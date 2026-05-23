@@ -1,0 +1,125 @@
+name: AlphaRadar Daily Run
+
+# ─── 실행 트리거 ─────────────────────────────────────────
+on:
+  schedule:
+    # 매주 월~금 KST 16:00 (= UTC 07:00) 자동 실행
+    # 한국 장 마감(15:30) 30분 후, KIS 일별 데이터 집계 완료 시점
+    - cron: '0 7 * * 1-5'
+  workflow_dispatch:        # 수동 실행 버튼 활성화
+    inputs:
+      dry_run:
+        description: 'dry-run 모드 (텔레그램 발송 X)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+      limit:
+        description: '종목 제한 (빈 값 = 전체)'
+        required: false
+        default: ''
+        type: string
+
+# 동시 실행 방지 (이전 실행 진행 중이면 큐에 넣기)
+concurrency:
+  group: alpharadar-daily
+  cancel-in-progress: false
+
+permissions:
+  contents: write           # DB 자동 커밋용
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30     # KIS 2770종목 13분 + 여유
+
+    steps:
+      # ─── 1. 코드 체크아웃 ──────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ─── 2. Python 환경 ────────────────────────────────
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ─── 3. FinBERT 모델 캐시 (~400MB, 매 실행 다운로드 방지) ─
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-finbert-snunlp-v1
+          restore-keys: hf-finbert-
+
+      # ─── 4. 의존성 설치 ────────────────────────────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # FinBERT 필수 — requirements.txt에 주석 처리되어 있어 별도 설치
+          pip install 'transformers>=4.30' 'torch>=2.0' --extra-index-url https://download.pytorch.org/whl/cpu
+
+      # ─── 5. AlphaRadar 실행 ───────────────────────────
+      - name: Run AlphaRadar
+        env:
+          # KIS Open API
+          KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KIS_ACCOUNT_NO: ${{ secrets.KIS_ACCOUNT_NO }}
+          KIS_IS_REAL:    ${{ secrets.KIS_IS_REAL }}
+          # OpenDART
+          DART_API_KEY:   ${{ secrets.DART_API_KEY }}
+          # Naver Open API (키 1)
+          NAVER_CLIENT_ID:     ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          # Naver Open API (키 2~3 — 한도 초과 시 자동 회전, API별 독립)
+          NAVER_CLIENT_ID_2:     ${{ secrets.NAVER_CLIENT_ID_2 }}
+          NAVER_CLIENT_SECRET_2: ${{ secrets.NAVER_CLIENT_SECRET_2 }}
+          NAVER_CLIENT_ID_3:     ${{ secrets.NAVER_CLIENT_ID_3 }}
+          NAVER_CLIENT_SECRET_3: ${{ secrets.NAVER_CLIENT_SECRET_3 }}
+          # Telegram
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          # GitHub Actions는 비대화형 환경 → tqdm 진행바 비활성화
+          TQDM_DISABLE: '1'
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          if [ -n "${{ github.event.inputs.limit }}" ]; then
+            ARGS="$ARGS --limit ${{ github.event.inputs.limit }}"
+          fi
+          echo "실행 인자: python alpharadar.py $ARGS"
+          python alpharadar.py $ARGS
+
+      # ─── 6. 결과 DB·캐시 자동 커밋 (다음 실행 시 재사용) ─
+      - name: Commit DB & cache updates
+        if: always()        # 실행 실패해도 부분 로그는 커밋
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name  "alpharadar-bot"
+          # DB·캐시·로그만 추가 (소스 파일은 변경 안 함)
+          git add data/scores_history.db        2>/dev/null || true
+          git add data/cache/dart_sector_map*.pkl 2>/dev/null || true
+          git add data/logs/scanner_*.log       2>/dev/null || true
+          # 변경 사항 있을 때만 커밋
+          if git diff --staged --quiet; then
+            echo "커밋할 변경사항 없음"
+          else
+            git commit -m "auto: daily run $(date -u +%F\ %H:%M\ UTC)"
+            git push
+          fi
+
+      # ─── 7. 실패 시 로그 업로드 (디버깅용) ─────────────
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scanner-logs-${{ github.run_id }}
+          path: data/logs/
+          retention-days: 7

@@ -1,0 +1,21 @@
+# ═══════════════════════════════════════════════════════
+# AlphaRadar v3.2 의존성
+# ═══════════════════════════════════════════════════════
+
+# ── 핵심 ─────────────────────────────────────────────
+finance-datareader>=0.9.50    # 한국 주식 가격·시총·종목목록
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+pyyaml>=6.0
+scipy>=1.11.0                 # backtest.py 전용 (Spearman IC)
+tqdm>=4.66.0
+
+# ── FinBERT 감성 분석 ────────────────────────────────
+# 미설치 시: 키워드 매칭으로 자동 폴백 (정확도 ↓)
+# GitHub Actions에서는 daily.yml이 별도 설치 (CPU 버전 PyTorch)
+# 로컬 설치 (선택):
+#   pip install transformers torch
+# transformers>=4.30
+# torch>=2.0
