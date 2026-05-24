@@ -1782,6 +1782,8 @@ def run_step1(precomputed,cfg):
             "name":p.get("name",ticker),"sector":p.get("sector","기타"),
             "cap_tier":tier,"market_cap":p.get("market_cap",0),
             "vol_slope":p.get("vol_slope",0),"net_buy_days":p.get("net_buy_days",0),
+            "vol_5d_avg":p.get("vol_5d_avg",0),"vol_60ma":p.get("vol_60ma",0),
+            "vol_20ma":p.get("vol_20ma",0),"vol_rising":vol_rising,
             "net_buy_total":p.get("net_buy_total",0),"retail_buy_days":p.get("retail_buy_days",0),
             "inst_net":p.get("inst_net",0),"foreign_net":p.get("foreign_net",0),
             "current_price":p.get("current_price",0),"change_pct":p.get("change_pct",0.0),
@@ -2032,6 +2034,8 @@ def run_step3(pool_b,precomputed,cfg,date):
             "news_count":len(news_texts.get(ticker,[])),
             "dart_count":len(dart_texts.get(ticker,[])),
             "vol_slope":meta.get("vol_slope",0),"net_buy_days":meta.get("net_buy_days",0),
+            "vol_5d_avg":meta.get("vol_5d_avg",0),"vol_60ma":meta.get("vol_60ma",0),
+            "vol_20ma":meta.get("vol_20ma",0),"vol_rising":meta.get("vol_rising",False),
             "net_buy_total":meta.get("net_buy_total",0),"retail_buy_days":meta.get("retail_buy_days",0),
             "current_price":meta.get("current_price",0),"inst_net":meta.get("inst_net",0),"foreign_net":meta.get("foreign_net",0),
             "rsi":meta.get("rsi",50.0),"bb_pos":meta.get("bb_pos",50.0),
@@ -2062,6 +2066,8 @@ def run_step4(results,cfg,dry_run=False):
     today=datetime.now().strftime("%Y%m%d"); tg=TelegramClient()
     min_score=cfg.get("grade",{}).get("min_display_score",0)
     results=[r for r in results if r["score"]>=min_score]
+    # 중복 차단 해제: 같은 종목·같은 등급이라도 매 실행마다 발송
+    # (지속 시그널과 등급 변화 모두 정보로 보존, mark_sent는 이력 추적용으로 유지)
     to_send = list(results)
     high=[r for r in to_send if r["grade"]=="집중"]
     mid=[r for r in to_send if r["grade"]=="주시"]
@@ -2101,6 +2107,17 @@ def run_step4(results,cfg,dry_run=False):
         rsi = r.get("rsi",50)
         rsi_label = ("과매수" if rsi>=70 else "과매도" if rsi<=30 else "중립")
 
+        # 거래량 비율 (5일 평균 / 60일 평균) — 1.5배 이상은 vol_rising 표시
+        vol_5d  = r.get("vol_5d_avg", 0)
+        vol_60  = r.get("vol_60ma", 0) or r.get("vol_20ma", 0)
+        if vol_5d > 0 and vol_60 > 0:
+            vol_ratio = vol_5d / vol_60
+            vol_pct = vol_ratio * 100
+            vol_icon = "🔥" if vol_ratio >= 2.0 else "📈" if vol_ratio >= 1.5 else "📊"
+            vol_line = f"  |  {vol_icon} 거래량 {vol_pct:.0f}%"
+        else:
+            vol_line = ""
+
         # 최고 호재 헤드라인
         headline=r.get("best_headline",""); h_pct=r.get("best_headline_pct",0)
         if headline and h_pct>=70:
@@ -2113,7 +2130,7 @@ def run_step4(results,cfg,dry_run=False):
             f"\n\n<b>{i}. {_esc(r['name'])} ({r['ticker']})</b>\n"
             f"   {_esc(r['sector'])}  {tier_icon}  |  💵 {price_str}\n"
             f"   🏦 기관 {inst_str}  |  🌏 외인 {foreign_str}  ({r['net_buy_days']}일){retail_tag}\n"
-            f"   📊 BB {bb:.0f}% {bb_label}  |  RSI {rsi:.0f} {rsi_label}\n"
+            f"   📊 BB {bb:.0f}% {bb_label}  |  RSI {rsi:.0f} {rsi_label}{vol_line}\n"
             f"   📐 이격도 {r['disparity']:.1f}%  (20일 평균 대비 현재가 위치)\n"
             f"   🏆 <b>총점 {r['score']:.1f}</b>  기술 {r['t']:.0f}  수급 {r['d']:.0f}  감성 {r['s_text']:.0f}{cross}{headline_line}"
         )
