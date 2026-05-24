@@ -2062,10 +2062,7 @@ def run_step4(results,cfg,dry_run=False):
     today=datetime.now().strftime("%Y%m%d"); tg=TelegramClient()
     min_score=cfg.get("grade",{}).get("min_display_score",0)
     results=[r for r in results if r["score"]>=min_score]
-    to_send=[]
-    for r in results:
-        prev=was_sent_today(r["ticker"],today)
-        if prev is None or GRADE_RANK.get(r["grade"],-1) > GRADE_RANK.get(prev,-1): to_send.append(r)
+    to_send = list(results)
     high=[r for r in to_send if r["grade"]=="집중"]
     mid=[r for r in to_send if r["grade"]=="주시"]
 
