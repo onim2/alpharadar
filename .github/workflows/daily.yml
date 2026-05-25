@@ -26,12 +26,15 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write           # DB 자동 커밋용
+  contents: write           # DB·캐시 자동 커밋용
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30     # KIS 2770종목 13분 + 여유
+    # v3.3: 30 → 60 분.
+    # 첫 실행 시 DART 마스터 캐시가 비어있어 fresh fetch(약 20분) 필요.
+    # 두 번째 실행부터 캐시 적중으로 15분 내 종료 예상.
+    timeout-minutes: 60
 
     steps:
       # ─── 1. 코드 체크아웃 ──────────────────────────────
@@ -47,7 +50,7 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      # ─── 3. FinBERT 모델 캐시 (~400MB, 매 실행 다운로드 방지) ─
+      # ─── 3. FinBERT 모델 캐시 (~400MB) ─────────────────
       - name: Cache HuggingFace models
         uses: actions/cache@v4
         with:
@@ -55,7 +58,21 @@ jobs:
           key: hf-finbert-snunlp-v1
           restore-keys: hf-finbert-
 
-      # ─── 4. 의존성 설치 ────────────────────────────────
+      # ─── 4. v3.3 신규: 일별 텍스트·수급 캐시 ──────────
+      # Phase A 의 incremental 캐시(news_titles, dart_titles)와 KIS 수급을
+      # GitHub Actions cache 로 보호. git push 부담 없음, 매일 자동 회전.
+      # restore-keys 가 prefix 매칭이라 직전 실행 캐시를 항상 복원.
+      - name: Cache daily text/investor data
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/cache/news_titles_*.pkl
+            data/cache/dart_titles_*.pkl
+            data/cache/kis_investor_*.pkl
+          key: alpharadar-daily-${{ github.run_id }}
+          restore-keys: alpharadar-daily-
+
+      # ─── 5. 의존성 설치 ────────────────────────────────
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -63,7 +80,7 @@ jobs:
           # FinBERT 필수 — requirements.txt에 주석 처리되어 있어 별도 설치
           pip install 'transformers>=4.30' 'torch>=2.0' --extra-index-url https://download.pytorch.org/whl/cpu
 
-      # ─── 5. AlphaRadar 실행 ───────────────────────────
+      # ─── 6. AlphaRadar 실행 ───────────────────────────
       - name: Run AlphaRadar
         env:
           # KIS Open API
@@ -76,7 +93,7 @@ jobs:
           # Naver Open API (키 1)
           NAVER_CLIENT_ID:     ${{ secrets.NAVER_CLIENT_ID }}
           NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
-          # Naver Open API (키 2~3 — 한도 초과 시 자동 회전, API별 독립)
+          # Naver Open API (키 2~3)
           NAVER_CLIENT_ID_2:     ${{ secrets.NAVER_CLIENT_ID_2 }}
           NAVER_CLIENT_SECRET_2: ${{ secrets.NAVER_CLIENT_SECRET_2 }}
           NAVER_CLIENT_ID_3:     ${{ secrets.NAVER_CLIENT_ID_3 }}
@@ -97,25 +114,32 @@ jobs:
           echo "실행 인자: python alpharadar.py $ARGS"
           python alpharadar.py $ARGS
 
-      # ─── 6. 결과 DB·캐시 자동 커밋 (다음 실행 시 재사용) ─
-      - name: Commit DB & cache updates
-        if: always()        # 실행 실패해도 부분 로그는 커밋
+      # ─── 7. 결과 DB·DART 마스터 캐시 자동 커밋 ─────────
+      # 일별 텍스트 캐시는 위 actions/cache 가 담당.
+      # 여기는 DART 마스터(월 단위) + DB + 로그만 push.
+      - name: Commit DB & DART master cache
+        if: always()        # 실행 실패해도 부분 캐시·로그는 커밋
         run: |
           git config user.email "actions@github.com"
           git config user.name  "alpharadar-bot"
-          # DB·캐시·로그만 추가 (소스 파일은 변경 안 함)
-          git add data/scores_history.db        2>/dev/null || true
-          git add data/cache/dart_sector_map*.pkl 2>/dev/null || true
-          git add data/logs/scanner_*.log       2>/dev/null || true
+          # DB
+          git add data/scores_history.db              2>/dev/null || true
+          # DART 마스터 캐시 (v3.3: dart_corp_codes 추가)
+          git add data/cache/dart_sector_map.pkl      2>/dev/null || true
+          git add data/cache/dart_sector_map_v2.pkl   2>/dev/null || true
+          git add data/cache/dart_corp_codes.pkl      2>/dev/null || true
+          # 로그
+          git add data/logs/scanner_*.log             2>/dev/null || true
           # 변경 사항 있을 때만 커밋
           if git diff --staged --quiet; then
             echo "커밋할 변경사항 없음"
           else
-            git commit -m "auto: daily run $(date -u +%F\ %H:%M\ UTC)"
+            # [skip ci]: 자기 자신 다시 트리거 방지 (schedule 만 있어 사실 무관, 안전 마진)
+            git commit -m "auto: daily run $(date -u +%F\ %H:%M\ UTC) [skip ci]"
             git push
           fi
 
-      # ─── 7. 실패 시 로그 업로드 (디버깅용) ─────────────
+      # ─── 8. 실패 시 로그 업로드 (디버깅용) ─────────────
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
