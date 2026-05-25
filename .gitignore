@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════
-# 🔐 보안 — 절대 커밋하면 안 되는 파일
+# 🔐 보안 — 절대 커밋 금지
 # ═══════════════════════════════════════════════════════
 .env
 .env.*
@@ -9,7 +9,7 @@
 secrets.yaml
 
 # ═══════════════════════════════════════════════════════
-# Python 캐시
+# Python
 # ═══════════════════════════════════════════════════════
 __pycache__/
 *.py[cod]
@@ -29,22 +29,18 @@ env/
 ENV/
 
 # ═══════════════════════════════════════════════════════
-# OS
+# OS / IDE
 # ═══════════════════════════════════════════════════════
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# ═══════════════════════════════════════════════════════
-# IDE
-# ═══════════════════════════════════════════════════════
 .vscode/
 .idea/
 *.swp
 *.swo
 
 # ═══════════════════════════════════════════════════════
-# 백업 파일
+# 백업
 # ═══════════════════════════════════════════════════════
 *.bak
 *.bak_*
@@ -53,32 +49,34 @@ desktop.ini
 *~
 
 # ═══════════════════════════════════════════════════════
-# AlphaRadar 캐시 — 일부는 커밋 (성능 위해)
+# AlphaRadar 캐시 — 커밋할 것과 무시할 것 분리
+# 중요: data/cache/, data/logs/ 디렉토리 자체는 무시 X.
+#       부모 디렉토리가 ignore 되면 자식 파일은 ! 로도 unignore 불가.
 # ═══════════════════════════════════════════════════════
 
-# DataLab 일별 호출 결과 등 큰 캐시는 제외
+# 일별 캐시 — 무시 (날짜별 생성, 크기 큼, GitHub Actions cache 로 보호)
 data/cache/datalab_*.pkl
 data/cache/news_*.pkl
 data/cache/precompute_*.pkl
+data/cache/news_titles_*.pkl
+data/cache/dart_titles_*.pkl
+data/cache/universe_*.pkl
+data/cache/pool_a_*.pkl
+data/cache/results_*.pkl
+data/cache/kis_investor_*.pkl
 
-# DART 섹터맵은 커밋 유지 (월 1회 갱신, 838개 한글 매핑 재생성 비용 큼)
-# → !data/cache/dart_sector_map*.pkl 로 명시적 허용 (아래 참고)
+# 임시 파일
+data/cache/*.pkl.tmp
 
-# 로그 — 최근 것만 커밋, 오래된 것 제외
+# 로그 — 오래된/압축된 것만 무시
 data/logs/*.log.old
 data/logs/*.gz
 
-# ═══════════════════════════════════════════════════════
-# 명시적 커밋 허용 (위 패턴에 우연히 걸리는 것 예외)
-# ═══════════════════════════════════════════════════════
-!data/cache/dart_sector_map.pkl
-!data/cache/dart_sector_map_v2.pkl
-!data/scores_history.db
-!data/logs/scanner_*.log
-
-# 로컬 캐시·로그·DB (각 환경에서 자동 생성)
-data/cache/
-data/logs/
-data/scores_history.db
-*.log
-*.pkl
+# ─────────────────────────────────────────────────────
+# 자동 커밋 대상 (위 패턴에 안 걸리므로 트래킹됨):
+#   data/cache/dart_sector_map.pkl
+#   data/cache/dart_sector_map_v2.pkl
+#   data/cache/dart_corp_codes.pkl
+#   data/scores_history.db
+#   data/logs/scanner_*.log
+# ─────────────────────────────────────────────────────
