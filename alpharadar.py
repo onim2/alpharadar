@@ -1,18 +1,33 @@
 """
-AlphaRadar v3.2 — 단일 파일 안정화 버전
+AlphaRadar v3.3 — 단일 파일 안정화 버전
 정형:비정형 = 6:4 (S_text = 뉴스+공시 FinBERT)
 
 변경사항:
+  v3.3 (2026-05-25): Phase A — Tier 1·2 통합 패치
+  [TelegramClient 강화]
+  - R1: timeout=(3, 10) 분리 — DNS 막힘 빠른 컷
+  - R2: 429 Retry-After 헤더 우선 처리 (상한 30초)
+  - R3: token AND chat_id 둘 다 있어야 enabled, 하나만 있으면 콘솔 폴백
+  - R4: 분할 발송 시 [k/N] 청크 헤더 — 사용자 끊김 인지 가능
+  [뉴스-종목 매핑 정밀화]
+  - B6: 네이버 search query 자동 따옴표 (3자↑)
+  - B1: 짧은 종목명(<3자) 컨텍스트 토큰 동반 필수
+  - B2: 종목명 직후 자회사/계열사 접미사 검사 (서비스/증권/홀딩스 등)
+  - B4: 종목명 직후 우선주 접미사 검사 ('우', '우B' 등)
+  - WB: 한국어 조사 화이트리스트 기반 단어 경계 (오리온자리 차단)
+  - B3: 시황 토큰이 종목명보다 앞에 등장하면 reject
+  - B5: _is_duplicate 사전 필터(길이비율·head/tail) — O(n²) 비용 감소
+  [캐시 정책]
+  - A2: step3 텍스트(뉴스·공시) 일자별 incremental 캐시
+  - A3: DART 섹터 v1→v2 변환 시 mtime 승계
+  - A4: DART corp_codes 30일 만료 + last-known-good 폴백
+
   v3.2 (2026-05-21):
-  - 수급: pykrx → KIS API 교체 (기관/외인 순매수 실시간 조회)
+  - 수급: pykrx → KIS API 교체
   - KIS: 멀티스레드 토큰 경합 방지 (threading.Lock 이중 체크)
-  - 섹터: DART API로 KOSPI 업종명 보완 (30일 캐시, FDR 미제공 문제 해결)
+  - 섹터: DART API로 KOSPI 업종명 보완 (30일 캐시)
   - config: 이격도 상한 하향(115/120/130), cap_tier 하드코딩 제거
   - 가중치: w_tech/w_text/w_cross 명시 (w1/w2/w3 하위호환 유지)
-
-  v3.1:
-  - cap_tier: StockListing Marcap 실제 시가총액 사용
-  - 섹터: StockListing 컬럼 매핑 패턴 확장
 
 실행:
   python3 alpharadar.py                  # 전체 실행
@@ -23,9 +38,6 @@ AlphaRadar v3.2 — 단일 파일 안정화 버전
 
 스코어 공식:
   S = T×0.30 + S_text×0.40 + D×0.30
-  T      (기본 체력)      — 이동평균·매물대·BB·RSI     정형
-  S_text (텍스트 감성)    — 뉴스+공시 FinBERT          비정형
-  D      (수급/관심 교차) — 거래량·순매수·검색량 교차   정형
 """
 
 # ── 표준 라이브러리 ────────────────────────────────────────────────────────────
@@ -35,6 +47,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 from pathlib import Path
 
 # ── 외부 라이브러리 ────────────────────────────────────────────────────────────
@@ -68,42 +81,29 @@ DEFAULT_CONFIG = {
     },
     "engine_a": {
         "vol_base_days": 60, "vol_recent_days": 5,
-        "vol_surge_pct": 0.50,          # 50% 이상 거래량 폭발 (기존 20% → 상향)
+        "vol_surge_pct": 0.50,
         "net_buy_recent_days": 5, "net_buy_min_days": 3,
     },
     "engine_b": {"hype_trend_days": 7, "max_negative_sentiment": 0.30,
                   "hype_top_n": 500},
-    # engine_a_retail: 개인 순매수 조건은 엔진 A 진입 조건에서 제거됨.
-    # retail_buy_days 데이터는 D 점수 보조 지표 및 텔레그램 표시에만 사용.
     "cap_tier": {
         "large_threshold": 5_000_000_000_000,
         "mid_threshold":     500_000_000_000,
     },
     "filter": {
-        # ── 이격도 상한: MA20 대비 과열 상한 (cap_tier별 차등)
-        "max_disparity_large": 115,  # 대형주: MA20 대비 15% 이상이면 과열
-        "max_disparity_mid":   120,  # 중형주: 20% 이상
-        "max_disparity_small": 130,  # 소형주: 30% 이상
-        # ── 이격도 하한: MA20 아래 하락 추세 종목 제거
-        "min_disparity": 93,         # MA20 대비 93% 미만이면 하락 추세로 간주
-        # ── MA 방향성: 단기 이평이 장기 이평 위에 있어야 진입 허용
-        "require_ma_trend": True,    # ma20 > ma120 조건 (False면 비활성)
-        # ── RSI 과매수 상한: 극단적 과열 종목 제거
-        "max_rsi": 80,               # RSI 80 초과면 단기 과매수로 제거
-        # ── 섹터 동조화 보너스 기준 (D 점수 +5, 하드 필터 아님)
-        "min_sector_peers": 2,        # 동일 섹터 Pool B 내 최소 N개 이상이어야 보너스
-        # (vol_5d_avg × price) / market_cap >= min_turnover_ratio  (상대 기준)
-        # (vol_5d_avg × price)              >= min_turnover_amount (절대 기준)
-        # 주의: market_cap이 추정치(current×vol_20ma×5)라 정밀 수치 아님
-        "min_turnover_ratio":  0.01,          # 1.0% 이상 (시총 대비 일평균 거래대금)
-        "min_turnover_amount": 2_000_000_000, # 20억 이상 (절대 유동성 최솟값)
+        "max_disparity_large": 115,
+        "max_disparity_mid":   120,
+        "max_disparity_small": 130,
+        "min_disparity": 93,
+        "require_ma_trend": True,
+        "max_rsi": 80,
+        "min_sector_peers": 2,
+        "min_turnover_ratio":  0.01,
+        "min_turnover_amount": 2_000_000_000,
     },
     "scoring": {
-        # S = T×w_tech + S_text×w_text + D×w_cross  (합계 1.0)
-        "w_tech": 0.30,   # 정형
-        "w_text": 0.40,   # 비정형 (뉴스+공시 FinBERT)
-        "w_cross": 0.30,  # 정형
-        "w1": 0.30, "w2": 0.40, "w3": 0.30,  # 하위 호환
+        "w_tech": 0.30, "w_text": 0.40, "w_cross": 0.30,
+        "w1": 0.30, "w2": 0.40, "w3": 0.30,
         "finbert_model": "snunlp/KR-FinBert-SC",
         "news_count":   10,
         "news_weight":  0.60,
@@ -111,7 +111,7 @@ DEFAULT_CONFIG = {
         "n_accel_window": 3, "v_surge_rank": 20,
         "strength_top_pct": 0.20,
         "dart_days": 90,
-        "dart_positive": {},  # FinBERT로 대체되어 키워드 매칭 불필요
+        "dart_positive": {},
     },
     "grade": {"high_interest": 75, "interest": 65, "min_display_score": 55},
     "negative_keywords": [
@@ -135,8 +135,6 @@ def validate_config(cfg: dict):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # KSIC (한국표준산업분류) 코드 → 한글 업종명 매핑
-# DART API가 induty_code(5자리)만 제공하므로 2자리 prefix(중분류)로 변환
-# 텔레그램 표시 가독성 + 섹터 동조화 그룹핑 둘 다 개선
 # ══════════════════════════════════════════════════════════════════════════════
 KSIC_DIVISION_MAP = {
     "01": "농업",        "02": "임업",        "03": "어업",
@@ -170,11 +168,9 @@ KSIC_DIVISION_MAP = {
 }
 
 def _ksic_to_sector(code) -> str:
-    """KSIC 산업분류 코드 → 한글 업종명. 2자리 prefix 기준 lookup.
-    매핑 없으면 'KSIC{code}' 형태로 원본 보존."""
     if code is None: return ""
     s = str(code).strip()
-    if not s or not s[0].isdigit(): return s   # 이미 한글 업종명이면 통과
+    if not s or not s[0].isdigit(): return s
     prefix = s[:2]
     return KSIC_DIVISION_MAP.get(prefix, f"기타({s})")
 
@@ -213,8 +209,6 @@ def disparity(price, ma20):
 def resistance_top(df):
     if df is None or len(df) < 10: return float("inf")
     threshold = df["거래량"].quantile(0.90)
-    # 거래량이 터진 날의 고가(매물대 실제 저항선) 기준
-    # "고가" 컬럼 없으면 "종가" 폴백
     price_col = "고가" if "고가" in df.columns else "종가"
     high_vol = df[df["거래량"] >= threshold][price_col]
     return float(high_vol.max()) if not high_vol.empty else float("inf")
@@ -222,12 +216,11 @@ def resistance_top(df):
 def is_top_percentile(value, all_values, pct=0.20):
     if not all_values or value is None: return False
     arr = sorted([v for v in all_values if v is not None], reverse=True)
-    if not arr: return False   # None만 있는 경우 방어
+    if not arr: return False
     cutoff = arr[max(1, int(len(arr)*pct)) - 1]
     return value >= cutoff
 
 def calc_rsi(close_series, period=14) -> float:
-    """RSI(14) 계산. 0~100, 70↑ 과매수, 30↓ 과매도"""
     if len(close_series) < period+1: return 50.0
     delta = close_series.diff()
     gain  = delta.where(delta>0, 0.0)
@@ -239,10 +232,6 @@ def calc_rsi(close_series, period=14) -> float:
     return round(float(100 - 100/(1+rs)), 1)
 
 def calc_bb_position(close_series, period=20, std_mult=2) -> float:
-    """
-    볼린저밴드 내 현재가 위치 (0~100%).
-    0% = 하단, 50% = 중간(MA), 100% = 상단
-    """
     if len(close_series) < period: return 50.0
     ma    = close_series.rolling(period).mean().iloc[-1]
     std   = close_series.rolling(period).std().iloc[-1]
@@ -262,10 +251,6 @@ _NEGATIVE_KW = ["급락","실적쇼크","소송","횡령","배임","상장폐지
                 "적자전환","검찰","과징금","리콜","부도","구조조정"]
 
 class FinBertClient:
-    """
-    KR-FinBERT 감성 분석기.
-    transformers 미설치 시 키워드 사전 폴백 자동 적용.
-    """
     def __init__(self, model_name="snunlp/KR-FinBert-SC"):
         self.model_name = model_name
         self._pipe = None
@@ -288,7 +273,7 @@ class FinBertClient:
                 "text-classification", model=self.model_name,
                 device=device, truncation=True, max_length=512,
                 batch_size=batch,
-                top_k=None,   # positive/negative/neutral 세 확률 모두 반환
+                top_k=None,
             )
             self.device_label = device_label
             logger.info(f"FinBERT 로드 완료 ({device_label})")
@@ -301,10 +286,9 @@ class FinBertClient:
         if not cleaned: return []
         if self.mode == "finbert" and self._pipe:
             try:
-                raw = self._pipe(cleaned)  # top_k=None → [[{label,score},...], ...]
+                raw = self._pipe(cleaned)
                 results = []
                 for result in raw:
-                    # result = [{"label": "positive", "score": 0.8}, ...]
                     prob = {}
                     for item in result:
                         lbl = item["label"].lower()
@@ -322,7 +306,6 @@ class FinBertClient:
                 return results
             except Exception as e:
                 logger.warning(f"FinBERT 분석 실패 → 폴백: {e}")
-        # 키워드 폴백 — pos_prob/neg_prob 형식 통일
         results = []
         for text in cleaned:
             pos = sum(1 for kw in _POSITIVE_KW if kw in text)
@@ -351,20 +334,10 @@ class FinBertClient:
         return s
 
     def score_with_best(self, texts):
-        """
-        (overall_score, best_positive_text, best_positive_pct) 반환.
-        공식: 50 + mean(pos_prob - neg_prob) × 50
-          → 전체 positive 80%, negative 10%면 50 + 0.70×50 = 85점
-        """
         results = self.analyze(texts)
         if not results: return 50.0, "", 0.0
-
-        # 텍스트마다 (pos_prob - neg_prob) 계산 후 평균
         diffs = [r["pos_prob"] - r["neg_prob"] for r in results]
         overall = round(max(0.0, min(100.0, 50.0 + np.mean(diffs) * 50.0)), 1)
-
-        # 가장 높은 pos_prob 텍스트를 헤드라인으로 노출
-        # analyze()와 동일한 필터 적용 후 zip (인덱스 불일치 방지)
         cleaned_texts = [t.strip() for t in texts if t and len(t.strip()) > 3]
         best_text, best_pct = "", 0.0
         for text, result in zip(cleaned_texts, results):
@@ -412,7 +385,6 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_sent_ticker_date
                 ON sent_history(ticker, send_date);
         """)
-        # 기존 DB에 cap_tier 컬럼이 없으면 자동 추가 (마이그레이션)
         cols = [r[1] for r in con.execute("PRAGMA table_info(scan_results)").fetchall()]
         if "cap_tier" not in cols:
             con.execute("ALTER TABLE scan_results ADD COLUMN cap_tier TEXT")
@@ -443,7 +415,6 @@ def save_scan_results(results, scan_date):
                 (scan_date, r["ticker"], r.get("name"), r.get("sector"),
                  r.get("cap_tier"),
                  r.get("score"), r.get("t"), None, r.get("d"),
-                 # score_total, score_t, score_m(미사용/None), score_d
                  r.get("s_text"), r.get("news_score"), r.get("dart_score"),
                  r.get("grade"), r.get("source"),
                  int(r.get("n_accel",False)), int(r.get("v_surge",False)),
@@ -491,7 +462,7 @@ class DartClient:
             try:
                 r = requests.get(f"https://opendart.fss.or.kr/api/{endpoint}",
                                  params=params, timeout=10)
-                if r.status_code == 429:          # rate limit
+                if r.status_code == 429:
                     wait = 2 ** (attempt + 1)
                     logger.warning(f"DART rate limit → {wait}초 대기")
                     time.sleep(wait)
@@ -509,18 +480,9 @@ class DartClient:
                     return {}
         return {}
 
-    # 주가 임팩트가 있는 주요 공시 타입
-    # A: 정기공시(사업/분기/반기 보고서)
-    # B: 외부감사관련 (감사보고서)
-    # C: 수시공시 ★ (영업양수도, 단일판매·공급계약, 주식분할, 자기주식취득 등 핵심)
-    # I: 거래소공시 (불성실공시, 관리종목 지정, 매매거래정지 등)
     _DART_PUBLICATION_TYPES = ["A", "B", "C", "I"]
 
     def get_report_titles(self, corp_code, days=90):
-        """공시 제목 목록 반환 — FinBERT 입력용.
-        주요 공시 4종(A/B/C/I)을 모두 조회해서 합침.
-        C(수시공시) — 단일판매·공급계약, 영업양수도 등 주가 임팩트 큰 공시 포함.
-        """
         if not self.api_key or not corp_code: return []
         bgn = (datetime.now()-timedelta(days=days)).strftime("%Y%m%d")
         end = datetime.now().strftime("%Y%m%d")
@@ -533,8 +495,7 @@ class DartClient:
             for r in data.get("list", []):
                 nm = r.get("report_nm")
                 if nm: titles.append(nm)
-            time.sleep(0.12)   # DART 분당 1,000건 제한 안전 마진
-        # 중복 제거 (서로 다른 pty 분류에 같은 보고서가 나올 수 있음)
+            time.sleep(0.12)
         seen, unique = set(), []
         for t in titles:
             if t not in seen:
@@ -545,138 +506,68 @@ class DartClient:
 # ══════════════════════════════════════════════════════════════════════════════
 # 공시 임팩트 분류 (Phase 2)
 # ══════════════════════════════════════════════════════════════════════════════
-# 한국 주식시장에서 공시 종류별 평균 주가 임팩트를 기반으로 4단계 분류.
-# 점수는 50점이 중립, 0~100 범위 (FinBERT 점수와 동일 스케일).
-#
-# 평균 주가 임팩트는 한국거래소 공시 효과 연구(여러 학술 논문 종합)를 참고:
-#  - 단일판매·공급계약: 평균 +5~10% (1주일 누적)
-#  - 자기주식 취득: 평균 +3~7%
-#  - 유상증자: 평균 -5~10% (희석 우려)
-#  - 불성실공시: 평균 -3~8%
-
 DART_IMPACT_CATEGORIES = {
-    # 🟢 강한 호재 (+25점, 점수 75)
     "strong_positive": {
         "score": 75,
         "label": "🟢 강호재",
         "keywords": [
-            "단일판매ㆍ공급계약",      # 큰 수주 (가장 강한 호재)
-            "단일판매·공급계약",
-            "단일판매.공급계약",
+            "단일판매ㆍ공급계약", "단일판매·공급계약", "단일판매.공급계약",
             "공급계약체결",
-            "영업양수",                # 사업 확장
-            "영업양도",                # 사업 축소 (양도는 자금 유입)
-            # 자기주식 — '취득'만 호재. '처분'은 부정 카테고리에서 별도 처리
-            "자기주식취득결정",
-            "자기주식 취득 결정",
-            "자기주식취득 결과",
-            "자기주식 취득 결과",
-            "자기주식취득신탁계약체결",
-            "자기주식취득 신탁계약",
-            "무상증자",                # 주주 환원
-            "주식분할",                # 유동성 확대
-            "현금배당",                # 결산 배당
-            "현금ㆍ현물배당",
-            "현금·현물배당",
-            "특별배당",
-            "타법인 주식 및 출자증권 취득",  # M&A
-            "타법인주식및출자증권취득",
-            "흡수합병",                # M&A
-            "합병결정",
-            "임상시험계획승인",        # 바이오 호재
-            "임상2상승인",
-            "임상3상승인",
-            "품목허가",                # 바이오 호재
-            "신약허가",
-            "특허취득",
-            "조건부지정승인",          # 바이오 — 신속허가
-            # 주식소각 — 발행주식수 감소 → 주당가치 ↑ (강호재)
-            # 주의: '감자'와 다름. 감자는 결손 보전 목적의 자본금 축소 (negative에서 처리)
-            "주식소각결정",
-            "주식소각",
-            "이익소각",                # 이익잉여금으로 소각 — 자본 감소 X
-            "자기주식소각",
-            "이익소각결정",
-            "자기주식소각결정",
+            "영업양수", "영업양도",
+            "자기주식취득결정", "자기주식 취득 결정",
+            "자기주식취득 결과", "자기주식 취득 결과",
+            "자기주식취득신탁계약체결", "자기주식취득 신탁계약",
+            "무상증자", "주식분할",
+            "현금배당", "현금ㆍ현물배당", "현금·현물배당", "특별배당",
+            "타법인 주식 및 출자증권 취득", "타법인주식및출자증권취득",
+            "흡수합병", "합병결정",
+            "임상시험계획승인", "임상2상승인", "임상3상승인",
+            "품목허가", "신약허가", "특허취득",
+            "조건부지정승인",
+            "주식소각결정", "주식소각",
+            "이익소각", "자기주식소각",
+            "이익소각결정", "자기주식소각결정",
         ],
     },
-    # 🟡 중립 호재 (+10점, 점수 60)
     "mild_positive": {
         "score": 60,
         "label": "🟡 중립",
         "keywords": [
-            "사업보고서",
-            "분기보고서",
-            "반기보고서",
-            "주식배당",
-            "정관변경",
-            "주주총회",
-            "임원ㆍ주요주주특정증권등소유상황보고",  # 내부자 매수 가능성
+            "사업보고서", "분기보고서", "반기보고서",
+            "주식배당", "정관변경", "주주총회",
+            "임원ㆍ주요주주특정증권등소유상황보고",
         ],
     },
-    # ⚫ 부정 시그널 (-25점, 점수 25)
     "negative": {
         "score": 25,
         "label": "⚫ 부정",
         "keywords": [
-            # 자본 희석류 (가장 강한 부정)
             "유상증자",
-            "전환사채권발행결정",      # CB - 잠재 희석
-            "신주인수권부사채권발행결정",  # BW - 잠재 희석
-            "교환사채권발행결정",      # EB
+            "전환사채권발행결정", "신주인수권부사채권발행결정",
+            "교환사채권발행결정",
             "주요사항보고서(전환사채권발행결정)",
             "주요사항보고서(신주인수권부사채권발행결정)",
             "주요사항보고서(유상증자결정)",
-            # 자기주식 처분 — 시장에 물량 풀림 = 희석
-            "자기주식처분결정",
-            "자기주식 처분 결정",
-            "자기주식처분 결과",
-            "자기주식 처분 결과",
-            # 페널티 / 거래소 제재
-            "불성실공시법인지정",
-            "불성실공시",
+            "자기주식처분결정", "자기주식 처분 결정",
+            "자기주식처분 결과", "자기주식 처분 결과",
+            "불성실공시법인지정", "불성실공시",
             "관리종목지정",
-            "투자주의환기종목지정",
-            "투자위험종목지정",
-            "투자경고종목지정",
-            # 회계·감사 부실
-            "회계감리",
-            "감사의견거절",            # 상장폐지 위기
-            "감사범위제한",
-            "감사의견한정",
-            # 재무 부실
-            "자본잠식",
-            "유보율감소",
-            # 형사 / 윤리 문제
-            "횡령",
-            "배임",
-            # 자본 감소 (감자 = 결손 보전 목적, 진짜 부정)
-            "감자결정",                # 명백한 부정
-            "무상감자",
-            # 상장폐지 / 거래정지 류
-            "회생절차",
-            "파산",
-            "부도",
-            "주식매매거래정지",
-            "거래정지",
-            "상장적격성실질심사",
-            "상장폐지",
-            # 임상 / 신약 부정
-            "임상시험중단",
-            "임상실패",
-            "품목허가취소",
+            "투자주의환기종목지정", "투자위험종목지정", "투자경고종목지정",
+            "회계감리", "감사의견거절", "감사범위제한", "감사의견한정",
+            "자본잠식", "유보율감소",
+            "횡령", "배임",
+            "감자결정", "무상감자",
+            "회생절차", "파산", "부도",
+            "주식매매거래정지", "거래정지",
+            "상장적격성실질심사", "상장폐지",
+            "임상시험중단", "임상실패", "품목허가취소",
         ],
     },
 }
 
 def classify_dart_title(title: str) -> tuple[str, int]:
-    """공시 제목 → (카테고리, 점수) 분류.
-    가장 먼저 매치되는 카테고리 우선 (부정 > 강호재 > 중립 순).
-    매치 없으면 ('neutral', 50) 반환.
-    """
     if not title: return ("neutral", 50)
     t = title.replace(" ", "")
-    # 부정 먼저 (예: '유상증자' 키워드는 다른 호재 키워드보다 우선)
     for cat in ("negative", "strong_positive", "mild_positive"):
         for kw in DART_IMPACT_CATEGORIES[cat]["keywords"]:
             if kw.replace(" ", "") in t:
@@ -684,24 +575,8 @@ def classify_dart_title(title: str) -> tuple[str, int]:
     return ("neutral", 50)
 
 def calc_dart_keyword_score(titles: list[str]) -> tuple[float, str]:
-    """공시 제목 리스트 → (키워드 기반 점수, 가장 임팩트 큰 공시 한 줄).
-
-    알고리즘 (Phase 2.1 — 극단값 주도):
-      평균만 쓰면 공시 많은 종목(대형주, 60일간 10~20건)에서
-      강호재/부정 1건이 정기보고서 더미에 묻혀버린다.
-      → "가장 강한 신호 70% + 전체 평균 30%" 혼합으로 변경.
-
-      score = max_impact × 0.7 + avg × 0.3
-      여기서 max_impact는 50에서 가장 먼 점수 (강호재면 75, 부정이면 25).
-      부정이 있으면 부정을 우선 선택 (리스크 회피).
-
-    여러 공시:
-      - 평균은 가중평균 (부정 가중치 2배)
-      - best: 50에서 가장 멀리, 동점이면 부정 우선
-    """
     if not titles: return (50.0, "")
     classified = [(t, *classify_dart_title(t)) for t in titles]
-    # 가중 평균 (부정은 가중치 2배)
     weighted_sum, weight_total = 0.0, 0.0
     for _, cat, sc in classified:
         w = 2.0 if cat == "negative" else 1.0
@@ -709,10 +584,8 @@ def calc_dart_keyword_score(titles: list[str]) -> tuple[float, str]:
         weight_total += w
     avg_score = weighted_sum / weight_total if weight_total > 0 else 50.0
 
-    # 가장 임팩트 큰 (50에서 가장 먼) 공시 — 부정이 있으면 부정 우선
     non_neutral = [(t, cat, sc) for t, cat, sc in classified if cat != "neutral"]
     if non_neutral:
-        # 부정 우선: (-abs(sc-50), sc) → abs 큰 게 먼저, 같으면 점수 작은(부정) 우선
         best = min(non_neutral, key=lambda x: (-abs(x[2] - 50), x[2]))
         max_impact = best[2]
         best_title = best[0]
@@ -720,61 +593,97 @@ def calc_dart_keyword_score(titles: list[str]) -> tuple[float, str]:
         max_impact = 50
         best_title = ""
 
-    # 극단값 70% + 평균 30%
     score = max_impact * 0.7 + avg_score * 0.3
     return (round(score, 1), best_title)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 뉴스-종목 매핑 정밀화 — Phase A 모듈 상수 + 단어 경계 헬퍼
+# ══════════════════════════════════════════════════════════════════════════════
+# 자회사·계열사 접미사: 종목명 직후 이게 붙으면 별도 회사로 판단 (B2)
+_SUBSIDIARY_SUFFIXES: tuple[str, ...] = (
+    "서비스", "판매", "유통", "물류", "증권", "생명", "화재", "카드",
+    "캐피탈", "건설", "에너지", "솔루션", "메디신", "헬스케어", "케미칼",
+    "산업", "엔지니어링", "투자", "자산운용", "홀딩스", "지주",
+)
+# 우선주 접미사: 긴 패턴 우선 매칭(우B → 우) (B4)
+_PREFERRED_SUFFIXES: tuple[str, ...] = ("우B", "우C", "우", "1우", "2우B", "3우C")
+# 짧은 종목명에 강제할 컨텍스트 토큰 (B1)
+_CTX_TOKENS: tuple[str, ...] = (
+    "주식", "주가", "상장", "시총", "증권", "투자", "거래량", "공시",
+    "실적", "매수", "매도", "수주", "공급계약", "배당", "신고가",
+)
+# 시황 기사 표지 토큰 (B3)
+_MARKET_TOKENS: tuple[str, ...] = (
+    "코스피", "코스닥", "KOSPI", "KOSDAQ", "지수", "시황", "마감", "개장",
+)
+# 한국어 조사 — 긴 것 우선 (greedy match) (WB)
+_KO_PARTICLES: tuple[str, ...] = (
+    "으로서", "으로써", "에서", "에게", "한테", "께서", "부터", "까지", "마저",
+    "조차", "이라", "으로", "라고", "이다",
+    "이", "가", "은", "는", "을", "를", "도", "만", "의", "에", "와", "과",
+    "로", "께", "뿐", "야", "랑",
+)
+
+def _hangul(c: str) -> bool:
+    return bool(c) and "\uac00" <= c <= "\ud7a3"
+
+def _has_word_boundary(text: str, idx: int, name_len: int) -> bool:
+    """
+    종목명 직후가 단어 경계인지 검사 (WB).
+      - 텍스트 끝             → True
+      - 비한글(공백/구두점/숫자/영문) → True
+      - 한글이지만 한국어 조사로 시작하고 그 조사 다음이 비한글 → True
+      - 그 외(한글 합성어 가능성) → False (예: 오리온자리)
+    """
+    tail = text[idx + name_len:]
+    if not tail:
+        return True
+    if not _hangul(tail[0]):
+        return True
+    for p in _KO_PARTICLES:
+        if tail.startswith(p):
+            rest = tail[len(p):]
+            if not rest or not _hangul(rest[0]):
+                return True
+    return False
+
+
 class NaverClient:
     """
-    네이버 Open API 클라이언트 — N개 키 지원, API별 독립 회전
-
+    네이버 Open API 클라이언트 — N개 키 지원, API별 독립 회전.
     환경변수 (최대 9개 자동 감지):
       NAVER_CLIENT_ID  + NAVER_CLIENT_SECRET            (키 1)
       NAVER_CLIENT_ID_2 + NAVER_CLIENT_SECRET_2         (키 2)
-      NAVER_CLIENT_ID_3 + NAVER_CLIENT_SECRET_3         (키 3)
       ... up to _9
-
-    한도 도달(429/401) 시 같은 API만 다음 키로 회전:
-      - DataLab 키1 429 → DataLab만 키2로 (검색은 키1 유지)
-      - 검색 키1 429   → 검색만 키2로
-      - 마지막 키도 429 → 빈 결과 반환 (폴백)
     """
     def __init__(self):
-        # ── 환경변수에서 모든 키 로드 ─────────────────────
-        self.keys: list[tuple[str, str]] = []   # [(client_id, client_secret), ...]
-        # 키 1: suffix 없음
+        self.keys: list[tuple[str, str]] = []
         cid  = os.getenv("NAVER_CLIENT_ID", "").strip()
         csec = os.getenv("NAVER_CLIENT_SECRET", "").strip()
         if cid and csec:
             self.keys.append((cid, csec))
-        # 키 2~9: _N suffix
         for i in range(2, 10):
             cid  = os.getenv(f"NAVER_CLIENT_ID_{i}", "").strip()
             csec = os.getenv(f"NAVER_CLIENT_SECRET_{i}", "").strip()
             if cid and csec:
                 self.keys.append((cid, csec))
 
-        # ── 하위 호환: 기존 코드가 client_id를 읽을 수도 있음 ─
         self.client_id     = self.keys[0][0] if self.keys else ""
         self.client_secret = self.keys[0][1] if self.keys else ""
 
-        # ── API별 현재 키 인덱스 (DataLab과 검색이 독립) ──
         self._key_idx: dict[str, int] = {"datalab": 0, "search": 0}
-        self._key_lock = threading.Lock()   # 인덱스 회전 시 경쟁 보호
+        self._key_lock = threading.Lock()
 
         if not self.keys:
             logger.warning("NAVER_CLIENT_ID 없음 — mock 관심 지수 사용")
         elif len(self.keys) > 1:
             logger.info(f"NaverClient: {len(self.keys)}개 키 로드 (DataLab·검색 독립 회전)")
 
-    # ── 키 회전 헬퍼 ─────────────────────────────────────────
     def _current_headers(self, kind: str) -> dict:
-        """현재 kind('datalab' or 'search')에 사용 중인 키의 헤더 반환"""
         if not self.keys:
             return {}
         idx = self._key_idx.get(kind, 0)
-        # 인덱스가 범위 초과 시 마지막 키 사용 (안전장치)
         if idx >= len(self.keys):
             idx = len(self.keys) - 1
         cid, csec = self.keys[idx]
@@ -783,20 +692,12 @@ class NaverClient:
                 "Content-Type": "application/json"}
 
     def _rotate_key(self, kind: str, attempted_idx: int) -> bool:
-        """
-        429/401 발생 시 다음 키로 회전.
-        반환: True = 회전 성공 (재시도 가능), False = 더 이상 회전 불가
-        thread-safe: 여러 스레드가 동시에 같은 인덱스에서 실패해도 한 번만 회전.
-        """
         with self._key_lock:
             current = self._key_idx.get(kind, 0)
-            # 다른 스레드가 이미 회전시켜 인덱스가 진행된 경우 → 그 결과 사용 (성공으로 처리)
             if current > attempted_idx:
                 return True
-            # 마지막 키였다면 더 회전 못함
             if current + 1 >= len(self.keys):
                 return False
-            # 회전 실행
             self._key_idx[kind] = current + 1
             logger.info(f"Naver {kind} 키{current+1} 한도/인증 오류 → 키{current+2} 전환")
             return True
@@ -811,31 +712,28 @@ class NaverClient:
                 "endDate":datetime.now().strftime("%Y-%m-%d"),
                 "timeUnit":"date",
                 "keywordGroups":[{"groupName":keyword,"keywords":[keyword]}]}
-        MAX_NET = 2              # 네트워크 일시 오류 재시도 횟수
-        MAX_KEY_ROTATIONS = len(self.keys)   # 최악의 경우 모든 키 시도
-        MAX_BURST_RETRY = 3      # 429일 때 같은 키로 burst 재시도
+        MAX_NET = 2
+        MAX_KEY_ROTATIONS = len(self.keys)
+        MAX_BURST_RETRY = 3
         BURST_BACKOFF = [0.5, 1.0, 2.0]
         net_attempts = 0
         rotations = 0
         while True:
             attempted_idx = self._key_idx.get("datalab", 0)
             try:
-                # 같은 키로 burst 재시도 (429 일시 차단 회피)
                 r = None
                 for burst_try in range(MAX_BURST_RETRY):
                     r = requests.post("https://openapi.naver.com/v1/datalab/search",
                                       json=body, headers=self._current_headers("datalab"),
                                       timeout=(4, 8))
-                    # 429만 burst 재시도, 401은 인증 자체 문제라 즉시 키 회전
                     if r.status_code == 429 and burst_try < MAX_BURST_RETRY - 1:
                         time.sleep(BURST_BACKOFF[burst_try])
                         continue
                     break
-                # 한도(429)·인증(401) → 다음 키로 회전
                 if r.status_code in (429, 401):
                     if rotations < MAX_KEY_ROTATIONS and self._rotate_key("datalab", attempted_idx):
                         rotations += 1
-                        continue   # 새 키로 즉시 재시도
+                        continue
                     logger.warning(f"DataLab 한도/인증 오류({r.status_code}) ({keyword}) — 모든 키 소진")
                     return []
                 r.raise_for_status()
@@ -844,7 +742,6 @@ class NaverClient:
                 return [d["ratio"] for d in results[0].get("data",[])[-days:]]
             except (requests.exceptions.Timeout,
                     requests.exceptions.ConnectionError) as e:
-                # 네트워크 일시 오류 → 동일 키로 백오프 재시도 (키 회전 X)
                 net_attempts += 1
                 if net_attempts < MAX_NET:
                     time.sleep(0.5 * net_attempts)
@@ -858,41 +755,93 @@ class NaverClient:
                 logger.warning(f"DataLab 실패 ({keyword}): {e}")
                 return []
 
-    # 광고성 기사 필터 키워드
     _AD_MARKERS = [
         "[광고]","[PR]","[협찬]","[이벤트]","보도자료","제공","후원",
         "무료체험","할인쿠폰","신청하세요","이벤트 참여","~하는 방법",
     ]
 
     def _is_ad(self, text: str) -> bool:
-        """광고·홍보성 기사 판별"""
         return any(m in text for m in self._AD_MARKERS)
 
     def _is_relevant(self, text: str, company: str) -> bool:
-        """정확한 종목명 포함 여부 확인 (앞 2글자 부분 매칭 제거 — 노이즈 방지)
-        예: '삼성전자' 검색 시 '삼성SDI', '삼성생명' 뉴스 혼입 차단"""
-        return company in text
+        """
+        v3.3 — 단어 경계·자회사·우선주·시황 5중 가드.
+          B1: 종목명 < 3자면 컨텍스트 토큰 동반 필수
+          B2: 종목명 직후 자회사 접미사 → reject
+          B4: 종목명 직후 '우' 접미사 → reject
+          WB: 한글이 이어지면 조사일 때만 통과 (오리온자리 차단)
+          B3: 시황 토큰이 종목명보다 앞에 등장하면 reject
+        """
+        if not company or not text:
+            return False
 
-    def _is_duplicate(self, text: str, seen: list[str], threshold=0.7) -> bool:
-        """SequenceMatcher 유사도 기반 중복 판별"""
-        from difflib import SequenceMatcher
-        return any(
-            SequenceMatcher(None, text, s).ratio() > threshold
-            for s in seen
-        )
+        # B1: 2자 이하 — 컨텍스트 토큰 강제
+        if len(company) < 3:
+            if company not in text:
+                return False
+            return any(c in text for c in _CTX_TOKENS)
+
+        idx = text.find(company)
+        if idx < 0:
+            return False
+
+        after = text[idx + len(company): idx + len(company) + 8]
+
+        # B2: 자회사/계열사 접미사
+        for sfx in _SUBSIDIARY_SUFFIXES:
+            if after.startswith(sfx):
+                return False
+        # B4: 우선주 접미사 — 긴 패턴부터
+        for sfx in _PREFERRED_SUFFIXES:
+            if after.startswith(sfx):
+                return False
+
+        # WB: 단어 경계 — '오리온자리', '삼성전자세무사' 같은 미등록 합성어 차단
+        if not _has_word_boundary(text, idx, len(company)):
+            return False
+
+        # B3: 시황 기사 — 지수 토큰이 종목명보다 앞에 등장 시 reject
+        if text.count(company) == 1:
+            for m in _MARKET_TOKENS:
+                m_idx = text.find(m)
+                if 0 <= m_idx < idx:
+                    return False
+
+        return True
+
+    def _is_duplicate(self, text: str, seen: list[str], threshold: float = 0.7) -> bool:
+        """
+        B5 — SequenceMatcher 호출 전 사전 필터로 99% 후보를 즉시 컷.
+          가드 1: 길이 비율 < 0.5 면 명백히 다른 기사 → 통과
+          가드 2: 첫 5자도 마지막 5자도 다르면 → 통과
+          그 외만 SequenceMatcher ratio 계산.
+        """
+        text_len = len(text)
+        if text_len == 0:
+            return False
+        text_head = text[:5]
+        text_tail = text[-5:]
+        for s in seen:
+            s_len = len(s)
+            if s_len == 0:
+                continue
+            if min(text_len, s_len) / max(text_len, s_len) < 0.5:
+                continue
+            if text_head != s[:5] and text_tail != s[-5:]:
+                continue
+            if SequenceMatcher(None, text, s).ratio() > threshold:
+                return True
+        return False
 
     def get_news_headlines(self, query, target=10, fetch=30):
         """
         뉴스 헤드라인 수집 — FinBERT 입력용.
-        fetch건을 가져와 광고·중복·무관 기사를 제거한 뒤
-        깨끗한 target건 반환.
-
-        429(rate limit) 처리:
-          - 1차: 짧은 백오프 [0.5, 1, 2]초 후 같은 키 재시도 (burst 한도 회피)
-          - 2차: 그래도 429면 다음 키로 회전
-          - 3차: 모든 키 소진 시 빈 결과 반환
+        B6: 3자 이상 query 는 자동 따옴표(정확 매칭) — 자회사 흡수 1차 차단.
         """
         if not self.keys: return []
+
+        # B6: 정확 매칭 query 변환
+        api_query = f'"{query}"' if query and len(query) >= 3 else query
 
         MAX_KEY_ROTATIONS = len(self.keys)
         MAX_BURST_RETRY = 3
@@ -901,21 +850,19 @@ class NaverClient:
         raw_items = []
         while True:
             attempted_idx = self._key_idx.get("search", 0)
-            # 같은 키로 burst 재시도
             got_response = False
             for burst_try in range(MAX_BURST_RETRY):
                 try:
                     r = requests.get(
                         "https://openapi.naver.com/v1/search/news.json",
                         headers=self._current_headers("search"),
-                        params={"query":query, "display":min(fetch,100), "sort":"date"},
+                        params={"query": api_query, "display": min(fetch,100), "sort":"date"},
                         timeout=10,
                     )
                 except requests.exceptions.RequestException as e:
                     logger.warning(f"뉴스 검색 실패 ({query}): {e}")
                     return []
 
-                # 429만 burst 재시도 (401은 인증 자체 문제라 즉시 키 회전)
                 if r.status_code == 429 and burst_try < MAX_BURST_RETRY - 1:
                     time.sleep(BURST_BACKOFF[burst_try])
                     continue
@@ -926,10 +873,9 @@ class NaverClient:
                 return []
 
             if r.status_code in (429, 401):
-                # burst 재시도 다 했는데도 429거나, 401이면 키 회전
                 if rotations < MAX_KEY_ROTATIONS and self._rotate_key("search", attempted_idx):
                     rotations += 1
-                    continue   # 새 키로 즉시 재시도
+                    continue
                 logger.warning(f"뉴스 검색 한도/인증 오류({r.status_code}) ({query}) — 모든 키 소진")
                 return []
             try:
@@ -953,26 +899,22 @@ class NaverClient:
             if not title:
                 continue
 
-            # ① 광고 필터 (제목 기준)
             if self._is_ad(title):
                 stats["ad"] += 1
                 continue
 
-            # ② 관련성 필터 — 제목 또는 본문에 정확한 종목명 포함 여부
             if not self._is_relevant(title, query) and not self._is_relevant(desc, query):
                 stats["irrelevant"] += 1
                 continue
 
-            # ③ 중복 제거 (제목 기준)
             if self._is_duplicate(title, seen):
                 stats["duplicate"] += 1
                 continue
 
-            # FinBERT 입력: 제목 + description 앞 100자 (맥락 보강)
             text = f"{title}. {desc[:100]}" if desc else title
 
             clean.append(text)
-            seen.append(title)   # 중복 체크는 제목으로
+            seen.append(title)
             stats["pass"] += 1
 
             if len(clean) >= target:
@@ -983,73 +925,93 @@ class NaverClient:
             f"광고 -{stats['ad']} 무관 -{stats['irrelevant']} "
             f"중복 -{stats['duplicate']} → 최종 {len(clean)}건"
         )
-        time.sleep(0.10)   # 네이버 API 일 25,000건 제한 — 0.05 → 0.10
+        time.sleep(0.10)
         return clean
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# TelegramClient — Phase A 강화 (R1·R2·R3·R4)
+# ══════════════════════════════════════════════════════════════════════════════
 class TelegramClient:
-    """텔레그램 발송 클라이언트
-    - 짧은 백오프 retry (DNS 막힘 등에서 무한 hang 방지)
-    - Circuit breaker: 연속 N개 실패 시 즉시 중단 (남은 메시지 skip)
-    - send/send_many 모두 bool 반환 (run_step4가 성공 여부로 mark_sent 결정)
+    """
+    v3.3 텔레그램 발송 — 4중 강화.
+      R1: timeout=(3, 10) 분리 — connect/read 분리, DNS 막힘 빠른 컷
+      R2: 429 Retry-After 헤더 우선 처리 (상한 30초)
+      R3: token AND chat_id 둘 다 있어야 enabled, 하나만 있으면 콘솔 폴백
+      R4: 분할 발송 시 [k/N] 청크 헤더
     """
     MAX_LEN = 4096
-    CIRCUIT_THRESHOLD = 3      # 연속 N개 실패 시 circuit open
+    CIRCUIT_THRESHOLD = 3
 
     def __init__(self):
-        self.token   = os.getenv("TELEGRAM_BOT_TOKEN","")
-        self.chat_id = os.getenv("TELEGRAM_CHAT_ID","")
-        if not self.token: logger.warning("텔레그램 미설정 — 콘솔 출력 모드")
+        self.token   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        # R3: 둘 다 필수
+        self.enabled = bool(self.token and self.chat_id)
+        if not self.enabled:
+            missing = []
+            if not self.token:   missing.append("TELEGRAM_BOT_TOKEN")
+            if not self.chat_id: missing.append("TELEGRAM_CHAT_ID")
+            logger.warning(f"텔레그램 미설정 ({', '.join(missing)}) — 콘솔 출력 모드")
 
     def _send_raw(self, text, retries=3):
-        """단일 raw 메시지 발송. 성공 True / 실패 False.
-        retry 백오프 [1, 3, 5]초 — 합 9초 (기존 5+15+45=65초에서 단축).
-        DNS 막힘 같은 일시 장애에서 1메시지당 hang 최소화."""
-        if not self.token: print(text); return True
+        if not self.enabled:
+            print(text); return True
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-        payload = {"chat_id":self.chat_id,"text":text,
-                   "parse_mode":"HTML","disable_web_page_preview":True}
+        payload = {"chat_id": self.chat_id, "text": text,
+                   "parse_mode": "HTML", "disable_web_page_preview": True}
         backoff = [1, 3, 5]
         for i in range(retries):
             try:
-                requests.post(url, json=payload, timeout=10).raise_for_status()
+                # R1: (connect=3s, read=10s)
+                r = requests.post(url, json=payload, timeout=(3, 10))
+                # R2: 429 → Retry-After 우선
+                if r.status_code == 429:
+                    try:
+                        wait = int(r.json().get("parameters", {}).get("retry_after", backoff[i]))
+                    except Exception:
+                        wait = backoff[i]
+                    wait = min(max(wait, 1), 30)
+                    logger.warning(f"텔레그램 429 → {wait}초 대기 (Retry-After)")
+                    time.sleep(wait)
+                    continue
+                r.raise_for_status()
                 return True
             except Exception as e:
-                if i < retries-1:
+                if i < retries - 1:
                     time.sleep(backoff[i] if i < len(backoff) else 5)
                 else:
                     logger.error(f"텔레그램 발송 실패: {e}")
         return False
 
     def send(self, text):
-        """긴 메시지를 line 단위로 분할 발송. 모두 성공해야 True."""
+        """R4: 분할 발송 시 [k/N] 청크 헤더 부착."""
         if len(text) <= self.MAX_LEN:
             return self._send_raw(text)
-        lines, chunk, length = text.split("\n"), [], 0
-        all_ok = True
+
+        lines, chunks, cur, length = text.split("\n"), [], [], 0
+        header_reserve = 24
         for line in lines:
-            if length+len(line)+1 > self.MAX_LEN:
-                if not self._send_raw("\n".join(chunk)):
-                    all_ok = False
-                time.sleep(0.5); chunk, length = [], 0
-            chunk.append(line); length += len(line)+1
-        if chunk:
-            if not self._send_raw("\n".join(chunk)):
+            if length + len(line) + 1 > self.MAX_LEN - header_reserve:
+                chunks.append("\n".join(cur))
+                cur, length = [], 0
+            cur.append(line); length += len(line) + 1
+        if cur:
+            chunks.append("\n".join(cur))
+
+        all_ok, n = True, len(chunks)
+        for k, chunk in enumerate(chunks, 1):
+            hdr = f"<b>[{k}/{n}]</b>\n" if n > 1 else ""
+            if not self._send_raw(hdr + chunk):
                 all_ok = False
+            time.sleep(0.5)
         return all_ok
 
     def send_many(self, messages, delay=0.5):
-        """메시지 리스트 발송. 각 메시지의 성공 여부 리스트 반환.
-        Circuit breaker: 연속 CIRCUIT_THRESHOLD개 실패 시 즉시 중단,
-        남은 메시지는 False로 채워 반환 (DNS 막힘 같은 장기 장애 대응).
-        """
-        results = []
-        consecutive_fail = 0
-        circuit_open = False
+        results, consecutive_fail, circuit_open = [], 0, False
         for idx, msg in enumerate(messages):
             if circuit_open:
-                results.append(False)
-                continue
+                results.append(False); continue
             ok = self.send(msg)
             results.append(ok)
             if ok:
@@ -1065,6 +1027,125 @@ class TelegramClient:
                     circuit_open = True
             time.sleep(delay)
         return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DART 캐시 정책 — Phase A (A4)
+# ══════════════════════════════════════════════════════════════════════════════
+def load_dart_corp_codes(api_key: str, max_age_days: int = 30) -> dict:
+    """
+    A4 — corp_codes 30일 만료 정책 + last-known-good 폴백.
+    """
+    cache_path = CACHE_DIR / "dart_corp_codes.pkl"
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    need_refresh = not cache_path.exists()
+    if not need_refresh:
+        age_days = (datetime.now().timestamp() - cache_path.stat().st_mtime) / 86400
+        if age_days > max_age_days:
+            need_refresh = True
+            logger.info(f"DART corp_code 캐시 {age_days:.0f}일 경과 → 재다운로드")
+
+    if not need_refresh:
+        with open(cache_path, "rb") as f:
+            return pickle.load(f)
+
+    if not api_key:
+        logger.warning("DART_API_KEY 없음 — corp_code 매핑 비활성화")
+        return {}
+
+    try:
+        r = requests.get(
+            "https://opendart.fss.or.kr/api/corpCode.xml",
+            params={"crtfc_key": api_key},
+            timeout=30,
+        )
+        r.raise_for_status()
+        z = zipfile.ZipFile(io.BytesIO(r.content))
+        root = ET.fromstring(z.read("CORPCODE.xml").decode("utf-8"))
+        corp_map = {
+            item.findtext("stock_code", "").strip(): item.findtext("corp_code", "").strip()
+            for item in root.findall("list")
+            if len(item.findtext("stock_code", "").strip()) == 6
+        }
+        tmp = cache_path.with_suffix(".pkl.tmp")
+        with open(tmp, "wb") as f: pickle.dump(corp_map, f)
+        tmp.replace(cache_path)
+        logger.info(f"DART corp_code 캐시 갱신 완료: {len(corp_map)}개")
+        return corp_map
+    except Exception as e:
+        logger.warning(f"DART corp_code 다운로드 실패: {e}")
+        # fail-soft: 옛 캐시라도 있으면 사용
+        if cache_path.exists():
+            with open(cache_path, "rb") as f:
+                logger.warning("옛 corp_code 캐시 사용 (last-known-good)")
+                return pickle.load(f)
+        return {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Step3 텍스트 수집 캐시 — Phase A (A2)
+# ══════════════════════════════════════════════════════════════════════════════
+def collect_texts_with_cache(pool_b, naver, dart, news_cnt, dart_days,
+                              date: str, workers: int = 6):
+    """
+    A2 — 뉴스·공시 텍스트 일자별 incremental 캐시.
+    같은 날 가중치 튜닝 재실행 시 외부 API 0건.
+    """
+    news_cache = CACHE_DIR / f"news_titles_{date}.pkl"
+    dart_cache = CACHE_DIR / f"dart_titles_{date}.pkl"
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    news_texts: dict = {}
+    dart_texts: dict = {}
+    if news_cache.exists():
+        try:
+            with open(news_cache, "rb") as f: news_texts = pickle.load(f)
+        except Exception: news_texts = {}
+    if dart_cache.exists():
+        try:
+            with open(dart_cache, "rb") as f: dart_texts = pickle.load(f)
+        except Exception: dart_texts = {}
+
+    missing = [(t, m) for t, m in pool_b.items()
+               if t not in news_texts or t not in dart_texts]
+
+    if not missing:
+        logger.info(f"텍스트 캐시 전체 적중: {len(pool_b)}종목 (외부 API 0건)")
+        return news_texts, dart_texts
+
+    logger.info(
+        f"텍스트 신규 수집: {len(missing)}종목 "
+        f"(캐시 적중 {len(pool_b) - len(missing)}종목)"
+    )
+
+    def _collect(item):
+        ticker, meta = item
+        nm = meta.get("name", ticker)
+        news = naver.get_news_headlines(nm, target=news_cnt, fetch=news_cnt * 3)
+        dart_t = (dart.get_report_titles(meta.get("corp_code", ""), dart_days)
+                  if meta.get("corp_code") else [])
+        return ticker, news, dart_t
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for ticker, news, dart_t in ex.map(_collect, missing):
+            news_texts[ticker] = news
+            dart_texts[ticker] = dart_t
+
+    # 원자적 저장 — 도중 실패해도 옛 캐시 보존
+    tmp_n = news_cache.with_suffix(".pkl.tmp")
+    tmp_d = dart_cache.with_suffix(".pkl.tmp")
+    with open(tmp_n, "wb") as f: pickle.dump(news_texts, f)
+    with open(tmp_d, "wb") as f: pickle.dump(dart_texts, f)
+    tmp_n.replace(news_cache)
+    tmp_d.replace(dart_cache)
+
+    logger.info(
+        f"수집 완료: 뉴스 {sum(len(v) for v in news_texts.values())}건 | "
+        f"공시 {sum(len(v) for v in dart_texts.values())}건"
+    )
+    return news_texts, dart_texts
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Mock 데이터
@@ -1197,15 +1278,12 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
         vol_5d=moving_average(volume_s,5)
         mkt=info.get("market","KOSPI")
 
-        # 시가총액: StockListing Marcap 우선, 없으면 추정치로 fallback
         marcap_real = int(info.get("market_cap", 0) or 0)
         cap = marcap_real if marcap_real > 0 else int(current * float(vol_20ma) * 50)
 
-        # 최소 시가총액 필터 (Marcap 정보가 있는 경우에만 적용)
         if marcap_real > 0 and marcap_real < ucfg.get("min_market_cap", 30_000_000_000):
             return None
 
-        # cap_tier: config.yaml의 cap_tier 섹션 기준으로 분류
         _ct       = ucfg.get("cap_tier", {})
         _large_th = _ct.get("large_threshold", 5_000_000_000_000)
         _mid_th   = _ct.get("mid_threshold",     500_000_000_000)
@@ -1218,7 +1296,6 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
         change_pct = float(df["Change"].iloc[-1]*100) if "Change" in df.columns else 0.0
         sector=str(info.get("sector") or "기타").strip()
         if sector in ("nan","None",""): sector="기타"
-        # FDR 고가 컬럼 추출 (없으면 종가로 대체)
         high_s = df["High"].astype(float) if "High" in df.columns else close_s
         hist_df = pd.DataFrame({"종가": close_s, "고가": high_s, "거래량": volume_s})
         return {
@@ -1240,47 +1317,35 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
         return None
 
 # ── KIS API 수급 클라이언트 ───────────────────────────────────────────────────
-_KIS_TOKEN_CACHE: dict = {}   # {"token": str, "expires": datetime}
-_KIS_LAST_CALL   = 0.0        # 마지막 호출 시각 (속도 제한용)
-_KIS_INTERVAL    = 0.06       # 초당 20건 제한 → 건당 최소 0.06초 간격
-_KIS_WARNED      = False      # 키 미설정 경고 중복 방지
-_KIS_TB_LOGGED   = 0          # 수급 실패 traceback 로깅 횟수 (3회까지만)
-_KIS_TOKEN_LOCK  = threading.Lock()  # 토큰 발급 경합 방지
-_KIS_RATE_LOCK   = threading.Lock()  # 속도 제한 전역변수 경합 방지 (병렬 호출)
+_KIS_TOKEN_CACHE: dict = {}
+_KIS_LAST_CALL   = 0.0
+_KIS_INTERVAL    = 0.06
+_KIS_WARNED      = False
+_KIS_TB_LOGGED   = 0
+_KIS_TOKEN_LOCK  = threading.Lock()
+_KIS_RATE_LOCK   = threading.Lock()
 
 def _kis_base_url() -> str:
-    """KIS Open API 엔드포인트.
-    실전: openapi.koreainvestment.com:9443
-    모의: openapivts.koreainvestment.com:29443  (vts 주의!)
-    KIS_IS_REAL: 1/true/yes/y → 실전, 그 외 (0/false/빈값) → 모의
-    """
     raw = os.getenv("KIS_IS_REAL", "0").strip().lower()
     is_real = raw in ("1", "true", "yes", "y", "real")
     return ("https://openapi.koreainvestment.com:9443" if is_real
             else "https://openapivts.koreainvestment.com:29443")
 
 def _kis_token() -> str:
-    """KIS 접근토큰 반환 — 만료 5분 전 자동 갱신, 파일 캐시 사용
-    Lock으로 멀티스레드 동시 발급 방지 (하루 발급 횟수 제한 초과 방지)
-    """
     global _KIS_TOKEN_CACHE
     now = datetime.now()
 
-    # 1차: Lock 없이 메모리 캐시 빠른 확인
     if _KIS_TOKEN_CACHE.get("token") and _KIS_TOKEN_CACHE.get("expires"):
         if now < _KIS_TOKEN_CACHE["expires"] - timedelta(minutes=5):
             return _KIS_TOKEN_CACHE["token"]
 
-    # 2차: Lock 획득 후 재확인 (다른 스레드가 이미 발급했을 수 있음)
     with _KIS_TOKEN_LOCK:
         now = datetime.now()
 
-        # Lock 안에서 메모리 캐시 재확인
         if _KIS_TOKEN_CACHE.get("token") and _KIS_TOKEN_CACHE.get("expires"):
             if now < _KIS_TOKEN_CACHE["expires"] - timedelta(minutes=5):
                 return _KIS_TOKEN_CACHE["token"]
 
-        # 파일 캐시 확인 (.kis_token)
         token_file = Path(".kis_token")
         if token_file.exists():
             try:
@@ -1292,7 +1357,6 @@ def _kis_token() -> str:
             except Exception:
                 pass
 
-        # 신규 발급
         app_key    = os.getenv("KIS_APP_KEY", "")
         app_secret = os.getenv("KIS_APP_SECRET", "")
         if not app_key or app_key == "your_kis_app_key":
@@ -1308,7 +1372,6 @@ def _kis_token() -> str:
             r.raise_for_status()
             data    = r.json()
             token   = data["access_token"]
-            # expires_in이 빈 문자열로 올 수도 있음 → _safe_int 사용
             exp_sec = _safe_int(data.get("expires_in", 86400), default=86400)
             if exp_sec <= 0:
                 exp_sec = 86400
@@ -1322,7 +1385,6 @@ def _kis_token() -> str:
             return ""
 
 def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3) -> dict:
-    """KIS REST API GET 호출 — 속도 제한·재시도 포함"""
     global _KIS_LAST_CALL
     token = _kis_token()
     if not token:
@@ -1331,7 +1393,6 @@ def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3) -> dict:
     app_key    = os.getenv("KIS_APP_KEY", "")
     app_secret = os.getenv("KIS_APP_SECRET", "")
 
-    # 속도 제한: 초당 20건 → 건당 0.06초 간격 (병렬 호출 대비 Lock 보호)
     with _KIS_RATE_LOCK:
         elapsed = time.time() - _KIS_LAST_CALL
         if elapsed < _KIS_INTERVAL:
@@ -1354,7 +1415,6 @@ def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3) -> dict:
             )
             r.raise_for_status()
             data = r.json()
-            # 속도 초과 에러 → 잠시 대기 후 재시도
             if data.get("rt_cd") == "1" and "EGW00201" in data.get("msg_cd", ""):
                 wait = 2 ** (attempt + 1)
                 logger.warning(f"KIS 속도 제한 → {wait}초 대기")
@@ -1369,23 +1429,17 @@ def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3) -> dict:
     return {}
 
 def _safe_int(v, default=0):
-    """KIS 응답 값을 안전하게 int로 변환. 빈 문자열/None/콤마 처리."""
     if v is None:
         return default
     s = str(v).strip().replace(",", "")
     if s == "" or s == "-":
         return default
     try:
-        return int(float(s))   # "123.0" 같은 케이스도 흡수
+        return int(float(s))
     except (ValueError, TypeError):
         return default
 
 def _get_investor_data(ticker, start_date, end_date):
-    """
-    KIS API로 기관/외국인/개인 순매수 반환.
-    반환: (net_buy_days, net_buy_total, retail_buy_days, inst_net, foreign_net)
-    KIS_APP_KEY 미설정 시 (0,0,0,0,0) 반환.
-    """
     global _KIS_WARNED
     app_key = os.getenv("KIS_APP_KEY", "")
     if not app_key or app_key == "your_kis_app_key":
@@ -1398,8 +1452,6 @@ def _get_investor_data(ticker, start_date, end_date):
         return 0, 0, 0, 0, 0
 
     try:
-        # TR: 투자자별 일별 매매동향 (FHKST01010900)
-        # 최근 5거래일 데이터 조회
         tr_id = "FHKST01010900"
         data  = _kis_get(
             "/uapi/domestic-stock/v1/quotations/inquire-investor",
@@ -1410,7 +1462,6 @@ def _get_investor_data(ticker, start_date, end_date):
             tr_id=tr_id,
         )
 
-        # ── 디버그: KIS_DEBUG_TICKER 와 일치하는 종목만 원본 응답 덤프 ──
         if os.getenv("KIS_DEBUG_TICKER") == ticker:
             import json
             _out = data.get("output", data.get("output1", data.get("output2", [])))
@@ -1432,13 +1483,11 @@ def _get_investor_data(ticker, start_date, end_date):
                     + json.dumps(data, ensure_ascii=False, indent=2)
                 )
 
-        output2 = data.get("output", data.get("output2", []))   # 일별 상세 (최신순)
-        # output2가 list가 아닌 경우(문자열·None 등) 방어
+        output2 = data.get("output", data.get("output2", []))
         if not isinstance(output2, list) or not output2:
             logger.debug(f"KIS 수급 빈/비정상 응답 ({ticker}): type={type(output2).__name__}")
             return 0, 0, 0, 0, 0
 
-        # 미집계(빈 값) 행 제외 — 최근 거래일은 장 마감 집계 전까지 빈 값으로 옴
         _FIELDS = ("orgn_ntby_tr_pbmn", "frgn_ntby_tr_pbmn", "prsn_ntby_tr_pbmn",
                    "orgn_ntby_qty",     "frgn_ntby_qty",     "prsn_ntby_qty")
         def _settled(r):
@@ -1447,12 +1496,11 @@ def _get_investor_data(ticker, start_date, end_date):
             return any(str(r.get(k, "")).strip() not in ("", "-") for k in _FIELDS)
 
         valid = [r for r in output2 if _settled(r)]
-        rows  = valid[:5]   # 값이 있는 최근 5거래일
+        rows  = valid[:5]
         if not rows:
             logger.debug(f"KIS 수급 미집계 ({ticker})")
             return 0, 0, 0, 0, 0
 
-        # 거래대금(_tr_pbmn) 우선, 비어 있으면 수량(_ntby_qty)로 폴백 (종목 내 일관 적용)
         use_pbmn = any(
             str(r.get("orgn_ntby_tr_pbmn", "")).strip() not in ("", "-") for r in rows
         )
@@ -1461,24 +1509,21 @@ def _get_investor_data(ticker, start_date, end_date):
         else:
             f_inst, f_for, f_ret = "orgn_ntby_qty", "frgn_ntby_qty", "prsn_ntby_qty"
 
-        # _safe_int 항상 int 반환 → 후속 sum/int 안전
-        inst_list    = [_safe_int(r.get(f_inst)) for r in rows]  # 기관 순매수
-        foreign_list = [_safe_int(r.get(f_for))  for r in rows]  # 외인 순매수
-        retail_list  = [_safe_int(r.get(f_ret))  for r in rows]  # 개인 순매수
+        inst_list    = [_safe_int(r.get(f_inst)) for r in rows]
+        foreign_list = [_safe_int(r.get(f_for))  for r in rows]
+        retail_list  = [_safe_int(r.get(f_ret))  for r in rows]
 
         combined = [i + f for i, f in zip(inst_list, foreign_list)]
 
         return (
-            sum(1 for v in combined  if v > 0),    # net_buy_days
-            sum(combined),                          # net_buy_total
-            sum(1 for v in retail_list if v > 0),  # retail_buy_days
-            sum(inst_list),                         # inst_net
-            sum(foreign_list),                      # foreign_net
+            sum(1 for v in combined  if v > 0),
+            sum(combined),
+            sum(1 for v in retail_list if v > 0),
+            sum(inst_list),
+            sum(foreign_list),
         )
 
     except Exception as e:
-        # 첫 N건은 traceback까지 남겨서 정확한 원인 파악
-        # (이후엔 메시지만 — 로그 폭발 방지)
         global _KIS_TB_LOGGED
         if _KIS_TB_LOGGED < 3:
             import traceback
@@ -1492,17 +1537,14 @@ def _get_investor_data(ticker, start_date, end_date):
         return 0, 0, 0, 0, 0
 
 def _load_dart_sector_map() -> dict:
-    """DART API로 KOSPI 종목 업종명 조회 — 캐시 파일 사용 (v2: KSIC 한글명 변환 적용)
-    캐시:
-      - data/cache/dart_sector_map_v2.pkl (신: 한글 업종명, 30일 유효)
-      - data/cache/dart_sector_map.pkl    (구: KSIC 코드만 — 자동 변환해서 v2 생성)
-    반환: {ticker: sector_name(한글)}
+    """
+    DART API로 KOSPI 종목 업종명 조회 — 캐시 파일 사용 (v2: KSIC 한글명 변환 적용)
+    v3.3 (A3): v1→v2 변환 시 mtime 승계 — 30일 만료 정책 정합성 보장.
     """
     cache_path    = CACHE_DIR / "dart_sector_map_v2.pkl"
     cache_path_v1 = CACHE_DIR / "dart_sector_map.pkl"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── v2 캐시 우선 확인 ────────────────────────────────────
     if cache_path.exists():
         mtime = datetime.fromtimestamp(cache_path.stat().st_mtime)
         if datetime.now() - mtime < timedelta(days=30):
@@ -1512,23 +1554,26 @@ def _load_dart_sector_map() -> dict:
             except Exception:
                 pass
 
-    # ── v1 캐시(KSIC 코드) → v2(한글) 변환만 적용, API 재호출 X ─
     if cache_path_v1.exists():
         mtime = datetime.fromtimestamp(cache_path_v1.stat().st_mtime)
         if datetime.now() - mtime < timedelta(days=30):
             try:
                 with open(cache_path_v1, "rb") as f:
                     v1_map = pickle.load(f)
-                # KSIC 코드 → 한글 업종명 변환
                 v2_map = {tk: _ksic_to_sector(code) for tk, code in v1_map.items()}
                 with open(cache_path, "wb") as f:
                     pickle.dump(v2_map, f)
+                # A3: v1 mtime 을 v2 에 승계 — 30일 정책 정합성
+                try:
+                    v1_mtime = cache_path_v1.stat().st_mtime
+                    os.utime(cache_path, (v1_mtime, v1_mtime))
+                except Exception as e:
+                    logger.debug(f"sector mtime 승계 실패: {e}")
                 logger.info(f"DART 섹터맵 v1→v2 변환 완료: {len(v2_map)}개 (KSIC 코드 → 한글 업종명)")
                 return v2_map
             except Exception as e:
                 logger.warning(f"v1 → v2 변환 실패: {e}")
 
-    # ── 둘 다 없으면 DART API 신규 호출 ────────────────────
     api_key = os.getenv("DART_API_KEY", "")
     if not api_key:
         return {}
@@ -1536,7 +1581,6 @@ def _load_dart_sector_map() -> dict:
     logger.info("DART API로 KOSPI 업종 정보 수집 중...")
     sector_map = {}
     try:
-        # DART 전체 종목 목록 조회
         r = requests.get(
             "https://opendart.fss.or.kr/api/corpCode.xml",
             params={"crtfc_key": api_key},
@@ -1546,14 +1590,12 @@ def _load_dart_sector_map() -> dict:
         z = zipfile.ZipFile(io.BytesIO(r.content))
         root = ET.fromstring(z.read("CORPCODE.xml").decode("utf-8"))
 
-        # KOSPI 종목만 필터링 (948개)
         try:
             import FinanceDataReader as fdr
             kospi_tickers = set(fdr.StockListing("KOSPI")["Code"].astype(str).tolist())
         except Exception:
             kospi_tickers = set()
 
-        # 상장 종목 코드 수집 — KOSPI만
         corp_list = [
             (item.findtext("corp_code","").strip(),
              item.findtext("stock_code","").strip())
@@ -1563,7 +1605,6 @@ def _load_dart_sector_map() -> dict:
         ]
         logger.info(f"DART 업종 조회 대상: {len(corp_list)}개 KOSPI 종목 (약 {len(corp_list)//20}초 소요)")
 
-        # 종목별 업종명 조회
         for corp_code, stock_code in tqdm(corp_list, desc="DART 업종", unit="종목"):
             try:
                 res = requests.get(
@@ -1573,7 +1614,6 @@ def _load_dart_sector_map() -> dict:
                 )
                 data = res.json()
                 if data.get("status") == "000":
-                    # DART company API는 induty_code(5자리 KSIC)만 제공
                     induty_code = str(data.get("induty_code", "")).strip()
                     induty = _ksic_to_sector(induty_code) if induty_code else ""
                     if not induty:
@@ -1595,7 +1635,6 @@ def _load_dart_sector_map() -> dict:
     return sector_map
 
 def run_step0(date,cfg,market="ALL",limit=None):
-    # DART 업종 캐시 미리 로드 (KOSPI 섹터 보완용)
     dart_sector_map = _load_dart_sector_map()
     import FinanceDataReader as fdr
     ucfg=cfg["universe"]
@@ -1610,7 +1649,6 @@ def run_step0(date,cfg,market="ALL",limit=None):
     for mkt in markets:
         try:
             df=fdr.StockListing(mkt)
-            # 컬럼 매핑 디버그 (첫 실행 시 실제 컬럼명 확인용)
             logger.debug(f"{mkt} StockListing 컬럼: {list(df.columns)}")
             cols={}
             for c in df.columns:
@@ -1637,7 +1675,6 @@ def run_step0(date,cfg,market="ALL",limit=None):
     all_tickers=stock_df["ticker"].astype(str).tolist()
     ticker_info=stock_df.set_index("ticker").to_dict("index")
 
-    # DART 섹터로 KOSPI 종목 보완 (FDR은 KOSPI 섹터 미제공)
     patched = 0
     if dart_sector_map:
         for ticker, info in ticker_info.items():
@@ -1646,7 +1683,6 @@ def run_step0(date,cfg,market="ALL",limit=None):
                 ticker_info[ticker]["sector"] = dart_sector_map[ticker]
                 patched += 1
 
-    # 시장별 섹터 통계 로그 (DART 보완 후 기준)
     for mkt in (["KOSPI","KOSDAQ"] if market=="ALL" else [market]):
         mkt_tickers = [t for t,i in ticker_info.items() if i.get("market")==mkt]
         sector_filled = sum(1 for t in mkt_tickers
@@ -1673,36 +1709,10 @@ def run_step0(date,cfg,market="ALL",limit=None):
     for p in precomputed.values():
         for k,v in [("hype_latest",0.0),("hype_7d_ago",0.0),("hype_slope",0.0),("hype_rank",9999),("neg_ratio",0.0)]:
             p.setdefault(k,v)
-    corp_map_path=CACHE_DIR/"dart_corp_codes.pkl"
-    # 캐시 없으면 자동 생성 (DART corpCode.xml 다운로드, 한 번만)
-    if not corp_map_path.exists():
-        api_key = os.getenv("DART_API_KEY","")
-        if api_key:
-            logger.info("DART 법인코드 캐시 없음 — 자동 다운로드 시작")
-            try:
-                r = requests.get("https://opendart.fss.or.kr/api/corpCode.xml",
-                                 params={"crtfc_key":api_key}, timeout=30)
-                r.raise_for_status()
-                z = zipfile.ZipFile(io.BytesIO(r.content))
-                root = ET.fromstring(z.read("CORPCODE.xml").decode("utf-8"))
-                corp_map = {
-                    item.findtext("stock_code","").strip(): item.findtext("corp_code","").strip()
-                    for item in root.findall("list")
-                    if len(item.findtext("stock_code","").strip()) == 6
-                }
-                CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                with open(corp_map_path, "wb") as f: pickle.dump(corp_map, f)
-                logger.info(f"DART 법인코드 캐시 생성 완료: {len(corp_map)}개")
-            except Exception as e:
-                logger.warning(f"DART 법인코드 다운로드 실패: {e} (공시 수집 비활성화)")
-                corp_map = {}
-        else:
-            logger.warning("DART_API_KEY 없음 — 공시 수집 비활성화")
-            corp_map = {}
-    else:
-        with open(corp_map_path,"rb") as f: corp_map=pickle.load(f)
 
-    # 종목별 매핑 적용 + 통계
+    # A4: corp_codes 30일 만료 + last-known-good 폴백 (Phase A)
+    corp_map = load_dart_corp_codes(os.getenv("DART_API_KEY", ""))
+
     mapped = 0
     for t, p in precomputed.items():
         cc = corp_map.get(t, "")
@@ -1724,24 +1734,21 @@ def run_step1(precomputed,cfg):
     naver=NaverClient()
     logger.info("관심 지수 및 부정 뉴스 비율 조회 중...")
 
-    top_n = eb_cfg.get("hype_top_n", 100)   # DataLab 호출 종목 수 제한
-    max_workers = eb_cfg.get("hype_workers", 6)  # 병렬 네트워크 호출 수
+    top_n = eb_cfg.get("hype_top_n", 100)
+    max_workers = eb_cfg.get("hype_workers", 6)
     targets = sorted(precomputed.items(),
                      key=lambda x:x[1].get("vol_5d_avg",0), reverse=True)[:top_n]
 
     def _enrich(item):
-        """단일 종목의 트렌드·뉴스 조회 (병렬 워커). neg 감지 여부 반환."""
         ticker, p = item
         name = p.get("name", ticker)
 
-        # ① 네이버 검색 트렌드 (7일 기울기 계산)
         trend = naver.get_trend(name, eb_cfg["hype_trend_days"])
         if len(trend) >= 2:
             p["hype_latest"] = float(trend[-1])
             p["hype_7d_ago"] = float(trend[0])
             p["hype_slope"]  = linear_slope(trend)
 
-        # ② neg_ratio 실계산: 최근 뉴스 헤드라인 중 부정 키워드 포함 비율
         headlines = naver.get_news_headlines(name, target=5, fetch=15)
         if headlines:
             neg_count = sum(1 for h in headlines if any(kw in h for kw in neg_kws))
@@ -1765,10 +1772,7 @@ def run_step1(precomputed,cfg):
         vol_base=p.get("vol_60ma",p.get("vol_20ma",1))
         vol_rising=(vol_base>0 and p.get("vol_5d_avg",0)>=vol_base*(1+surge_pct))
         inst_buy=p.get("net_buy_days",0)>=ea_cfg["net_buy_min_days"]
-        # 개인 순매수 단독 조건 제거 — D 점수 보조 지표로만 활용
         a=vol_rising or inst_buy
-        # 엔진 B: 7일 검색 트렌드 선형회귀 기울기 > 0 (전체 추세 우상향)
-        #          + 부정 키워드 비율 30% 미만 (리스크 필터)
         b=(p.get("hype_slope", 0) > 0 and
            p.get("neg_ratio",  0) < eb_cfg["max_negative_sentiment"])
         if not (a or b): continue
@@ -1802,17 +1806,16 @@ def run_step1(precomputed,cfg):
 def run_step2(pool_a, precomputed, cfg):
     fcfg = cfg["filter"]
 
-    # ── 필터 파라미터 로드 ──────────────────────────────────────────────────
     upper = {
         "large": fcfg.get("max_disparity_large", 115),
         "mid":   fcfg.get("max_disparity_mid",   120),
         "small": fcfg.get("max_disparity_small",  130),
     }
-    min_disp        = fcfg.get("min_disparity",      93)           # 이격도 하한
-    require_trend   = fcfg.get("require_ma_trend",   True)         # MA20 > MA120
-    max_rsi         = fcfg.get("max_rsi",            80)           # RSI 과매수 상한
-    min_turnover    = fcfg.get("min_turnover_ratio",  0.01)        # 회전율 하한 (1%)
-    min_amount      = fcfg.get("min_turnover_amount", 2_000_000_000) # 절대금액 하한 (20억)
+    min_disp        = fcfg.get("min_disparity",      93)
+    require_trend   = fcfg.get("require_ma_trend",   True)
+    max_rsi         = fcfg.get("max_rsi",            80)
+    min_turnover    = fcfg.get("min_turnover_ratio",  0.01)
+    min_amount      = fcfg.get("min_turnover_amount", 2_000_000_000)
 
     pool_b = {}
     removed = {"disp_upper": [], "disp_lower": [], "ma_trend": [], "rsi": [], "turnover": []}
@@ -1823,32 +1826,26 @@ def run_step2(pool_a, precomputed, cfg):
         tier   = p.get("cap_tier", "large")
         rsi    = p.get("rsi", 50)
         ma20   = p.get("ma20",  0)
-        ma60   = p.get("ma60",  0)   # pool_b 전달용
+        ma60   = p.get("ma60",  0)
         ma120  = p.get("ma120", 0)
         mktcap = p.get("market_cap", 0)
 
-        # ① 이격도 상한 — 단기 과열 제거 (추격매수 금지)
         if disp >= upper[tier]:
             removed["disp_upper"].append(ticker)
             continue
 
-        # ② 이격도 하한 — MA20 아래 하락 추세 제거
         if disp < min_disp:
             removed["disp_lower"].append(ticker)
             continue
 
-        # ③ MA 방향성 — MA20 > MA120 (단기가 장기 위에 있어야 상승 추세)
         if require_trend and ma20 > 0 and ma120 > 0 and ma20 <= ma120:
             removed["ma_trend"].append(ticker)
             continue
 
-        # ④ RSI 과매수 상한 — 단기 극과열 제거
         if rsi > max_rsi:
             removed["rsi"].append(ticker)
             continue
 
-        # ⑤ 거래대금 필터 — 회전율 AND 절대금액 동시 충족
-        #    일평균 거래대금 = vol_5d_avg × current_price
         daily_amount = p.get("vol_5d_avg", 0) * p.get("current_price", 0)
         turnover_ratio = daily_amount / mktcap if mktcap > 0 else 0
         if turnover_ratio < min_turnover or daily_amount < min_amount:
@@ -1876,7 +1873,6 @@ def run_step2(pool_a, precomputed, cfg):
             "bb_pos":     p.get("bb_pos", 50),
         }
 
-    # ── 제거 현황 로그 ──────────────────────────────────────────────────────
     total_removed = sum(len(v) for v in removed.values())
     logger.info(
         f"하드 필터 제거: {total_removed}개 | "
@@ -1901,16 +1897,14 @@ def _calc_t(meta):
     ma20, ma60, ma120 = meta.get("ma20",0), meta.get("ma60",0), meta.get("ma120",0)
     price = meta.get("current_price", 0)
 
-    if ma20 > ma60 > 0:          score += 25  # 단기 정배열
-    if ma60 > ma120 > 0:         score += 25  # 중기 정배열
-    if ma20 > ma60 > ma120 > 0:  score += 10  # 완전 정배열 보너스
+    if ma20 > ma60 > 0:          score += 25
+    if ma60 > ma120 > 0:         score += 25
+    if ma20 > ma60 > ma120 > 0:  score += 10
 
-    # 고점 대비 -5% 이내 (신고가 사정권)
     h = meta.get("w52_high", 0)
     if h > 0 and price >= h * 0.95:
         score += 20
 
-    # 거래량 상위 10% 고가 기준 저항선 돌파
     if price > meta.get("res_top", float("inf")):
         score += 20
 
@@ -1921,31 +1915,25 @@ def _calc_d(ticker, meta, all_vol, all_hype, top_pct, scfg):
     base   = 50 if source == "both" else 30 if source == "engine_a" else 20
 
     strength = 0
-    # 거래량 증가 기울기 상위 20%
     if is_top_percentile(meta.get("vol_slope", 0), all_vol, top_pct):
         strength += 10
 
-    # 메이저 수급 차등 점수 (5일 중 4일+: +5, 전일 5일: +10)
     nbd = meta.get("net_buy_days", 0)
     if nbd >= 5:        strength += 10
     elif nbd >= 4:      strength += 5
 
-    # 관심도 상승 기울기 상위 20%
     if is_top_percentile(meta.get("hype_slope", 0), all_hype, top_pct):
         strength += 10
 
-    # 섹터 동조화 보너스 (동일 섹터 Pool B 내 2개 이상)
     if meta.get("has_sector_bonus", False):
         strength += 5
 
     cross = 0; n_accel = False; v_surge = False
 
-    # N-Accel: 과거 3일 내 엔진 B 이력이 있고 오늘 엔진 A가 터진 경우
     if meta.get("engine_a", False):
         if get_engine_b_history(ticker, scfg.get("n_accel_window", 3)):
             cross += 15; n_accel = True
 
-    # V-Surge: 검색 관심도 순위 전체 20위 이내 (엔진 종류 무관)
     if meta.get("hype_rank", 9999) <= scfg.get("v_surge_rank", 20):
         cross += 10; v_surge = True
 
@@ -1964,8 +1952,6 @@ def run_step3(pool_b,precomputed,cfg,date):
     all_hype=[m.get("hype_slope",0) for m in pool_b.values()]
     top_pct=scfg.get("strength_top_pct",0.20)
 
-    # 섹터 동조화 보너스 계산 — 하드 필터 없이 D 점수 가산용
-    # "기타" 섹터는 신뢰도 낮아 보너스 제외
     min_peers = cfg.get("filter", {}).get("min_sector_peers", 2)
     sector_counts = Counter(
         m.get("sector","기타") for m in pool_b.values()
@@ -1977,38 +1963,20 @@ def run_step3(pool_b,precomputed,cfg,date):
             sec != "기타" and sector_counts.get(sec, 0) >= min_peers
         )
 
-    logger.info("텍스트 수집 중 (뉴스 + 공시 제목)...")
-    news_texts={}; dart_texts={}
-    _workers = scfg.get("text_workers", 6)
-
-    def _collect(item):
-        ticker, meta = item
-        nm = meta.get("name", ticker)
-        news = naver.get_news_headlines(nm, target=news_cnt, fetch=news_cnt*3)
-        dart_t = (dart.get_report_titles(meta.get("corp_code",""), dart_days)
-                  if meta.get("corp_code") else [])
-        return ticker, news, dart_t
-
-    with ThreadPoolExecutor(max_workers=_workers) as ex:
-        for ticker, news, dart_t in ex.map(_collect, list(pool_b.items())):
-            news_texts[ticker] = news
-            dart_texts[ticker] = dart_t
-    logger.info(f"수집: 뉴스 {sum(len(v) for v in news_texts.values())}건 | 공시 {sum(len(v) for v in dart_texts.values())}건")
+    # A2: 일자별 incremental 캐시 — 같은 날 재실행 시 외부 API 0건 (Phase A)
+    news_texts, dart_texts = collect_texts_with_cache(
+        pool_b, naver, dart, news_cnt, dart_days, date,
+        workers=scfg.get("text_workers", 6),
+    )
 
     logger.info(f"FinBERT 감성 분석 ({finbert.mode} 모드)...")
     finbert._load()
-    # 뉴스: 점수 + 최고 호재 헤드라인 함께 추출
     news_data = {t: finbert.score_with_best(texts) for t,texts in news_texts.items()}
-    # 공시: FinBERT 점수 + 키워드 임팩트 점수 결합 (Phase 2)
-    #   - FinBERT만 쓰면 도메인 특수 용어(유상증자=부정, 단일판매=호재) 잘 못 잡음
-    #   - 키워드만 쓰면 뉘앙스(임상실패 등) 놓침
-    #   - 50:50 가중평균으로 결합
     dart_scores = {}
     dart_best_titles = {}
     for ticker, texts in dart_texts.items():
         finbert_sc = finbert.score(texts)
         kw_sc, best_title = calc_dart_keyword_score(texts)
-        # 키워드가 중립(50)이면 FinBERT만 100%, 아니면 50:50
         if abs(kw_sc - 50) < 1:
             dart_scores[ticker] = finbert_sc
         else:
@@ -2030,7 +1998,7 @@ def run_step3(pool_b,precomputed,cfg,date):
             "source":meta.get("source","?"),"n_accel":n_accel,"v_surge":v_surge,
             "finbert_mode":finbert.mode,
             "best_headline":n_headline,"best_headline_pct":n_pct,
-            "best_dart_title":dart_best_titles.get(ticker,""),   # Phase 2 신규
+            "best_dart_title":dart_best_titles.get(ticker,""),
             "news_count":len(news_texts.get(ticker,[])),
             "dart_count":len(dart_texts.get(ticker,[])),
             "vol_slope":meta.get("vol_slope",0),"net_buy_days":meta.get("net_buy_days",0),
@@ -2057,7 +2025,6 @@ def run_step3(pool_b,precomputed,cfg,date):
 # Step 4 — 텔레그램 발송
 # ══════════════════════════════════════════════════════════════════════════════
 def _esc(text: str) -> str:
-    """텔레그램 HTML 모드 이스케이프 — &, <, > 처리"""
     return str(text).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
 GRADE_RANK={"집중":2,"주시":1,"참고":0}
@@ -2066,28 +2033,22 @@ def run_step4(results,cfg,dry_run=False):
     today=datetime.now().strftime("%Y%m%d"); tg=TelegramClient()
     min_score=cfg.get("grade",{}).get("min_display_score",0)
     results=[r for r in results if r["score"]>=min_score]
-    # 중복 차단 해제: 같은 종목·같은 등급이라도 매 실행마다 발송
-    # (지속 시그널과 등급 변화 모두 정보로 보존, mark_sent는 이력 추적용으로 유지)
     to_send = list(results)
     high=[r for r in to_send if r["grade"]=="집중"]
     mid=[r for r in to_send if r["grade"]=="주시"]
 
     def fmt(i,r):
-        # 기본 정보
         tier_icon={"large":"[대형]","mid":"[중형]","small":"[소형]"}.get(r.get("cap_tier","large"),"[?]")
         cross=("  ✦ N-Accel" if r.get("n_accel") else "")+("  ✦ V-Surge" if r.get("v_surge") else "")
 
-        # 현재가 + 등락률
         price      = r.get("current_price",0)
         change_pct = r.get("change_pct",0)
         change_str = (f"+{change_pct:.1f}%" if change_pct>=0 else f"{change_pct:.1f}%")
         change_icon= "▲" if change_pct>0 else ("▼" if change_pct<0 else "─")
         price_str  = f"{price:,.0f}원 {change_icon}{change_str}" if price>0 else "─"
 
-        # 수급 (기관/외인 분리) — KIS API 단위: 백만원
         inst_v    = r.get("inst_net",    0)
         foreign_v = r.get("foreign_net", 0)
-        # net_buy_days=0 이고 inst/foreign 모두 0이면 수급 미수신으로 판단
         no_data = (inst_v == 0 and foreign_v == 0 and r.get("net_buy_days", 0) == 0)
 
         if no_data:
@@ -2098,16 +2059,13 @@ def run_step4(results,cfg,dry_run=False):
             foreign_str = (f"+{foreign_v:,}백만" if foreign_v > 0 else f"{foreign_v:,}백만" if foreign_v < 0 else "0")
         retail_tag = "  ✦ 개인주도" if r.get("retail_buy_days",0)>=3 and r.get("net_buy_days",0)<3 else ""
 
-        # 볼린저밴드 위치 표시
         bb  = r.get("bb_pos",50)
         bb_label = ("상단돌파" if bb>=95 else "상단근접" if bb>=80
                     else "중립"   if bb>=40 else "하단근접" if bb>=20 else "하단돌파")
 
-        # RSI
         rsi = r.get("rsi",50)
         rsi_label = ("과매수" if rsi>=70 else "과매도" if rsi<=30 else "중립")
 
-        # 거래량 비율 (5일 평균 / 60일 평균) — 1.5배 이상은 vol_rising 표시
         vol_5d  = r.get("vol_5d_avg", 0)
         vol_60  = r.get("vol_60ma", 0) or r.get("vol_20ma", 0)
         if vol_5d > 0 and vol_60 > 0:
@@ -2118,7 +2076,6 @@ def run_step4(results,cfg,dry_run=False):
         else:
             vol_line = ""
 
-        # 최고 호재 헤드라인
         headline=r.get("best_headline",""); h_pct=r.get("best_headline_pct",0)
         if headline and h_pct>=70:
             h_short=_esc(headline[:45])+("..." if len(headline)>45 else "")
@@ -2140,9 +2097,6 @@ def run_step4(results,cfg,dry_run=False):
     mi_c=sum(1 for r in results if r["grade"]=="주시")
     lo_c=sum(1 for r in results if r["grade"]=="참고")
 
-    # ── 메시지 구성: (kind, payload) 튜플 리스트로 ──
-    # kind: "header" | "high" | "mid" | "low" | "sector"
-    # 발송 성공한 그룹의 종목만 mark_sent (DB 데이터 손실 방지)
     msg_items = []
     msg_items.append(("header",
         f"📡 <b>AlphaRadar 관망 리스트</b>\n📅 {now}\n━━━━━━━━━━━━━━━━━━━━\n"
@@ -2160,7 +2114,6 @@ def run_step4(results,cfg,dry_run=False):
             + "".join(fmt(i+1,r) for i,r in enumerate(mid))
             + "\n━━━━━━━━━━━━━━━━━━━━"))
 
-    # 참고 — 종목명·섹터만 간략 출력
     low=[r for r in results if r["grade"]=="참고" and r["score"]>=min_score]
     if low:
         low_lines=["⚪ <b>참고</b>","━━━━━━━━━━━━━━━━━━━━"]
@@ -2169,7 +2122,6 @@ def run_step4(results,cfg,dry_run=False):
         low_lines.append("━━━━━━━━━━━━━━━━━━━━")
         msg_items.append(("low", "\n".join(low_lines)))
 
-    # 섹터별 집계 — low 등급 유무와 무관하게 항상 실행
     sg = defaultdict(lambda: {"집중": 0, "주시": 0, "참고": 0})
     for r in results:
         sg[r["sector"]][r["grade"]] += 1
@@ -2190,10 +2142,8 @@ def run_step4(results,cfg,dry_run=False):
     if dry_run:
         logger.info("▶ [DRY RUN] 콘솔 출력")
         for msg in msgs: print("\n"+"─"*60+"\n"+msg)
-        # dry_run에서는 mark_sent 호출 안 함 (운영 영향 X)
     else:
-        send_results = tg.send_many(msgs)   # 각 메시지 성공 여부 리스트
-        # 그룹별 성공 여부 매핑 → 성공한 그룹의 종목만 mark_sent
+        send_results = tg.send_many(msgs)
         kind_ok = {kind: ok for (kind, _), ok in zip(msg_items, send_results)}
         sent_count = 0
         skipped_count = 0
@@ -2234,7 +2184,7 @@ def setup_dart():
 # 진입점
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
-    parser=argparse.ArgumentParser(description="AlphaRadar v3")
+    parser=argparse.ArgumentParser(description="AlphaRadar v3.3")
     parser.add_argument("--step",    type=int,   default=None,  choices=[0,1,2,3,4])
     parser.add_argument("--date",    type=str,   default=None)
     parser.add_argument("--market",  type=str,   default="ALL", choices=["KOSPI","KOSDAQ","ALL"])
@@ -2254,7 +2204,7 @@ def main():
 
     start=time.time()
     logger.info("="*60)
-    logger.info(f"AlphaRadar v3  |  기준일: {date_str}")
+    logger.info(f"AlphaRadar v3.3  |  기준일: {date_str}")
     logger.info(f"S = T×{cfg['scoring'].get('w_tech',cfg['scoring'].get('w1',0.35))} + S_text×{cfg['scoring'].get('w_text',cfg['scoring'].get('w2',0.30))} + D×{cfg['scoring'].get('w_cross',cfg['scoring'].get('w3',0.35))}")
     logger.info("="*60)
 
@@ -2279,7 +2229,6 @@ def main():
     if args.step in (None,1):
         logger.info("▶ Step 1: 신호 탐지")
         pool_a=run_step1(precomputed,cfg)
-        # pool_a 캐시 저장 (--step 2/3 개별 실행 시 재사용)
         CACHE_DIR.mkdir(parents=True,exist_ok=True)
         with open(CACHE_DIR/f"pool_a_{date_str}.pkl","wb") as f: pickle.dump(pool_a,f)
         logger.info(f"  → POOL_A: {len(pool_a)}개")
