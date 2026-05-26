@@ -1,15 +1,8 @@
 """
-AlphaRadar v3.3.1 — 단일 파일 안정화 버전
+AlphaRadar v3.3 — 단일 파일 안정화 버전
 정형:비정형 = 6:4 (S_text = 뉴스+공시 FinBERT)
 
 변경사항:
-  v3.3.1 (2026-05-26): Phase A.1 — 매핑 신뢰도 게이트
-  [외부 보고서 6건 매핑 오염 사례 대응]
-  - B7: _is_subject() — 종목명이 텍스트 주체인지 검증 (위치+횟수)
-  - R5: score_with_confidence() — 감성 점수에 confidence 동시 산출
-  - C1: run_step3 신뢰도 게이트 — confidence < 0.5 면 감성 폐기
-  - C2: fmt() 경고 표시 — ⚠️ 매핑 신뢰도 낮음
-
   v3.3 (2026-05-25): Phase A — Tier 1·2 통합 패치
   [TelegramClient 강화]
   - R1: timeout=(3, 10) 분리 — DNS 막힘 빠른 컷
@@ -352,39 +345,6 @@ class FinBertClient:
                 best_pct = result["pos_prob"]
                 best_text = text
         return overall, best_text, round(best_pct * 100, 1)
-
-    def score_with_confidence(self, texts, name=None, position_threshold=0.3):
-        """
-        Phase A.1 — 매핑 신뢰도(confidence) 동시 반환.
-
-        반환: (score, best_headline, headline_pct, confidence)
-
-        name 이 주어지면 각 텍스트가 _is_subject 통과 비율로 confidence 계산.
-        confidence < 0.5 → score=50 (중립), 헤드라인 빈 문자열.
-        호출부(run_step3)는 confidence 로 게이트 처리.
-        """
-        if not texts:
-            return 50.0, "", 0.0, 0.0
-        if name:
-            valid = []
-            for t in texts:
-                if not t:
-                    continue
-                idx = t.find(name)
-                if idx < 0:
-                    continue
-                if idx / max(len(t), 1) >= position_threshold:
-                    continue
-                if t.count(name) < 2 and idx > 15:
-                    continue
-                valid.append(t)
-            confidence = round(len(valid) / len(texts), 3) if texts else 0.0
-            if confidence < 0.5 or not valid:
-                return 50.0, "", 0.0, confidence
-            score, headline, pct = self.score_with_best(valid)
-            return score, headline, pct, confidence
-        score, headline, pct = self.score_with_best(texts)
-        return score, headline, pct, 1.0
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DB
@@ -803,33 +763,6 @@ class NaverClient:
     def _is_ad(self, text: str) -> bool:
         return any(m in text for m in self._AD_MARKERS)
 
-    def _is_subject(self, text: str, name: str, position_threshold: float = 0.3) -> bool:
-        """
-        Phase A.1 (B7) — 종목명이 텍스트의 '주체'인지 검증.
-
-        외부 보고서 6건 매핑 오염 사례 대응:
-          한솔홀딩스 ← 서한 / 키스트론 ← 산일전기 /
-          예스티 ← 주성엔지니어링 / 삼영전자 ← 에스피지 /
-          디케이티·성우 ← 성우전자
-
-        규칙:
-          - 위치 검증: 종목명이 첫 N% 안에 등장 (기본 30%)
-          - 횟수 검증: 1회만 등장 시 매우 앞쪽(15자 이내)이어야 통과
-                       (제목 효과: '한솔홀딩스, ...' OK, '...한솔홀딩스' reject)
-        """
-        if not text or not name:
-            return False
-        idx = text.find(name)
-        if idx < 0:
-            return False
-        text_len = len(text)
-        if idx / max(text_len, 1) >= position_threshold:
-            return False
-        count = text.count(name)
-        if count < 2 and idx > 15:
-            return False
-        return True
-
     def _is_relevant(self, text: str, company: str) -> bool:
         """
         v3.3 — 단어 경계·자회사·우선주·시황 5중 가드.
@@ -873,11 +806,6 @@ class NaverClient:
                 m_idx = text.find(m)
                 if 0 <= m_idx < idx:
                     return False
-
-        # B7 (Phase A.1): 주체 검증 — 본문 앞쪽 30% 안에 + 2회 이상
-        # (또는 매우 앞쪽 1회). 부수 언급(본문 끝) 차단.
-        if not self._is_subject(text, company):
-            return False
 
         return True
 
@@ -2043,11 +1971,7 @@ def run_step3(pool_b,precomputed,cfg,date):
 
     logger.info(f"FinBERT 감성 분석 ({finbert.mode} 모드)...")
     finbert._load()
-    # Phase A.1 — 매핑 신뢰도 동시 산출 (외부 보고서 6건 사례 대응)
-    news_data = {}
-    for t, texts in news_texts.items():
-        nm = pool_b[t].get("name", t)
-        news_data[t] = finbert.score_with_confidence(texts, name=nm)
+    news_data = {t: finbert.score_with_best(texts) for t,texts in news_texts.items()}
     dart_scores = {}
     dart_best_titles = {}
     for ticker, texts in dart_texts.items():
@@ -2060,19 +1984,11 @@ def run_step3(pool_b,precomputed,cfg,date):
         dart_best_titles[ticker] = best_title
 
     results=[]
-    skipped_low_confidence = 0
     for ticker,meta in pool_b.items():
         t_score=_calc_t(meta)
-        n_sc, n_headline, n_pct, n_conf = news_data.get(ticker, (50.0,"",0.0,0.0))
+        n_sc, n_headline, n_pct = news_data.get(ticker, (50.0,"",0.0))
         d_sc=dart_scores.get(ticker,50.0)
-        # Phase A.1 (C1): 신뢰도 < 0.5 면 감성 점수 폐기 (중립 50 처리)
-        if n_conf < 0.5:
-            s_text = round(50.0*news_w + d_sc*dart_w, 1)
-            news_skipped = True
-            skipped_low_confidence += 1
-        else:
-            s_text = round(n_sc*news_w + d_sc*dart_w, 1)
-            news_skipped = False
+        s_text=round(n_sc*news_w + d_sc*dart_w, 1)
         d_score,n_accel,v_surge=_calc_d(ticker,meta,all_vol,all_hype,top_pct,scfg)
         score=round(t_score*w_tech + s_text*w_text + d_score*w_cross, 2)
         results.append({
@@ -2082,7 +1998,6 @@ def run_step3(pool_b,precomputed,cfg,date):
             "source":meta.get("source","?"),"n_accel":n_accel,"v_surge":v_surge,
             "finbert_mode":finbert.mode,
             "best_headline":n_headline,"best_headline_pct":n_pct,
-            "news_confidence":n_conf,"news_skipped":news_skipped,
             "best_dart_title":dart_best_titles.get(ticker,""),
             "news_count":len(news_texts.get(ticker,[])),
             "dart_count":len(dart_texts.get(ticker,[])),
@@ -2100,8 +2015,6 @@ def run_step3(pool_b,precomputed,cfg,date):
     hi=cfg["grade"]["high_interest"]; mi=cfg["grade"]["interest"]
     for r in results:
         r["grade"]="집중" if r["score"]>=hi else "주시" if r["score"]>=mi else "참고"
-    if skipped_low_confidence:
-        logger.info(f"Phase A.1: 매핑 신뢰도 < 0.5 → 감성 점수 폐기 {skipped_low_confidence}건")
     logger.info(f"스코어링: {len(results)}개 | 집중:{sum(1 for r in results if r['grade']=='집중')} | FinBERT:{finbert.mode}")
     save_scan_results(results,date)
     CACHE_DIR.mkdir(parents=True,exist_ok=True)
@@ -2164,13 +2077,7 @@ def run_step4(results,cfg,dry_run=False):
             vol_line = ""
 
         headline=r.get("best_headline",""); h_pct=r.get("best_headline_pct",0)
-        n_conf=r.get("news_confidence", 1.0)
-        news_skipped=r.get("news_skipped", False)
-
-        # Phase A.1 (C2): 매핑 신뢰도 낮음 경고
-        if news_skipped:
-            headline_line=f"\n   ⚠️ 뉴스 매핑 신뢰도 낮음 ({n_conf*100:.0f}%) — 감성 점수 폐기"
-        elif headline and h_pct>=70:
+        if headline and h_pct>=70:
             h_short=_esc(headline[:45])+("..." if len(headline)>45 else "")
             headline_line=f"\n   📝 [호재] {h_short} ({h_pct:.0f}%)"
         else:
@@ -2277,7 +2184,7 @@ def setup_dart():
 # 진입점
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
-    parser=argparse.ArgumentParser(description="AlphaRadar v3.3.1")
+    parser=argparse.ArgumentParser(description="AlphaRadar v3.3")
     parser.add_argument("--step",    type=int,   default=None,  choices=[0,1,2,3,4])
     parser.add_argument("--date",    type=str,   default=None)
     parser.add_argument("--market",  type=str,   default="ALL", choices=["KOSPI","KOSDAQ","ALL"])
@@ -2297,7 +2204,7 @@ def main():
 
     start=time.time()
     logger.info("="*60)
-    logger.info(f"AlphaRadar v3.3.1  |  기준일: {date_str}")
+    logger.info(f"AlphaRadar v3.3  |  기준일: {date_str}")
     logger.info(f"S = T×{cfg['scoring'].get('w_tech',cfg['scoring'].get('w1',0.35))} + S_text×{cfg['scoring'].get('w_text',cfg['scoring'].get('w2',0.30))} + D×{cfg['scoring'].get('w_cross',cfg['scoring'].get('w3',0.35))}")
     logger.info("="*60)
 
