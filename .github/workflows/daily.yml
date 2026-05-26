@@ -3,9 +3,13 @@ name: AlphaRadar Daily Run
 # ─── 실행 트리거 ─────────────────────────────────────────
 on:
   schedule:
-    # 매주 월~금 KST 16:00 (= UTC 07:00) 자동 실행
-    # 한국 장 마감(15:30) 30분 후, KIS 일별 데이터 집계 완료 시점
-    - cron: '0 7 * * 1-5'
+    # 매주 월~금 KST 07:40 (장 시작 1시간 20분 전) — UTC 일~목 22:40
+    # KST 월요일 07:40 = UTC 일요일 22:40 이므로 요일을 0-4 로 지정
+    # 7:40 설정은 GitHub Actions schedule 의 5~15분 지연을 흡수하여
+    # 실제 발송이 KST 08:00 근처에 도착하도록 마진을 둔 것
+    - cron: '40 22 * * 0-4'
+    # 매주 월~금 KST 18:40 (장 마감 3시간 10분 후) — UTC 월~금 09:40
+    - cron: '40 9 * * 1-5'
   workflow_dispatch:        # 수동 실행 버튼 활성화
     inputs:
       dry_run:
@@ -31,26 +35,20 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    # v3.3: 30 → 60 분.
-    # 첫 실행 시 DART 마스터 캐시가 비어있어 fresh fetch(약 20분) 필요.
-    # 두 번째 실행부터 캐시 적중으로 15분 내 종료 예상.
     timeout-minutes: 60
 
     steps:
-      # ─── 1. 코드 체크아웃 ──────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ─── 2. Python 환경 ────────────────────────────────
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      # ─── 3. FinBERT 모델 캐시 (~400MB) ─────────────────
       - name: Cache HuggingFace models
         uses: actions/cache@v4
         with:
@@ -58,10 +56,6 @@ jobs:
           key: hf-finbert-snunlp-v1
           restore-keys: hf-finbert-
 
-      # ─── 4. v3.3 신규: 일별 텍스트·수급 캐시 ──────────
-      # Phase A 의 incremental 캐시(news_titles, dart_titles)와 KIS 수급을
-      # GitHub Actions cache 로 보호. git push 부담 없음, 매일 자동 회전.
-      # restore-keys 가 prefix 매칭이라 직전 실행 캐시를 항상 복원.
       - name: Cache daily text/investor data
         uses: actions/cache@v4
         with:
@@ -72,36 +66,27 @@ jobs:
           key: alpharadar-daily-${{ github.run_id }}
           restore-keys: alpharadar-daily-
 
-      # ─── 5. 의존성 설치 ────────────────────────────────
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # FinBERT 필수 — requirements.txt에 주석 처리되어 있어 별도 설치
           pip install 'transformers>=4.30' 'torch>=2.0' --extra-index-url https://download.pytorch.org/whl/cpu
 
-      # ─── 6. AlphaRadar 실행 ───────────────────────────
       - name: Run AlphaRadar
         env:
-          # KIS Open API
           KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY }}
           KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
           KIS_ACCOUNT_NO: ${{ secrets.KIS_ACCOUNT_NO }}
           KIS_IS_REAL:    ${{ secrets.KIS_IS_REAL }}
-          # OpenDART
           DART_API_KEY:   ${{ secrets.DART_API_KEY }}
-          # Naver Open API (키 1)
           NAVER_CLIENT_ID:     ${{ secrets.NAVER_CLIENT_ID }}
           NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
-          # Naver Open API (키 2~3)
           NAVER_CLIENT_ID_2:     ${{ secrets.NAVER_CLIENT_ID_2 }}
           NAVER_CLIENT_SECRET_2: ${{ secrets.NAVER_CLIENT_SECRET_2 }}
           NAVER_CLIENT_ID_3:     ${{ secrets.NAVER_CLIENT_ID_3 }}
           NAVER_CLIENT_SECRET_3: ${{ secrets.NAVER_CLIENT_SECRET_3 }}
-          # Telegram
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          # GitHub Actions는 비대화형 환경 → tqdm 진행바 비활성화
           TQDM_DISABLE: '1'
         run: |
           ARGS=""
@@ -114,32 +99,23 @@ jobs:
           echo "실행 인자: python alpharadar.py $ARGS"
           python alpharadar.py $ARGS
 
-      # ─── 7. 결과 DB·DART 마스터 캐시 자동 커밋 ─────────
-      # 일별 텍스트 캐시는 위 actions/cache 가 담당.
-      # 여기는 DART 마스터(월 단위) + DB + 로그만 push.
       - name: Commit DB & DART master cache
-        if: always()        # 실행 실패해도 부분 캐시·로그는 커밋
+        if: always()
         run: |
           git config user.email "actions@github.com"
           git config user.name  "alpharadar-bot"
-          # DB
           git add data/scores_history.db              2>/dev/null || true
-          # DART 마스터 캐시 (v3.3: dart_corp_codes 추가)
           git add data/cache/dart_sector_map.pkl      2>/dev/null || true
           git add data/cache/dart_sector_map_v2.pkl   2>/dev/null || true
           git add data/cache/dart_corp_codes.pkl      2>/dev/null || true
-          # 로그
           git add data/logs/scanner_*.log             2>/dev/null || true
-          # 변경 사항 있을 때만 커밋
           if git diff --staged --quiet; then
             echo "커밋할 변경사항 없음"
           else
-            # [skip ci]: 자기 자신 다시 트리거 방지 (schedule 만 있어 사실 무관, 안전 마진)
             git commit -m "auto: daily run $(date -u +%F\ %H:%M\ UTC) [skip ci]"
             git push
           fi
 
-      # ─── 8. 실패 시 로그 업로드 (디버깅용) ─────────────
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
