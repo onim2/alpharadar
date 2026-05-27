@@ -1846,8 +1846,7 @@ def run_step1(precomputed,cfg):
         b=(p.get("hype_slope", 0) > 0 and
            p.get("neg_ratio",  0) < eb_cfg["max_negative_sentiment"])
         if not (a or b): continue
-        # Phase A.2: 부정 뉴스 30% 이상 — Engine B 진입조건에서 POOL_A 전체 게이트로 승격
-        # 근거: 횡령·유상증자 종목이 거래량 폭증(Engine A)만으로 통과하던 구멍 차단
+        # Phase A.2: neg_ratio gate (Engine B only -> POOL_A whole gate)
         if p.get("neg_ratio", 0) >= eb_cfg["max_negative_sentiment"]:
             continue
         source="both" if (a and b) else ("engine_a" if a else "engine_b")

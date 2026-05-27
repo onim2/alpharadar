@@ -31,9 +31,9 @@ cap_tier:
 # ── Step 2: 하드 필터 ─────────────────────────────────
 filter:
   # ① 이격도 상한 — 단기 과열 제거 (추격매수 금지)
-  max_disparity_large: 110         # 대형주: MA20 대비 10% 이상이면 과열
-  max_disparity_mid:   115         # 중형주: MA20 대비 15% 이상이면 과열
-  max_disparity_small: 120         # 소형주: MA20 대비 20% 이상이면 과열
+  max_disparity_large: 110         # 대형주: MA20 대비 15% 이상이면 과열
+  max_disparity_mid:   115         # 중형주: MA20 대비 20% 이상이면 과열
+  max_disparity_small: 120         # 소형주: MA20 대비 30% 이상이면 과열
 
   # ② 이격도 하한 — MA20 아래 하락 추세 제거
   min_disparity: 93                # MA20 대비 93% 미만 = MA20 아래 = 하락 추세
@@ -84,7 +84,7 @@ scoring:
 grade:
   high_interest: 75                # 75점 이상 → 🔴 집중
   interest: 70                     # 65점 이상 → 🟠 주시
-  min_display_score: 60           # 55점 미만은 텔레그램 출력에서 완전 제외
+  min_display_score: 60            # 55점 미만은 텔레그램 출력에서 완전 제외
 
 # ── 리스크 키워드 ─────────────────────────────────────
 # 뉴스 헤드라인에 포함 시 neg_ratio 상승 → 30% 이상이면 엔진 B 신호 차단
