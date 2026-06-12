@@ -361,3 +361,58 @@
 2026-06-12 01:08:09,348 [WARNING] __main__ — KIS 토큰 발급 실패: HTTPSConnectionPool(host='openapivts.koreainvestment.com', port=29443): Max retries exceeded with url: /oauth2/tokenP (Caused by ConnectTimeoutError(<HTTPSConnection(host='openapivts.koreainvestment.com', port=29443) at 0x7fc110d19e90>, 'Connection to openapivts.koreainvestment.com timed out. (connect timeout=10)'))
 2026-06-12 01:08:19,447 [WARNING] __main__ — KIS 토큰 발급 실패: HTTPSConnectionPool(host='openapivts.koreainvestment.com', port=29443): Max retries exceeded with url: /oauth2/tokenP (Caused by ConnectTimeoutError(<HTTPSConnection(host='openapivts.koreainvestment.com', port=29443) at 0x7fc12925ef90>, 'Connection to openapivts.koreainvestment.com timed out. (connect timeout=10)'))
 2026-06-12 01:08:29,459 [WARNING] __main__ — KIS 토큰 발급 실패: HTTPSConnectionPool(host='openapivts.koreainvestment.com', port=29443): Max retries exceeded with url: /oauth2/tokenP (Caused by ConnectTimeoutError(<HTTPSConnection(host='openapivts.koreainvestment.com', port=29443) at 0x7fc110d64190>, 'Connection to openapivts.koreainvestment.com timed out. (connect timeout=10)'))
+2026-06-12 12:43:41,136 [INFO] __main__ — config 검증 완료 ✓
+2026-06-12 12:43:41,136 [INFO] __main__ — ============================================================
+2026-06-12 12:43:41,136 [INFO] __main__ — AlphaRadar v3.3.1  |  기준일: 20260612
+2026-06-12 12:43:41,136 [INFO] __main__ — S = T×0.3 + S_text×0.4 + D×0.3
+2026-06-12 12:43:41,136 [INFO] __main__ — ============================================================
+2026-06-12 12:43:41,136 [INFO] __main__ — ▶ Step 0: 유니버스 필터링
+2026-06-12 12:43:41,303 [INFO] __main__ — FDR 데이터 수집: 20251207 ~ 20260612
+2026-06-12 12:43:42,524 [INFO] __main__ — KOSPI: 946개 | 섹터정보 836개 (DART +836개 보완)
+2026-06-12 12:43:42,525 [INFO] __main__ — KOSDAQ: 1822개 | 섹터정보 1822개
+2026-06-12 12:43:42,525 [INFO] __main__ — 전체: 2768개
+2026-06-12 12:43:45,202 [INFO] __main__ — KIS 토큰 발급 완료
+2026-06-12 12:59:54,084 [INFO] __main__ — DART corp_code 매핑: 2230/2283개 (97%)
+2026-06-12 12:59:54,084 [INFO] __main__ — 유효 유니버스: 2283개
+2026-06-12 12:59:54,096 [INFO] __main__ —   → 2283개
+2026-06-12 12:59:54,096 [INFO] __main__ — ▶ Step 1: 신호 탐지
+2026-06-12 12:59:54,096 [INFO] __main__ — NaverClient: 3개 키 로드 (DataLab·검색 독립 회전)
+2026-06-12 12:59:54,096 [INFO] __main__ — 관심 지수 및 부정 뉴스 비율 조회 중...
+2026-06-12 13:03:55,132 [INFO] __main__ — 부정 키워드 감지: 15개 종목 (neg_ratio > 0)
+2026-06-12 13:03:55,138 [INFO] __main__ — POOL_A: 1245개 (A:775 B:221 동시:249)
+  대형:105 중형:280 소형:860
+2026-06-12 13:03:55,147 [INFO] __main__ —   → POOL_A: 1245개
+2026-06-12 13:03:55,147 [INFO] __main__ — ▶ Step 2: 하드 필터링
+2026-06-12 13:03:55,149 [INFO] __main__ — 하드 필터 제거: 1168개 | 이격도상한 54 | 이격도하한 524 | MA추세 465 | RSI과열 1 | 거래대금 124
+2026-06-12 13:03:55,149 [INFO] __main__ — POOL_B: 77개 | 대형:13 중형:37 소형:27
+2026-06-12 13:03:55,149 [INFO] __main__ —   → POOL_B: 77개
+2026-06-12 13:03:55,149 [INFO] __main__ — ▶ Step 3: 스코어링 (FinBERT 감성 분석)
+2026-06-12 13:03:55,150 [INFO] __main__ — NaverClient: 3개 키 로드 (DataLab·검색 독립 회전)
+2026-06-12 13:03:55,150 [INFO] __main__ — 텍스트 신규 수집: 77종목 (캐시 적중 0종목)
+2026-06-12 13:06:02,490 [INFO] __main__ — 수집 완료: 뉴스 736건 | 공시 764건
+2026-06-12 13:06:02,491 [INFO] __main__ — FinBERT 감성 분석 (finbert 모드)...
+2026-06-12 13:06:02,491 [INFO] __main__ — FinBERT 로딩: snunlp/KR-FinBert-SC (CPU, batch=8)
+2026-06-12 13:06:02,538 [INFO] httpx — HTTP Request: GET https://huggingface.co/api/agent-harnesses "HTTP/1.1 200 OK"
+2026-06-12 13:06:02,555 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-06-12 13:06:02,562 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/snunlp/KR-FinBert-SC/f8586286cc3161fb648e9fee09a456069fd846d0/config.json "HTTP/1.1 200 OK"
+2026-06-12 13:06:02,598 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/model.safetensors "HTTP/1.1 404 Not Found"
+2026-06-12 13:06:02,598 [WARNING] huggingface_hub.utils._http — Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+2026-06-12 13:06:02,618 [INFO] httpx — HTTP Request: GET https://huggingface.co/api/models/snunlp/KR-FinBert-SC "HTTP/1.1 200 OK"
+2026-06-12 13:06:02,655 [INFO] httpx — HTTP Request: GET https://huggingface.co/api/models/snunlp/KR-FinBert-SC/commits/main "HTTP/1.1 200 OK"
+2026-06-12 13:06:02,681 [INFO] httpx — HTTP Request: GET https://huggingface.co/api/models/snunlp/KR-FinBert-SC/discussions?p=0 "HTTP/1.1 200 OK"
+2026-06-12 13:06:02,708 [INFO] httpx — HTTP Request: GET https://huggingface.co/api/models/snunlp/KR-FinBert-SC/commits/refs%2Fpr%2F3 "HTTP/1.1 200 OK"
+2026-06-12 13:06:02,735 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/refs%2Fpr%2F3/model.safetensors.index.json "HTTP/1.1 404 Not Found"
+2026-06-12 13:06:02,766 [INFO] httpx — HTTP Request: GET https://huggingface.co/api/models/snunlp/KR-FinBert-SC/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+2026-06-12 13:06:02,768 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/refs%2Fpr%2F3/model.safetensors "HTTP/1.1 302 Found"
+2026-06-12 13:06:02,785 [INFO] httpx — HTTP Request: GET https://huggingface.co/api/models/snunlp/KR-FinBert-SC/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-06-12 13:06:02,825 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
+2026-06-12 13:06:02,845 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/video_preprocessor_config.json "HTTP/1.1 404 Not Found"
+2026-06-12 13:06:02,863 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/preprocessor_config.json "HTTP/1.1 404 Not Found"
+2026-06-12 13:06:02,864 [INFO] __main__ — FinBERT 로드 완료 (CPU)
+2026-06-12 13:06:57,511 [INFO] __main__ — Phase A.1: 매핑 신뢰도 < 0.5 → 감성 점수 폐기 56건
+2026-06-12 13:06:57,511 [INFO] __main__ — 스코어링: 77개 | 집중:2 | FinBERT:finbert
+2026-06-12 13:06:57,529 [INFO] __main__ —   → 77개
+2026-06-12 13:06:57,529 [INFO] __main__ — ▶ Step 4: 발송
+2026-06-12 13:07:03,243 [INFO] __main__ — DB 기록: 16개 / 전체 to_send 16개
+2026-06-12 13:07:03,243 [INFO] __main__ — 발송: 집중 2 / 주시 2
+2026-06-12 13:07:03,244 [INFO] __main__ — 완료  |  소요: 1402.1초
