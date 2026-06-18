@@ -54,3 +54,103 @@
 2026-06-18 00:33:08,293 [INFO] __main__ — DB 기록: 0개 / 전체 to_send 16개
 2026-06-18 00:33:08,293 [INFO] __main__ — 발송: 집중 0 / 주시 0
 2026-06-18 00:33:08,293 [INFO] __main__ — 완료  |  소요: 1772.3초
+2026-06-18 12:43:00,904 [INFO] __main__ — config 검증 완료 ✓
+2026-06-18 12:43:00,904 [INFO] __main__ — ============================================================
+2026-06-18 12:43:00,904 [INFO] __main__ — AlphaRadar v3.3.1  |  기준일: 20260618
+2026-06-18 12:43:00,904 [INFO] __main__ — S = T×0.3 + S_text×0.4 + D×0.3
+2026-06-18 12:43:00,904 [INFO] __main__ — ============================================================
+2026-06-18 12:43:00,904 [INFO] __main__ — ▶ Step 0: 유니버스 필터링
+2026-06-18 12:43:01,070 [INFO] __main__ — FDR 데이터 수집: 20251213 ~ 20260618
+2026-06-18 12:43:02,663 [INFO] __main__ — KOSPI: 946개 | 섹터정보 836개 (DART +836개 보완)
+2026-06-18 12:43:02,663 [INFO] __main__ — KOSDAQ: 1821개 | 섹터정보 1821개
+2026-06-18 12:43:02,664 [INFO] __main__ — 전체: 2767개
+2026-06-18 12:43:04,854 [INFO] __main__ — KIS 토큰 발급 완료
+2026-06-18 12:58:58,303 [INFO] __main__ — DART corp_code 매핑: 2223/2277개 (97%)
+2026-06-18 12:58:58,303 [INFO] __main__ — 유효 유니버스: 2277개
+2026-06-18 12:58:58,314 [INFO] __main__ —   → 2277개
+2026-06-18 12:58:58,314 [INFO] __main__ — ▶ Step 1: 신호 탐지
+2026-06-18 12:58:58,314 [INFO] __main__ — NaverClient: 3개 키 로드 (DataLab·검색 독립 회전)
+2026-06-18 12:58:58,315 [INFO] __main__ — 관심 지수 및 부정 뉴스 비율 조회 중...
+2026-06-18 13:02:58,769 [INFO] __main__ — 부정 키워드 감지: 21개 종목 (neg_ratio > 0)
+2026-06-18 13:02:58,777 [INFO] __main__ — POOL_A: 865개 (A:491 B:220 동시:154)
+  대형:92 중형:202 소형:571
+2026-06-18 13:02:58,784 [INFO] __main__ —   → POOL_A: 865개
+2026-06-18 13:02:58,784 [INFO] __main__ — ▶ Step 2: 하드 필터링
+2026-06-18 13:02:58,785 [INFO] __main__ — 하드 필터 제거: 795개 | 이격도상한 51 | 이격도하한 232 | MA추세 388 | RSI과열 5 | 거래대금 119
+2026-06-18 13:02:58,785 [INFO] __main__ — POOL_B: 70개 | 대형:12 중형:27 소형:31
+2026-06-18 13:02:58,785 [INFO] __main__ —   → POOL_B: 70개
+2026-06-18 13:02:58,785 [INFO] __main__ — ▶ Step 3: 스코어링 (FinBERT 감성 분석)
+2026-06-18 13:02:58,785 [INFO] __main__ — NaverClient: 3개 키 로드 (DataLab·검색 독립 회전)
+2026-06-18 13:02:58,786 [INFO] __main__ — 텍스트 신규 수집: 21종목 (캐시 적중 49종목)
+2026-06-18 13:18:40,169 [INFO] __main__ — 수집 완료: 뉴스 792건 | 공시 570건
+2026-06-18 13:18:40,169 [INFO] __main__ — FinBERT 감성 분석 (finbert 모드)...
+2026-06-18 13:18:40,169 [INFO] __main__ — FinBERT 로딩: snunlp/KR-FinBert-SC (CPU, batch=8)
+2026-06-18 13:18:40,288 [INFO] httpx — HTTP Request: GET https://huggingface.co/api/agent-harnesses "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:18:40,293 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:18:40,315 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/model.safetensors "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:18:40,320 [INFO] httpx — HTTP Request: GET https://huggingface.co/api/models/snunlp/KR-FinBert-SC "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:18:40,421 [INFO] httpx — HTTP Request: GET https://huggingface.co/api/models/snunlp/KR-FinBert-SC/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:18:40,425 [INFO] httpx — HTTP Request: GET https://huggingface.co/api/models/snunlp/KR-FinBert-SC/tree/main?recursive=true&expand=false "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:18:40,449 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/processor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:18:40,453 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/processor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:18:40,454 [WARNING] huggingface_hub.utils._http — HTTP Error 429 thrown while requesting HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/processor_config.json
+2026-06-18 13:18:40,454 [WARNING] huggingface_hub.utils._http — Retrying in 1s [Retry 1/5].
+2026-06-18 13:18:41,458 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/processor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:18:41,459 [WARNING] huggingface_hub.utils._http — HTTP Error 429 thrown while requesting HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/processor_config.json
+2026-06-18 13:18:41,459 [WARNING] huggingface_hub.utils._http — Retrying in 2s [Retry 2/5].
+2026-06-18 13:18:43,463 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/processor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:18:43,463 [WARNING] huggingface_hub.utils._http — HTTP Error 429 thrown while requesting HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/processor_config.json
+2026-06-18 13:18:43,463 [WARNING] huggingface_hub.utils._http — Retrying in 4s [Retry 3/5].
+2026-06-18 13:18:47,467 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/processor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:18:47,467 [WARNING] huggingface_hub.utils._http — HTTP Error 429 thrown while requesting HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/processor_config.json
+2026-06-18 13:18:47,467 [WARNING] huggingface_hub.utils._http — Retrying in 8s [Retry 4/5].
+2026-06-18 13:18:55,480 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/processor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:18:55,480 [WARNING] huggingface_hub.utils._http — HTTP Error 429 thrown while requesting HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/processor_config.json
+2026-06-18 13:18:55,480 [WARNING] huggingface_hub.utils._http — Retrying in 8s [Retry 5/5].
+2026-06-18 13:19:03,492 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/processor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:19:03,492 [WARNING] huggingface_hub.utils._http — HTTP Error 429 thrown while requesting HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/processor_config.json
+2026-06-18 13:19:03,497 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/video_preprocessor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:19:03,501 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/video_preprocessor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:19:03,501 [WARNING] huggingface_hub.utils._http — HTTP Error 429 thrown while requesting HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/video_preprocessor_config.json
+2026-06-18 13:19:03,501 [WARNING] huggingface_hub.utils._http — Retrying in 1s [Retry 1/5].
+2026-06-18 13:19:04,505 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/video_preprocessor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:19:04,506 [WARNING] huggingface_hub.utils._http — HTTP Error 429 thrown while requesting HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/video_preprocessor_config.json
+2026-06-18 13:19:04,506 [WARNING] huggingface_hub.utils._http — Retrying in 2s [Retry 2/5].
+2026-06-18 13:19:06,510 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/video_preprocessor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:19:06,510 [WARNING] huggingface_hub.utils._http — HTTP Error 429 thrown while requesting HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/video_preprocessor_config.json
+2026-06-18 13:19:06,510 [WARNING] huggingface_hub.utils._http — Retrying in 4s [Retry 3/5].
+2026-06-18 13:19:10,514 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/video_preprocessor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:19:10,514 [WARNING] huggingface_hub.utils._http — HTTP Error 429 thrown while requesting HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/video_preprocessor_config.json
+2026-06-18 13:19:10,514 [WARNING] huggingface_hub.utils._http — Retrying in 8s [Retry 4/5].
+2026-06-18 13:19:18,529 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/video_preprocessor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:19:18,529 [WARNING] huggingface_hub.utils._http — HTTP Error 429 thrown while requesting HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/video_preprocessor_config.json
+2026-06-18 13:19:18,529 [WARNING] huggingface_hub.utils._http — Retrying in 8s [Retry 5/5].
+2026-06-18 13:19:26,547 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/video_preprocessor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:19:26,548 [WARNING] huggingface_hub.utils._http — HTTP Error 429 thrown while requesting HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/video_preprocessor_config.json
+2026-06-18 13:19:26,553 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/preprocessor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:19:26,560 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/preprocessor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:19:26,560 [WARNING] huggingface_hub.utils._http — HTTP Error 429 thrown while requesting HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/preprocessor_config.json
+2026-06-18 13:19:26,560 [WARNING] huggingface_hub.utils._http — Retrying in 1s [Retry 1/5].
+2026-06-18 13:19:27,564 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/preprocessor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:19:27,565 [WARNING] huggingface_hub.utils._http — HTTP Error 429 thrown while requesting HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/preprocessor_config.json
+2026-06-18 13:19:27,565 [WARNING] huggingface_hub.utils._http — Retrying in 2s [Retry 2/5].
+2026-06-18 13:19:29,570 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/preprocessor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:19:29,571 [WARNING] huggingface_hub.utils._http — HTTP Error 429 thrown while requesting HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/preprocessor_config.json
+2026-06-18 13:19:29,571 [WARNING] huggingface_hub.utils._http — Retrying in 4s [Retry 3/5].
+2026-06-18 13:19:33,575 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/preprocessor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:19:33,575 [WARNING] huggingface_hub.utils._http — HTTP Error 429 thrown while requesting HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/preprocessor_config.json
+2026-06-18 13:19:33,575 [WARNING] huggingface_hub.utils._http — Retrying in 8s [Retry 4/5].
+2026-06-18 13:19:41,626 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/preprocessor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:19:41,626 [WARNING] huggingface_hub.utils._http — HTTP Error 429 thrown while requesting HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/preprocessor_config.json
+2026-06-18 13:19:41,626 [WARNING] huggingface_hub.utils._http — Retrying in 8s [Retry 5/5].
+2026-06-18 13:19:49,639 [INFO] httpx — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/preprocessor_config.json "HTTP/1.1 429 Too Many Requests"
+2026-06-18 13:19:49,639 [WARNING] huggingface_hub.utils._http — HTTP Error 429 thrown while requesting HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/preprocessor_config.json
+2026-06-18 13:19:49,640 [INFO] __main__ — FinBERT 로드 완료 (CPU)
+2026-06-18 13:20:39,736 [INFO] __main__ — Phase A.1: 매핑 신뢰도 < 0.5 → 감성 점수 폐기 52건
+2026-06-18 13:20:39,736 [INFO] __main__ — 스코어링: 70개 | 집중:2 | FinBERT:finbert
+2026-06-18 13:20:39,740 [INFO] __main__ —   → 70개
+2026-06-18 13:20:39,740 [INFO] __main__ — ▶ Step 4: 발송
+2026-06-18 13:20:43,709 [WARNING] __main__ — 텔레그램 발송 실패 그룹 → mark_sent skip 10개 (다음 실행 시 재발송 대상)
+2026-06-18 13:20:43,709 [INFO] __main__ — DB 기록: 2개 / 전체 to_send 12개
+2026-06-18 13:20:43,709 [INFO] __main__ — 발송: 집중 2 / 주시 0
+2026-06-18 13:20:43,709 [INFO] __main__ — 완료  |  소요: 2262.8초
