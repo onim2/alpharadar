@@ -406,6 +406,8 @@ def init_db():
                 rsi REAL, bb_pos REAL, change_pct REAL,
                 vol_slope REAL, net_buy_days INTEGER,
                 hype_slope REAL, hype_rank INTEGER, disparity REAL,
+                rating_bond TEXT, rating_cp TEXT, fg_sector TEXT,
+                fg_industry TEXT, ksic TEXT, largest_holder TEXT,
                 created_at TEXT DEFAULT (datetime('now','localtime'))
             );
             CREATE TABLE IF NOT EXISTS engine_b_history (
@@ -429,6 +431,11 @@ def init_db():
         if "cap_tier" not in cols:
             con.execute("ALTER TABLE scan_results ADD COLUMN cap_tier TEXT")
             logger.info("DB 마이그레이션: cap_tier 컬럼 추가 완료")
+        # master universe 보강 메타 컬럼 (없으면 추가)
+        for _c in ("rating_bond","rating_cp","fg_sector","fg_industry","ksic","largest_holder"):
+            if _c not in cols:
+                con.execute(f"ALTER TABLE scan_results ADD COLUMN {_c} TEXT")
+                logger.info(f"DB 마이그레이션: {_c} 컬럼 추가 완료")
 
 @contextmanager
 def _conn():
@@ -450,8 +457,9 @@ def save_scan_results(results, scan_date):
                  s_text,news_score,dart_score,grade,source,n_accel,v_surge,
                  finbert_mode,news_count,dart_count,inst_net,foreign_net,
                  rsi,bb_pos,change_pct,vol_slope,net_buy_days,
-                 hype_slope,hype_rank,disparity)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 hype_slope,hype_rank,disparity,
+                 rating_bond,rating_cp,fg_sector,fg_industry,ksic,largest_holder)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (scan_date, r["ticker"], r.get("name"), r.get("sector"),
                  r.get("cap_tier"),
                  r.get("score"), r.get("t"), None, r.get("d"),
@@ -462,7 +470,9 @@ def save_scan_results(results, scan_date):
                  r.get("inst_net",0), r.get("foreign_net",0),
                  r.get("rsi",50), r.get("bb_pos",50), r.get("change_pct",0),
                  r.get("vol_slope"), r.get("net_buy_days"),
-                 r.get("hype_slope"), r.get("hype_rank"), r.get("disparity")))
+                 r.get("hype_slope"), r.get("hype_rank"), r.get("disparity"),
+                 r.get("rating_bond"), r.get("rating_cp"), r.get("fg_sector"),
+                 r.get("fg_industry"), r.get("ksic"), r.get("largest_holder")))
 
 def save_engine_b_history(tickers, precomputed, scan_date):
     with _conn() as con:
@@ -1370,6 +1380,10 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
         hist_df = pd.DataFrame({"종가": close_s, "고가": high_s, "거래량": volume_s})
         return {
             "ticker":ticker,"name":info.get("name") or ticker,"sector":sector,
+            # master universe 보강 메타(보조필드) — DB 영속·표시용, 스코어링 미사용
+            "rating_bond":info.get("rating_bond"),"rating_cp":info.get("rating_cp"),
+            "fg_sector":info.get("fg_sector"),"fg_industry":info.get("fg_industry"),
+            "ksic":info.get("ksic"),"largest_holder":info.get("largest_holder"),
             "market":mkt,"market_cap":cap,"cap_tier":cap_tier,"current_price":current,
             "ma20":ma20,"ma60":ma60,"ma120":ma120,"disparity":disparity(current,ma20),
             "vol_60ma":vol_60ma,"vol_20ma":vol_20ma,"vol_5d_avg":vol_5d,
@@ -1704,6 +1718,34 @@ def _load_dart_sector_map() -> dict:
 
     return sector_map
 
+def _load_master_universe_meta() -> dict:
+    """중앙 datastore(master.db) universe 최신 연도(PIT)에서 종목 메타 로드.
+    반환: {'005930': {fg_sector, fg_industry, ksic, rating_bond, rating_cp, largest_holder}}.
+    티커는 master 'A005930' → '005930' 매핑. master 없으면 {} (보강 생략)."""
+    try:
+        import sqlite3
+        db = "/Users/summer123/Project_2/data_store/master.db"
+        if not os.path.exists(db):
+            return {}
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as c:
+            yr = c.execute("SELECT MAX(year) FROM universe").fetchone()[0]
+            rows = c.execute(
+                "SELECT ticker, fg_sector, fg_industry, ksic, rating_bond, rating_cp, "
+                "largest_holder FROM universe WHERE year=?", (yr,)).fetchall()
+        def _s(x):  # xlsx 패딩 제거
+            return x.strip() if isinstance(x, str) else x
+        meta = {}
+        for tk, fgs, fgi, ksic, rb, rcp, lh in rows:
+            code = tk[1:] if isinstance(tk, str) and tk.startswith("A") and tk[1:].isdigit() else tk
+            meta[code] = {"fg_sector": _s(fgs), "fg_industry": _s(fgi), "ksic": _s(ksic),
+                          "rating_bond": _s(rb), "rating_cp": _s(rcp), "largest_holder": _s(lh)}
+        logger.info(f"master universe 메타 로드: {len(meta)}개 (year={yr})")
+        return meta
+    except Exception as e:
+        logger.info(f"master universe 메타 미사용: {e}")
+        return {}
+
+
 def run_step0(date,cfg,market="ALL",limit=None):
     dart_sector_map = _load_dart_sector_map()
     import FinanceDataReader as fdr
@@ -1752,6 +1794,44 @@ def run_step0(date,cfg,market="ALL",limit=None):
             if sector in ("", "nan", "None", "기타") and ticker in dart_sector_map:
                 ticker_info[ticker]["sector"] = dart_sector_map[ticker]
                 patched += 1
+
+    # 중앙 datastore(master.db) universe 보강: 신용등급·FnGuide·KSIC·최대주주(신규 보조필드)
+    # + 스코어링용 sector는 비어있을 때만 gap-fill(기존 KSIC 택소노미 보존 → 스코어링 영향 없음)
+    master_meta = _load_master_universe_meta()
+    m_rating = m_fg = m_gap = 0
+    if master_meta:
+        for ticker, info in ticker_info.items():
+            mm = master_meta.get(str(ticker))
+            if not mm:
+                continue
+            if mm.get("rating_bond") or mm.get("rating_cp"):
+                info["rating_bond"] = mm.get("rating_bond")
+                info["rating_cp"]   = mm.get("rating_cp")
+                m_rating += 1
+            if mm.get("fg_sector"):
+                info["fg_sector"]      = mm.get("fg_sector")
+                info["fg_industry"]    = mm.get("fg_industry")
+                info["ksic"]           = mm.get("ksic")
+                info["largest_holder"] = mm.get("largest_holder")
+                m_fg += 1
+                sec = str(info.get("sector") or "").strip()
+                if sec in ("", "nan", "None", "기타"):
+                    info["sector"] = mm["fg_sector"]
+                    m_gap += 1
+        logger.info(f"master 보강: 등급 {m_rating}개 | FnGuide/KSIC {m_fg}개 | 섹터 gap-fill {m_gap}개")
+
+    # 신용등급 하드 필터 (config filter.exclude_ratings) — 기본 빈 목록이면 무동작
+    excl = {str(x).strip() for x in (cfg.get("filter", {}).get("exclude_ratings") or [])}
+    if excl:
+        def _rating_excluded(t):
+            info = ticker_info.get(t, {})
+            rb = str(info.get("rating_bond") or "").strip()
+            rcp = str(info.get("rating_cp") or "").strip()
+            return (rb in excl) or (rcp in excl)
+        before = len(all_tickers)
+        all_tickers = [t for t in all_tickers if not _rating_excluded(t)]
+        logger.info(f"등급 필터: {before - len(all_tickers)}개 제외 "
+                    f"(exclude_ratings={sorted(excl)})")
 
     for mkt in (["KOSPI","KOSDAQ"] if market=="ALL" else [market]):
         mkt_tickers = [t for t,i in ticker_info.items() if i.get("market")==mkt]
@@ -2081,6 +2161,9 @@ def run_step3(pool_b,precomputed,cfg,date):
         score=round(t_score*w_tech + s_text*w_text + d_score*w_cross, 2)
         results.append({
             "ticker":ticker,"name":meta.get("name",ticker),"sector":meta.get("sector","기타"),
+            "rating_bond":meta.get("rating_bond"),"rating_cp":meta.get("rating_cp"),
+            "fg_sector":meta.get("fg_sector"),"fg_industry":meta.get("fg_industry"),
+            "ksic":meta.get("ksic"),"largest_holder":meta.get("largest_holder"),
             "cap_tier":meta.get("cap_tier","large"),"score":score,
             "t":t_score,"s_text":s_text,"news_score":n_sc,"dart_score":d_sc,"d":d_score,
             "source":meta.get("source","?"),"n_accel":n_accel,"v_surge":v_surge,
@@ -2137,6 +2220,9 @@ def run_step4(results,cfg,dry_run=False):
         change_str = (f"+{change_pct:.1f}%" if change_pct>=0 else f"{change_pct:.1f}%")
         change_icon= "▲" if change_pct>0 else ("▼" if change_pct<0 else "─")
         price_str  = f"{price:,.0f}원 {change_icon}{change_str}" if price>0 else "─"
+        # master 보강 신용등급 — 값 있을 때만 표시 (채권/CP)
+        _rb=str(r.get("rating_bond") or "").strip(); _rcp=str(r.get("rating_cp") or "").strip()
+        rating_str=(f"  |  🏷 {_esc(_rb)}"+(f"/{_esc(_rcp)}" if _rcp else "")) if _rb else ""
 
         inst_v    = r.get("inst_net",    0)
         foreign_v = r.get("foreign_net", 0)
@@ -2182,7 +2268,7 @@ def run_step4(results,cfg,dry_run=False):
 
         return (
             f"\n\n<b>{i}. {_esc(r['name'])} ({r['ticker']})</b>\n"
-            f"   {_esc(r['sector'])}  {tier_icon}  |  💵 {price_str}\n"
+            f"   {_esc(r['sector'])}  {tier_icon}{rating_str}  |  💵 {price_str}\n"
             f"   🏦 기관 {inst_str}  |  🌏 외인 {foreign_str}  ({r['net_buy_days']}일){retail_tag}\n"
             f"   📊 BB {bb:.0f}% {bb_label}  |  RSI {rsi:.0f} {rsi_label}{vol_line}\n"
             f"   📐 이격도 {r['disparity']:.1f}%  (20일 평균 대비 현재가 위치)\n"

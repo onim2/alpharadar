@@ -120,7 +120,71 @@ def _save_returns_cache(cache: dict):
         pickle.dump(cache, f)
 
 
+# ── 중앙 datastore(master.db) 연동 — KR 과거가격 우선 소스, FDR은 fallback ──
+_DS = None
+_MMAX = None
+DATASTORE_DIR = "/Users/summer123/Project_2/data_store"
+
+def _datastore():
+    """data_store/dataio.py의 DataStore (없으면 None → 전량 FDR)."""
+    global _DS
+    if _DS is None:
+        try:
+            if DATASTORE_DIR not in sys.path:
+                sys.path.insert(0, DATASTORE_DIR)
+            from dataio import DataStore
+            _DS = DataStore()
+            logger.info("중앙 datastore 연결: master.db (KR 과거가격 우선)")
+        except Exception as e:
+            logger.info(f"중앙 datastore 미사용 → FDR: {e}")
+            _DS = False
+    return _DS or None
+
+
+def _master_max_date(ds):
+    """master price의 KR(벤더수정) 최신일 — 이 날짜를 넘는 요청은 FDR로."""
+    global _MMAX
+    if _MMAX is None:
+        try:
+            with sqlite3.connect(f"file:{ds.db}?mode=ro", uri=True) as c:
+                r = c.execute(
+                    "SELECT MAX(date) FROM price WHERE adj_src='vendor frozen'"
+                ).fetchone()
+            _MMAX = pd.Timestamp(r[0]) if r and r[0] else False
+        except Exception:
+            _MMAX = False
+    return None if _MMAX is False else _MMAX
+
+
+def _fetch_from_master(ticker: str, start: str, end: str):
+    """master.db에서 KR 종목 수정종가(벤더 동결, FDR Close와 동일 의미) → df[['Close']].
+    티커 매핑 '005930'→'A005930'. 요청 end가 master 커버리지를 넘으면 None(→FDR)."""
+    ds = _datastore()
+    if ds is None:
+        return None
+    mmax = _master_max_date(ds)
+    if mmax is None or pd.Timestamp(end) > mmax:   # 최신 구간은 FDR이 더 최신
+        return None
+    mt = "A" + ticker if (ticker.isdigit() and len(ticker) == 6) else ticker
+    try:
+        w = ds.prices([mt], start=start, end=end, field="adj_close")
+    except Exception:
+        return None
+    if w.empty or mt not in w.columns:
+        return None
+    s = w[[mt]].dropna()
+    if s.empty:
+        return None
+    s.columns = ["Close"]
+    return s
+
+
 def _fetch_price_series(ticker: str, start: str, end: str):
+    # 1) 중앙 datastore 우선 (KR 종목 과거 수정종가)
+    s = _fetch_from_master(ticker, start, end)
+    if s is not None:
+        return s
+    # 2) fallback: FinanceDataReader (벤치마크 지수·master 미수록·최신 구간)
     try:
         import FinanceDataReader as fdr
         df = fdr.DataReader(ticker, start, end)
