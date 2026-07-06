@@ -80,6 +80,9 @@ scoring:
   finbert_model: "snunlp/KR-FinBert-SC"
   news_count: 10                   # 종목당 수집할 뉴스 헤드라인 수
   news_max_age_days: 14            # Task1: pubDate 기준 이보다 오래된 뉴스는 감성 분석 제외
+  # Task4: shadow presurge 스코어링. 발송·등급은 항상 legacy score 기준.
+  # 본 사이클에서는 false 고정 — outcomes로 IC 우위 검증 전 true 전환 금지.
+  pre_surge_mode: false
   news_weight: 0.60                # S_text 안에서 뉴스 비중
   dart_weight: 0.40                # S_text 안에서 공시 비중
   dart_days: 30                    # 공시 검색 기간 (일) — Task1: 90→30 (접수일 기준 창)

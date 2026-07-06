@@ -408,6 +408,7 @@ def init_db():
                 hype_slope REAL, hype_rank INTEGER, disparity REAL,
                 rating_bond TEXT, rating_cp TEXT, fg_sector TEXT,
                 fg_industry TEXT, ksic TEXT, largest_holder TEXT,
+                t_presurge REAL, score_presurge REAL,
                 created_at TEXT DEFAULT (datetime('now','localtime'))
             );
             CREATE TABLE IF NOT EXISTS engine_b_history (
@@ -441,6 +442,11 @@ def init_db():
             if _c not in cols:
                 con.execute(f"ALTER TABLE scan_results ADD COLUMN {_c} TEXT")
                 logger.info(f"DB 마이그레이션: {_c} 컬럼 추가 완료")
+        # Task 4: shadow presurge 점수 컬럼 (REAL)
+        for _c in ("t_presurge","score_presurge"):
+            if _c not in cols:
+                con.execute(f"ALTER TABLE scan_results ADD COLUMN {_c} REAL")
+                logger.info(f"DB 마이그레이션: {_c} 컬럼 추가 완료")
 
 @contextmanager
 def _conn():
@@ -463,8 +469,9 @@ def save_scan_results(results, scan_date):
                  finbert_mode,news_count,dart_count,inst_net,foreign_net,
                  rsi,bb_pos,change_pct,vol_slope,net_buy_days,
                  hype_slope,hype_rank,disparity,
-                 rating_bond,rating_cp,fg_sector,fg_industry,ksic,largest_holder)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 rating_bond,rating_cp,fg_sector,fg_industry,ksic,largest_holder,
+                 t_presurge,score_presurge)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (scan_date, r["ticker"], r.get("name"), r.get("sector"),
                  r.get("cap_tier"),
                  r.get("score"), r.get("t"), None, r.get("d"),
@@ -477,7 +484,8 @@ def save_scan_results(results, scan_date):
                  r.get("vol_slope"), r.get("net_buy_days"),
                  r.get("hype_slope"), r.get("hype_rank"), r.get("disparity"),
                  r.get("rating_bond"), r.get("rating_cp"), r.get("fg_sector"),
-                 r.get("fg_industry"), r.get("ksic"), r.get("largest_holder")))
+                 r.get("fg_industry"), r.get("ksic"), r.get("largest_holder"),
+                 r.get("t_presurge"), r.get("score_presurge")))
 
 def save_engine_b_history(tickers, precomputed, scan_date):
     with _conn() as con:
@@ -2180,6 +2188,35 @@ def _calc_t(meta):
 
     return min(score, 100)
 
+def _calc_t_presurge(meta):
+    """Task 4 — shadow 기술점수(물밑 축적 가설). legacy _calc_t 무변경, 병행 계산용.
+    신고가 근접·저항 돌파 보상 없음. 중장기 구조 생존 + 눌림목/저이격/에너지 응축 보상."""
+    score = 0
+    ma20  = meta.get("ma20", 0)
+    ma60  = meta.get("ma60", 0)
+    ma120 = meta.get("ma120", 0)
+    price = meta.get("current_price", 0)
+    disp  = meta.get("disparity", 0)       # (price/ma20)*100
+    bb    = meta.get("bb_pos", 50)
+    v5    = meta.get("vol_5d_avg", 0)
+    v60   = meta.get("vol_60ma", 0)
+    w52h  = meta.get("w52_high", 0)
+
+    if ma60 > ma120 > 0:                       # 중장기 구조 생존
+        score += 20
+    if ma20 > 0 and 0.97 <= price/ma20 <= 1.05:  # MA20 밀착 눌림목
+        score += 20
+    if 93 <= disp <= 105:                       # 저이격
+        score += 15
+    if bb <= 60:                                # 볼밴 하단~중립 (에너지 응축)
+        score += 15
+    if v60 > 0 and v5/v60 <= 1.3:               # 거래량 미폭발
+        score += 15
+    if w52h > 0 and 0.75 <= price/w52h <= 0.95:  # 바닥 탈출·고점 미도달
+        score += 15
+
+    return min(score, 100)
+
 def _calc_d(ticker, meta, all_vol, all_hype, top_pct, scfg, scan_date=None):
     source = meta.get("source", "engine_a")
     base   = 50 if source == "both" else 30 if source == "engine_a" else 20
@@ -2266,6 +2303,7 @@ def run_step3(pool_b,precomputed,cfg,date):
     skipped_low_confidence = 0
     for ticker,meta in pool_b.items():
         t_score=_calc_t(meta)
+        t_presurge=_calc_t_presurge(meta)   # Task 4: shadow 기술점수 병행 계산
         n_sc, n_headline, n_pct, n_conf = news_data.get(ticker, (50.0,"",0.0,0.0))
         d_sc=dart_scores.get(ticker,50.0)
         # Phase A.1 (C1): 신뢰도 < 0.5 면 감성 점수 폐기 (중립 50 처리)
@@ -2278,13 +2316,16 @@ def run_step3(pool_b,precomputed,cfg,date):
             news_skipped = False
         d_score,n_accel,v_surge=_calc_d(ticker,meta,all_vol,all_hype,top_pct,scfg,date)
         score=round(t_score*w_tech + s_text*w_text + d_score*w_cross, 2)
+        # Task 4: shadow 종합점수(발송·등급에 미사용, 결과 측정 전용)
+        score_presurge=round(t_presurge*w_tech + s_text*w_text + d_score*w_cross, 2)
         results.append({
             "ticker":ticker,"name":meta.get("name",ticker),"sector":meta.get("sector","기타"),
             "rating_bond":meta.get("rating_bond"),"rating_cp":meta.get("rating_cp"),
             "fg_sector":meta.get("fg_sector"),"fg_industry":meta.get("fg_industry"),
             "ksic":meta.get("ksic"),"largest_holder":meta.get("largest_holder"),
             "cap_tier":meta.get("cap_tier","large"),"score":score,
-            "t":t_score,"s_text":s_text,"news_score":n_sc,"dart_score":d_sc,"d":d_score,
+            "t":t_score,"t_presurge":t_presurge,"score_presurge":score_presurge,
+            "s_text":s_text,"news_score":n_sc,"dart_score":d_sc,"d":d_score,
             "source":meta.get("source","?"),"n_accel":n_accel,"v_surge":v_surge,
             "finbert_mode":finbert.mode,
             "best_headline":n_headline,"best_headline_pct":n_pct,
