@@ -418,6 +418,11 @@ def init_db():
                 ticker TEXT, send_date TEXT, grade TEXT, score REAL,
                 PRIMARY KEY (ticker, send_date)
             );
+            CREATE TABLE IF NOT EXISTS gated_tickers (
+                scan_date TEXT, ticker TEXT, reason TEXT,
+                ret_5d REAL, ret_20d REAL, w52_proximity REAL,
+                PRIMARY KEY (scan_date, ticker)
+            );
             CREATE INDEX IF NOT EXISTS idx_scan_date_ticker
                 ON scan_results(scan_date, ticker);
             CREATE INDEX IF NOT EXISTS idx_scan_ticker
@@ -479,6 +484,15 @@ def save_engine_b_history(tickers, precomputed, scan_date):
         for t in tickers:
             slope = precomputed.get(t,{}).get("hype_slope",0)
             con.execute("INSERT OR REPLACE INTO engine_b_history VALUES (?,?,?)", (scan_date,t,slope))
+
+def save_gated_tickers(rows, scan_date):
+    """Task 3 반사실 기록 — 과열 필터로 제거된 종목을 결과 추적용으로 영속."""
+    with _conn() as con:
+        for r in rows:
+            con.execute(
+                "INSERT OR REPLACE INTO gated_tickers VALUES (?,?,?,?,?,?)",
+                (scan_date, r["ticker"], r["reason"],
+                 r.get("ret_5d"), r.get("ret_20d"), r.get("w52_proximity")))
 
 def get_engine_b_history(ticker, scan_date=None, window_days=3):
     """기준일(scan_date) '이전' window_days*2 캘린더일 창의 엔진B 이력만 반환.
@@ -1406,6 +1420,11 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
         rsi    = calc_rsi(close_s)
         bb_pos = calc_bb_position(close_s)
         change_pct = float(df["Change"].iloc[-1]*100) if "Change" in df.columns else 0.0
+        # Task 3: 과열 배제용 피처 (누적수익률·신고가 근접도)
+        w52_high = float(close_s.max())
+        ret_5d  = (current/float(close_s.iloc[-6])-1)  if len(close_s) >= 6  else 0.0
+        ret_20d = (current/float(close_s.iloc[-21])-1) if len(close_s) >= 21 else 0.0
+        w52_proximity = (current/w52_high) if w52_high > 0 else 0.0
         sector=str(info.get("sector") or "기타").strip()
         if sector in ("nan","None",""): sector="기타"
         high_s = df["High"].astype(float) if "High" in df.columns else close_s
@@ -1424,7 +1443,8 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
             "retail_buy_days":retail_days,"retail_buy_total":0,
             "inst_net":inst_net,"foreign_net":foreign_net,
             "rsi":rsi,"bb_pos":bb_pos,"change_pct":change_pct,
-            "w52_high":float(close_s.max()),"res_top":resistance_top(hist_df.iloc[-60:]),
+            "ret_5d":ret_5d,"ret_20d":ret_20d,"w52_proximity":w52_proximity,
+            "w52_high":w52_high,"res_top":resistance_top(hist_df.iloc[-60:]),
             "corp_code":"","hype_latest":0.0,"hype_7d_ago":0.0,
             "hype_slope":0.0,"hype_rank":9999,"neg_ratio":0.0,
         }
@@ -2025,8 +2045,9 @@ def run_step1(precomputed,cfg,date=None):
 # ══════════════════════════════════════════════════════════════════════════════
 # Step 2 — 하드 필터링
 # ══════════════════════════════════════════════════════════════════════════════
-def run_step2(pool_a, precomputed, cfg):
+def run_step2(pool_a, precomputed, cfg, date=None):
     fcfg = cfg["filter"]
+    scan_date = date or datetime.now().strftime("%Y%m%d")
 
     upper = {
         "large": fcfg.get("max_disparity_large", 110),
@@ -2039,8 +2060,16 @@ def run_step2(pool_a, precomputed, cfg):
     min_turnover    = fcfg.get("min_turnover_ratio",  0.01)
     min_amount      = fcfg.get("min_turnover_amount", 2_000_000_000)
 
+    # Task 3: 과열 배제 필터 (기본 ON, config filter.exclude_overheat)
+    oh_cfg   = fcfg.get("exclude_overheat", {}) or {}
+    oh_on    = oh_cfg.get("enabled", True)
+    oh_r5    = oh_cfg.get("max_ret_5d",       0.20)
+    oh_r20   = oh_cfg.get("max_ret_20d",      0.40)
+    oh_prox  = oh_cfg.get("max_w52_proximity", 0.97)
+
     pool_b = {}
-    removed = {"disp_upper": [], "disp_lower": [], "ma_trend": [], "rsi": [], "turnover": []}
+    removed = {"overheat": [], "disp_upper": [], "disp_lower": [], "ma_trend": [], "rsi": [], "turnover": []}
+    gated_rows = []
 
     for ticker, meta in pool_a.items():
         p      = precomputed.get(ticker, {})
@@ -2051,6 +2080,21 @@ def run_step2(pool_a, precomputed, cfg):
         ma60   = p.get("ma60",  0)
         ma120  = p.get("ma120", 0)
         mktcap = p.get("market_cap", 0)
+
+        # 과열 배제: 이미 급등(누적수익률)·고점 근접 → 물밑 목적과 반대이므로 제외 + 반사실 기록
+        if oh_on:
+            r5   = p.get("ret_5d", 0.0)
+            r20  = p.get("ret_20d", 0.0)
+            prox = p.get("w52_proximity", 0.0)
+            oh_reason = []
+            if r5   > oh_r5:   oh_reason.append("ret5d")
+            if r20  > oh_r20:  oh_reason.append("ret20d")
+            if prox > oh_prox: oh_reason.append("w52prox")
+            if oh_reason:
+                removed["overheat"].append(ticker)
+                gated_rows.append({"ticker": ticker, "reason": "overheat:" + "+".join(oh_reason),
+                                   "ret_5d": r5, "ret_20d": r20, "w52_proximity": prox})
+                continue
 
         if disp >= upper[tier]:
             removed["disp_upper"].append(ticker)
@@ -2098,12 +2142,16 @@ def run_step2(pool_a, precomputed, cfg):
     total_removed = sum(len(v) for v in removed.values())
     logger.info(
         f"하드 필터 제거: {total_removed}개 | "
+        f"과열배제 {len(removed['overheat'])} | "
         f"이격도상한 {len(removed['disp_upper'])} | "
         f"이격도하한 {len(removed['disp_lower'])} | "
         f"MA추세 {len(removed['ma_trend'])} | "
         f"RSI과열 {len(removed['rsi'])} | "
         f"거래대금 {len(removed['turnover'])}"
     )
+    if gated_rows:
+        save_gated_tickers(gated_rows, scan_date)
+        logger.info(f"과열 gated 기록: {len(gated_rows)}개 → gated_tickers")
     tier_s = Counter(m["cap_tier"] for m in pool_b.values())
     logger.info(
         f"POOL_B: {len(pool_b)}개 | "
@@ -2497,7 +2545,7 @@ def main():
 
     if args.step in (None,2):
         logger.info("▶ Step 2: 하드 필터링")
-        pool_b=run_step2(pool_a,precomputed,cfg)
+        pool_b=run_step2(pool_a,precomputed,cfg,date_str)
         logger.info(f"  → POOL_B: {len(pool_b)}개")
         if args.step==2: return
     else: pool_b=pool_a
