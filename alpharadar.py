@@ -926,10 +926,12 @@ class NaverClient:
                 return True
         return False
 
-    def get_news_headlines(self, query, target=10, fetch=30):
+    def get_news_headlines(self, query, target=10, fetch=30, max_age_days=None):
         """
         뉴스 헤드라인 수집 — FinBERT 입력용.
         B6: 3자 이상 query 는 자동 따옴표(정확 매칭) — 자회사 흡수 1차 차단.
+        max_age_days: 지정 시 pubDate 기준 기준일(오늘)로부터 그보다 오래된 기사 제외.
+                      pubDate 파싱 실패 기사도 보수적으로 제외.
         """
         if not self.keys: return []
 
@@ -983,7 +985,7 @@ class NaverClient:
                 return []
 
         clean, seen = [], []
-        stats = {"ad":0, "irrelevant":0, "duplicate":0, "pass":0}
+        stats = {"ad":0, "irrelevant":0, "duplicate":0, "pass":0, "stale":0}
 
         for item in raw_items:
             title = re.sub(r"<[^>]+>", "", item.get("title", "")).strip()
@@ -991,6 +993,20 @@ class NaverClient:
 
             if not title:
                 continue
+
+            # 시점 필터 (Task 1): max_age_days 초과 또는 pubDate 파싱 실패 → 제외
+            if max_age_days is not None:
+                pub = item.get("pubDate", "")
+                try:
+                    pub_dt = datetime.strptime(pub, "%a, %d %b %Y %H:%M:%S %z")
+                    age = (datetime.now(pub_dt.tzinfo) - pub_dt).days
+                    if age > max_age_days:
+                        stats["stale"] += 1
+                        continue
+                except (ValueError, TypeError):
+                    logger.debug(f"pubDate 파싱 실패 → 제외 [{query}]: {pub!r}")
+                    stats["stale"] += 1
+                    continue
 
             if self._is_ad(title):
                 stats["ad"] += 1
@@ -1015,9 +1031,11 @@ class NaverClient:
 
         logger.debug(
             f"뉴스 필터 [{query}]: 수집 {len(raw_items)}건 → "
-            f"광고 -{stats['ad']} 무관 -{stats['irrelevant']} "
+            f"시점 -{stats['stale']} 광고 -{stats['ad']} 무관 -{stats['irrelevant']} "
             f"중복 -{stats['duplicate']} → 최종 {len(clean)}건"
         )
+        if max_age_days is not None and stats["stale"]:
+            logger.info(f"뉴스 시점 제외 [{query}]: {stats['stale']}건 (>{max_age_days}일/파싱실패)")
         time.sleep(0.10)
         return clean
 
@@ -1180,13 +1198,14 @@ def load_dart_corp_codes(api_key: str, max_age_days: int = 30) -> dict:
 # Step3 텍스트 수집 캐시 — Phase A (A2)
 # ══════════════════════════════════════════════════════════════════════════════
 def collect_texts_with_cache(pool_b, naver, dart, news_cnt, dart_days,
-                              date: str, workers: int = 6):
+                              date: str, workers: int = 6, news_max_age=None):
     """
     A2 — 뉴스·공시 텍스트 일자별 incremental 캐시.
     같은 날 가중치 튜닝 재실행 시 외부 API 0건.
+    캐시 파일명 _v2: Task 1(시점 필터) 이전 구버전 당일 캐시 재사용 차단.
     """
-    news_cache = CACHE_DIR / f"news_titles_{date}.pkl"
-    dart_cache = CACHE_DIR / f"dart_titles_{date}.pkl"
+    news_cache = CACHE_DIR / f"news_titles_{date}_v2.pkl"
+    dart_cache = CACHE_DIR / f"dart_titles_{date}_v2.pkl"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     news_texts: dict = {}
@@ -1215,7 +1234,7 @@ def collect_texts_with_cache(pool_b, naver, dart, news_cnt, dart_days,
     def _collect(item):
         ticker, meta = item
         nm = meta.get("name", ticker)
-        news = naver.get_news_headlines(nm, target=news_cnt, fetch=news_cnt * 3)
+        news = naver.get_news_headlines(nm, target=news_cnt, fetch=news_cnt * 3, max_age_days=news_max_age)
         dart_t = (dart.get_report_titles(meta.get("corp_code", ""), dart_days)
                   if meta.get("corp_code") else [])
         return ticker, news, dart_t
@@ -1897,6 +1916,7 @@ def run_step1(precomputed,cfg,date=None):
     naver=NaverClient()
     scan_date = date or datetime.now().strftime("%Y%m%d")
     max_neg = eb_cfg["max_negative_sentiment"]
+    news_max_age = cfg.get("scoring", {}).get("news_max_age_days", 14)
     logger.info("관심 지수 및 부정 뉴스 비율 조회 중...")
 
     top_n = eb_cfg.get("hype_top_n", 100)
@@ -1915,7 +1935,7 @@ def run_step1(precomputed,cfg,date=None):
             p["hype_7d_ago"] = float(trend[0])
             p["hype_slope"]  = linear_slope(trend)
 
-        headlines = naver.get_news_headlines(name, target=5, fetch=15)
+        headlines = naver.get_news_headlines(name, target=5, fetch=15, max_age_days=news_max_age)
         if headlines:
             neg_count = sum(1 for h in headlines if any(kw in h for kw in neg_kws))
             p["neg_ratio"] = round(neg_count / len(headlines), 3)
@@ -1933,16 +1953,23 @@ def run_step1(precomputed,cfg,date=None):
     for rank,(t,_) in enumerate(items,1): precomputed[t]["hype_rank"]=rank
 
     surge_pct=ea_cfg.get("vol_surge_pct",0.50)
+    require_pos=ea_cfg.get("require_positive_total", True)  # Task 2: 수급 부호 가드
+    sign_guarded=0
     # 1차: 신호 후보 판정 (a=수급/거래량, b=관심상승+부정낮음)
     candidates=[]
     for ticker,p in precomputed.items():
         vol_base=p.get("vol_60ma",p.get("vol_20ma",1))
         vol_rising=(vol_base>0 and p.get("vol_5d_avg",0)>=vol_base*(1+surge_pct))
-        inst_buy=p.get("net_buy_days",0)>=ea_cfg["net_buy_min_days"]
+        # 수급 부호 가드: 일수 충족이어도 순매수 합계가 음수면 매집 아님 → inst_buy 불인정
+        days_ok=p.get("net_buy_days",0)>=ea_cfg["net_buy_min_days"]
+        inst_buy=days_ok and ((not require_pos) or p.get("net_buy_total",0) > 0)
+        if require_pos and days_ok and not inst_buy:
+            sign_guarded += 1
         a=vol_rising or inst_buy
         b=(p.get("hype_slope", 0) > 0 and p.get("neg_ratio", 0) < max_neg)
         if a or b:
             candidates.append((ticker, a, b, vol_rising))
+    logger.info(f"수급일수충족·합계음수 제외: {sign_guarded}개")
 
     # 버그 수정: top_n 밖의 POOL_A 후보는 neg_ratio 미조회 상태 → 부정뉴스 게이트가 무조건 통과됨.
     # 후보 중 미조회 종목만 뉴스 2차 조회해 neg_ratio 채운 뒤 게이트 적용.
@@ -1950,7 +1977,7 @@ def run_step1(precomputed,cfg,date=None):
     if need:
         def _neg_only(t):
             name = precomputed[t].get("name", t)
-            hl = naver.get_news_headlines(name, target=5, fetch=15)
+            hl = naver.get_news_headlines(name, target=5, fetch=15, max_age_days=news_max_age)
             if hl:
                 nc = sum(1 for h in hl if any(kw in h for kw in neg_kws))
                 precomputed[t]["neg_ratio"] = round(nc/len(hl), 3)
@@ -2143,7 +2170,8 @@ def run_step3(pool_b,precomputed,cfg,date):
     dart=DartClient(); naver=NaverClient()
     finbert=FinBertClient(scfg.get("finbert_model","snunlp/KR-FinBert-SC"))
     news_w=scfg.get("news_weight",0.60); dart_w=scfg.get("dart_weight",0.40)
-    news_cnt=scfg.get("news_count",10); dart_days=scfg.get("dart_days",90)
+    news_cnt=scfg.get("news_count",10); dart_days=scfg.get("dart_days",30)
+    news_max_age=scfg.get("news_max_age_days",14)
     all_vol=[m.get("vol_slope",0) for m in pool_b.values()]
     all_hype=[m.get("hype_slope",0) for m in pool_b.values()]
     top_pct=scfg.get("strength_top_pct",0.20)
@@ -2162,7 +2190,7 @@ def run_step3(pool_b,precomputed,cfg,date):
     # A2: 일자별 incremental 캐시 — 같은 날 재실행 시 외부 API 0건 (Phase A)
     news_texts, dart_texts = collect_texts_with_cache(
         pool_b, naver, dart, news_cnt, dart_days, date,
-        workers=scfg.get("text_workers", 6),
+        workers=scfg.get("text_workers", 6), news_max_age=news_max_age,
     )
 
     logger.info(f"FinBERT 감성 분석 ({finbert.mode} 모드)...")
