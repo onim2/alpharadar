@@ -15,6 +15,7 @@ universe:
 engine_a:
   net_buy_min_days: 3              # 5일 중 최소 3일 기관+외인 순매수여야 신호 ON
   vol_surge_pct: 0.50              # 최근 5일 거래량이 60일 평균 대비 50% 이상이면 신호 ON
+  require_positive_total: true     # Task2: 순매수 일수 충족이어도 합계 음수면 매집 불인정
 
 engine_b:
   hype_trend_days: 7               # 네이버 DataLab 검색량 추세 기간 (기울기 계산)
@@ -51,6 +52,19 @@ filter:
   # 섹터 동조화 보너스 (하드 필터 아님 — D 점수 +5에만 영향)
   min_sector_peers: 2              # Pool B 내 같은 섹터 종목이 2개 이상일 때 보너스
 
+  # ⑥ 신용등급 제외 (master universe 보강 등급 기반) — 기본 빈 목록 = 제외 없음(현행 유지)
+  #    채권(적용등급) 또는 CP 등급이 목록에 들면 유니버스에서 제외. 등급 없는 종목은 영향 없음.
+  #    예: ["B+","B","B-","CCC+","CCC","CCC-","CC","C","D"]
+  exclude_ratings: []
+
+  # ⑦ 과열 배제 (Task3) — 이미 급등/고점 근접 종목 제외 (물밑 포착 목적 정렬)
+  #    셋 중 하나라도 초과하면 제외 + gated_tickers에 반사실 기록.
+  exclude_overheat:
+    enabled: true
+    max_ret_5d: 0.20             # 최근 5거래일 누적수익률 +20% 초과 제외
+    max_ret_20d: 0.40            # 최근 20거래일 누적수익률 +40% 초과 제외
+    max_w52_proximity: 0.97      # 현재가/기간내고가 0.97 초과(고점 근접) 제외
+
 # ── Step 3: 스코어링 ───────────────────────────────────
 scoring:
   # 가중치 — 세 값의 합이 반드시 1.0이어야 함
@@ -65,9 +79,13 @@ scoring:
   # FinBERT 모델
   finbert_model: "snunlp/KR-FinBert-SC"
   news_count: 10                   # 종목당 수집할 뉴스 헤드라인 수
+  news_max_age_days: 14            # Task1: pubDate 기준 이보다 오래된 뉴스는 감성 분석 제외
+  # Task4: shadow presurge 스코어링. 발송·등급은 항상 legacy score 기준.
+  # 본 사이클에서는 false 고정 — outcomes로 IC 우위 검증 전 true 전환 금지.
+  pre_surge_mode: false
   news_weight: 0.60                # S_text 안에서 뉴스 비중
   dart_weight: 0.40                # S_text 안에서 공시 비중
-  dart_days: 90                    # 공시 검색 기간 (일)
+  dart_days: 30                    # 공시 검색 기간 (일) — Task1: 90→30 (접수일 기준 창)
 
   # 교차 신호 조건
   n_accel_window: 3                # N-Accel: 과거 3거래일 내 엔진B 이력 + 오늘 엔진A → D+15

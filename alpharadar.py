@@ -406,6 +406,9 @@ def init_db():
                 rsi REAL, bb_pos REAL, change_pct REAL,
                 vol_slope REAL, net_buy_days INTEGER,
                 hype_slope REAL, hype_rank INTEGER, disparity REAL,
+                rating_bond TEXT, rating_cp TEXT, fg_sector TEXT,
+                fg_industry TEXT, ksic TEXT, largest_holder TEXT,
+                t_presurge REAL, score_presurge REAL,
                 created_at TEXT DEFAULT (datetime('now','localtime'))
             );
             CREATE TABLE IF NOT EXISTS engine_b_history (
@@ -415,6 +418,11 @@ def init_db():
             CREATE TABLE IF NOT EXISTS sent_history (
                 ticker TEXT, send_date TEXT, grade TEXT, score REAL,
                 PRIMARY KEY (ticker, send_date)
+            );
+            CREATE TABLE IF NOT EXISTS gated_tickers (
+                scan_date TEXT, ticker TEXT, reason TEXT,
+                ret_5d REAL, ret_20d REAL, w52_proximity REAL,
+                PRIMARY KEY (scan_date, ticker)
             );
             CREATE INDEX IF NOT EXISTS idx_scan_date_ticker
                 ON scan_results(scan_date, ticker);
@@ -429,6 +437,16 @@ def init_db():
         if "cap_tier" not in cols:
             con.execute("ALTER TABLE scan_results ADD COLUMN cap_tier TEXT")
             logger.info("DB 마이그레이션: cap_tier 컬럼 추가 완료")
+        # master universe 보강 메타 컬럼 (없으면 추가)
+        for _c in ("rating_bond","rating_cp","fg_sector","fg_industry","ksic","largest_holder"):
+            if _c not in cols:
+                con.execute(f"ALTER TABLE scan_results ADD COLUMN {_c} TEXT")
+                logger.info(f"DB 마이그레이션: {_c} 컬럼 추가 완료")
+        # Task 4: shadow presurge 점수 컬럼 (REAL)
+        for _c in ("t_presurge","score_presurge"):
+            if _c not in cols:
+                con.execute(f"ALTER TABLE scan_results ADD COLUMN {_c} REAL")
+                logger.info(f"DB 마이그레이션: {_c} 컬럼 추가 완료")
 
 @contextmanager
 def _conn():
@@ -450,8 +468,10 @@ def save_scan_results(results, scan_date):
                  s_text,news_score,dart_score,grade,source,n_accel,v_surge,
                  finbert_mode,news_count,dart_count,inst_net,foreign_net,
                  rsi,bb_pos,change_pct,vol_slope,net_buy_days,
-                 hype_slope,hype_rank,disparity)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 hype_slope,hype_rank,disparity,
+                 rating_bond,rating_cp,fg_sector,fg_industry,ksic,largest_holder,
+                 t_presurge,score_presurge)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (scan_date, r["ticker"], r.get("name"), r.get("sector"),
                  r.get("cap_tier"),
                  r.get("score"), r.get("t"), None, r.get("d"),
@@ -462,7 +482,10 @@ def save_scan_results(results, scan_date):
                  r.get("inst_net",0), r.get("foreign_net",0),
                  r.get("rsi",50), r.get("bb_pos",50), r.get("change_pct",0),
                  r.get("vol_slope"), r.get("net_buy_days"),
-                 r.get("hype_slope"), r.get("hype_rank"), r.get("disparity")))
+                 r.get("hype_slope"), r.get("hype_rank"), r.get("disparity"),
+                 r.get("rating_bond"), r.get("rating_cp"), r.get("fg_sector"),
+                 r.get("fg_industry"), r.get("ksic"), r.get("largest_holder"),
+                 r.get("t_presurge"), r.get("score_presurge")))
 
 def save_engine_b_history(tickers, precomputed, scan_date):
     with _conn() as con:
@@ -470,11 +493,33 @@ def save_engine_b_history(tickers, precomputed, scan_date):
             slope = precomputed.get(t,{}).get("hype_slope",0)
             con.execute("INSERT OR REPLACE INTO engine_b_history VALUES (?,?,?)", (scan_date,t,slope))
 
-def get_engine_b_history(ticker, window_days=3):
+def save_gated_tickers(rows, scan_date):
+    """Task 3 반사실 기록 — 과열 필터로 제거된 종목을 결과 추적용으로 영속."""
+    with _conn() as con:
+        for r in rows:
+            con.execute(
+                "INSERT OR REPLACE INTO gated_tickers VALUES (?,?,?,?,?,?)",
+                (scan_date, r["ticker"], r["reason"],
+                 r.get("ret_5d"), r.get("ret_20d"), r.get("w52_proximity")))
+
+def get_engine_b_history(ticker, scan_date=None, window_days=3):
+    """기준일(scan_date) '이전' window_days*2 캘린더일 창의 엔진B 이력만 반환.
+    버그 수정: 기존 LIMIT 방식은 수개월 전 이력이 N-Accel을 영구 발화시키고,
+    당일 자기 기록까지 포함해 'both' 종목이 자동 +15되던 문제가 있었다.
+    scan_date < 기준일 → 당일 자기기록 제외, scan_date >= 하한 → 과거 이력 제외."""
+    if not scan_date:
+        scan_date = datetime.now().strftime("%Y%m%d")
+    try:
+        base = datetime.strptime(str(scan_date), "%Y%m%d")
+    except (ValueError, TypeError):
+        base = datetime.now(); scan_date = base.strftime("%Y%m%d")
+    lower = (base - timedelta(days=window_days*2)).strftime("%Y%m%d")
     with _conn() as con:
         rows = con.execute(
-            "SELECT scan_date FROM engine_b_history WHERE ticker=? ORDER BY scan_date DESC LIMIT ?",
-            (ticker, window_days*2)).fetchall()
+            "SELECT scan_date FROM engine_b_history "
+            "WHERE ticker=? AND scan_date < ? AND scan_date >= ? "
+            "ORDER BY scan_date DESC",
+            (ticker, scan_date, lower)).fetchall()
     return [r["scan_date"] for r in rows]
 
 def was_sent_today(ticker, scan_date):
@@ -903,10 +948,12 @@ class NaverClient:
                 return True
         return False
 
-    def get_news_headlines(self, query, target=10, fetch=30):
+    def get_news_headlines(self, query, target=10, fetch=30, max_age_days=None):
         """
         뉴스 헤드라인 수집 — FinBERT 입력용.
         B6: 3자 이상 query 는 자동 따옴표(정확 매칭) — 자회사 흡수 1차 차단.
+        max_age_days: 지정 시 pubDate 기준 기준일(오늘)로부터 그보다 오래된 기사 제외.
+                      pubDate 파싱 실패 기사도 보수적으로 제외.
         """
         if not self.keys: return []
 
@@ -960,7 +1007,7 @@ class NaverClient:
                 return []
 
         clean, seen = [], []
-        stats = {"ad":0, "irrelevant":0, "duplicate":0, "pass":0}
+        stats = {"ad":0, "irrelevant":0, "duplicate":0, "pass":0, "stale":0}
 
         for item in raw_items:
             title = re.sub(r"<[^>]+>", "", item.get("title", "")).strip()
@@ -968,6 +1015,20 @@ class NaverClient:
 
             if not title:
                 continue
+
+            # 시점 필터 (Task 1): max_age_days 초과 또는 pubDate 파싱 실패 → 제외
+            if max_age_days is not None:
+                pub = item.get("pubDate", "")
+                try:
+                    pub_dt = datetime.strptime(pub, "%a, %d %b %Y %H:%M:%S %z")
+                    age = (datetime.now(pub_dt.tzinfo) - pub_dt).days
+                    if age > max_age_days:
+                        stats["stale"] += 1
+                        continue
+                except (ValueError, TypeError):
+                    logger.debug(f"pubDate 파싱 실패 → 제외 [{query}]: {pub!r}")
+                    stats["stale"] += 1
+                    continue
 
             if self._is_ad(title):
                 stats["ad"] += 1
@@ -992,9 +1053,11 @@ class NaverClient:
 
         logger.debug(
             f"뉴스 필터 [{query}]: 수집 {len(raw_items)}건 → "
-            f"광고 -{stats['ad']} 무관 -{stats['irrelevant']} "
+            f"시점 -{stats['stale']} 광고 -{stats['ad']} 무관 -{stats['irrelevant']} "
             f"중복 -{stats['duplicate']} → 최종 {len(clean)}건"
         )
+        if max_age_days is not None and stats["stale"]:
+            logger.info(f"뉴스 시점 제외 [{query}]: {stats['stale']}건 (>{max_age_days}일/파싱실패)")
         time.sleep(0.10)
         return clean
 
@@ -1157,13 +1220,14 @@ def load_dart_corp_codes(api_key: str, max_age_days: int = 30) -> dict:
 # Step3 텍스트 수집 캐시 — Phase A (A2)
 # ══════════════════════════════════════════════════════════════════════════════
 def collect_texts_with_cache(pool_b, naver, dart, news_cnt, dart_days,
-                              date: str, workers: int = 6):
+                              date: str, workers: int = 6, news_max_age=None):
     """
     A2 — 뉴스·공시 텍스트 일자별 incremental 캐시.
     같은 날 가중치 튜닝 재실행 시 외부 API 0건.
+    캐시 파일명 _v2: Task 1(시점 필터) 이전 구버전 당일 캐시 재사용 차단.
     """
-    news_cache = CACHE_DIR / f"news_titles_{date}.pkl"
-    dart_cache = CACHE_DIR / f"dart_titles_{date}.pkl"
+    news_cache = CACHE_DIR / f"news_titles_{date}_v2.pkl"
+    dart_cache = CACHE_DIR / f"dart_titles_{date}_v2.pkl"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     news_texts: dict = {}
@@ -1192,7 +1256,7 @@ def collect_texts_with_cache(pool_b, naver, dart, news_cnt, dart_days,
     def _collect(item):
         ticker, meta = item
         nm = meta.get("name", ticker)
-        news = naver.get_news_headlines(nm, target=news_cnt, fetch=news_cnt * 3)
+        news = naver.get_news_headlines(nm, target=news_cnt, fetch=news_cnt * 3, max_age_days=news_max_age)
         dart_t = (dart.get_report_titles(meta.get("corp_code", ""), dart_days)
                   if meta.get("corp_code") else [])
         return ticker, news, dart_t
@@ -1364,12 +1428,21 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
         rsi    = calc_rsi(close_s)
         bb_pos = calc_bb_position(close_s)
         change_pct = float(df["Change"].iloc[-1]*100) if "Change" in df.columns else 0.0
+        # Task 3: 과열 배제용 피처 (누적수익률·신고가 근접도)
+        w52_high = float(close_s.max())
+        ret_5d  = (current/float(close_s.iloc[-6])-1)  if len(close_s) >= 6  else 0.0
+        ret_20d = (current/float(close_s.iloc[-21])-1) if len(close_s) >= 21 else 0.0
+        w52_proximity = (current/w52_high) if w52_high > 0 else 0.0
         sector=str(info.get("sector") or "기타").strip()
         if sector in ("nan","None",""): sector="기타"
         high_s = df["High"].astype(float) if "High" in df.columns else close_s
         hist_df = pd.DataFrame({"종가": close_s, "고가": high_s, "거래량": volume_s})
         return {
             "ticker":ticker,"name":info.get("name") or ticker,"sector":sector,
+            # master universe 보강 메타(보조필드) — DB 영속·표시용, 스코어링 미사용
+            "rating_bond":info.get("rating_bond"),"rating_cp":info.get("rating_cp"),
+            "fg_sector":info.get("fg_sector"),"fg_industry":info.get("fg_industry"),
+            "ksic":info.get("ksic"),"largest_holder":info.get("largest_holder"),
             "market":mkt,"market_cap":cap,"cap_tier":cap_tier,"current_price":current,
             "ma20":ma20,"ma60":ma60,"ma120":ma120,"disparity":disparity(current,ma20),
             "vol_60ma":vol_60ma,"vol_20ma":vol_20ma,"vol_5d_avg":vol_5d,
@@ -1378,7 +1451,8 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
             "retail_buy_days":retail_days,"retail_buy_total":0,
             "inst_net":inst_net,"foreign_net":foreign_net,
             "rsi":rsi,"bb_pos":bb_pos,"change_pct":change_pct,
-            "w52_high":float(close_s.max()),"res_top":resistance_top(hist_df.iloc[-60:]),
+            "ret_5d":ret_5d,"ret_20d":ret_20d,"w52_proximity":w52_proximity,
+            "w52_high":w52_high,"res_top":resistance_top(hist_df.iloc[-60:]),
             "corp_code":"","hype_latest":0.0,"hype_7d_ago":0.0,
             "hype_slope":0.0,"hype_rank":9999,"neg_ratio":0.0,
         }
@@ -1704,6 +1778,34 @@ def _load_dart_sector_map() -> dict:
 
     return sector_map
 
+def _load_master_universe_meta() -> dict:
+    """중앙 datastore(master.db) universe 최신 연도(PIT)에서 종목 메타 로드.
+    반환: {'005930': {fg_sector, fg_industry, ksic, rating_bond, rating_cp, largest_holder}}.
+    티커는 master 'A005930' → '005930' 매핑. master 없으면 {} (보강 생략)."""
+    try:
+        import sqlite3
+        db = "/Users/summer123/Project_2/data_store/master.db"
+        if not os.path.exists(db):
+            return {}
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as c:
+            yr = c.execute("SELECT MAX(year) FROM universe").fetchone()[0]
+            rows = c.execute(
+                "SELECT ticker, fg_sector, fg_industry, ksic, rating_bond, rating_cp, "
+                "largest_holder FROM universe WHERE year=?", (yr,)).fetchall()
+        def _s(x):  # xlsx 패딩 제거
+            return x.strip() if isinstance(x, str) else x
+        meta = {}
+        for tk, fgs, fgi, ksic, rb, rcp, lh in rows:
+            code = tk[1:] if isinstance(tk, str) and tk.startswith("A") and tk[1:].isdigit() else tk
+            meta[code] = {"fg_sector": _s(fgs), "fg_industry": _s(fgi), "ksic": _s(ksic),
+                          "rating_bond": _s(rb), "rating_cp": _s(rcp), "largest_holder": _s(lh)}
+        logger.info(f"master universe 메타 로드: {len(meta)}개 (year={yr})")
+        return meta
+    except Exception as e:
+        logger.info(f"master universe 메타 미사용: {e}")
+        return {}
+
+
 def run_step0(date,cfg,market="ALL",limit=None):
     dart_sector_map = _load_dart_sector_map()
     import FinanceDataReader as fdr
@@ -1753,6 +1855,44 @@ def run_step0(date,cfg,market="ALL",limit=None):
                 ticker_info[ticker]["sector"] = dart_sector_map[ticker]
                 patched += 1
 
+    # 중앙 datastore(master.db) universe 보강: 신용등급·FnGuide·KSIC·최대주주(신규 보조필드)
+    # + 스코어링용 sector는 비어있을 때만 gap-fill(기존 KSIC 택소노미 보존 → 스코어링 영향 없음)
+    master_meta = _load_master_universe_meta()
+    m_rating = m_fg = m_gap = 0
+    if master_meta:
+        for ticker, info in ticker_info.items():
+            mm = master_meta.get(str(ticker))
+            if not mm:
+                continue
+            if mm.get("rating_bond") or mm.get("rating_cp"):
+                info["rating_bond"] = mm.get("rating_bond")
+                info["rating_cp"]   = mm.get("rating_cp")
+                m_rating += 1
+            if mm.get("fg_sector"):
+                info["fg_sector"]      = mm.get("fg_sector")
+                info["fg_industry"]    = mm.get("fg_industry")
+                info["ksic"]           = mm.get("ksic")
+                info["largest_holder"] = mm.get("largest_holder")
+                m_fg += 1
+                sec = str(info.get("sector") or "").strip()
+                if sec in ("", "nan", "None", "기타"):
+                    info["sector"] = mm["fg_sector"]
+                    m_gap += 1
+        logger.info(f"master 보강: 등급 {m_rating}개 | FnGuide/KSIC {m_fg}개 | 섹터 gap-fill {m_gap}개")
+
+    # 신용등급 하드 필터 (config filter.exclude_ratings) — 기본 빈 목록이면 무동작
+    excl = {str(x).strip() for x in (cfg.get("filter", {}).get("exclude_ratings") or [])}
+    if excl:
+        def _rating_excluded(t):
+            info = ticker_info.get(t, {})
+            rb = str(info.get("rating_bond") or "").strip()
+            rcp = str(info.get("rating_cp") or "").strip()
+            return (rb in excl) or (rcp in excl)
+        before = len(all_tickers)
+        all_tickers = [t for t in all_tickers if not _rating_excluded(t)]
+        logger.info(f"등급 필터: {before - len(all_tickers)}개 제외 "
+                    f"(exclude_ratings={sorted(excl)})")
+
     for mkt in (["KOSPI","KOSDAQ"] if market=="ALL" else [market]):
         mkt_tickers = [t for t,i in ticker_info.items() if i.get("market")==mkt]
         sector_filled = sum(1 for t in mkt_tickers
@@ -1798,16 +1938,20 @@ def run_step0(date,cfg,market="ALL",limit=None):
 # ══════════════════════════════════════════════════════════════════════════════
 # Step 1 — 신호 탐지
 # ══════════════════════════════════════════════════════════════════════════════
-def run_step1(precomputed,cfg):
+def run_step1(precomputed,cfg,date=None):
     ea_cfg=cfg["engine_a"]; eb_cfg=cfg["engine_b"]
     neg_kws=cfg["negative_keywords"]
     naver=NaverClient()
+    scan_date = date or datetime.now().strftime("%Y%m%d")
+    max_neg = eb_cfg["max_negative_sentiment"]
+    news_max_age = cfg.get("scoring", {}).get("news_max_age_days", 14)
     logger.info("관심 지수 및 부정 뉴스 비율 조회 중...")
 
     top_n = eb_cfg.get("hype_top_n", 100)
     max_workers = eb_cfg.get("hype_workers", 6)
     targets = sorted(precomputed.items(),
                      key=lambda x:x[1].get("vol_5d_avg",0), reverse=True)[:top_n]
+    enriched = {t for t,_ in targets}   # neg_ratio 산출을 시도한 종목 집합
 
     def _enrich(item):
         ticker, p = item
@@ -1819,12 +1963,11 @@ def run_step1(precomputed,cfg):
             p["hype_7d_ago"] = float(trend[0])
             p["hype_slope"]  = linear_slope(trend)
 
-        headlines = naver.get_news_headlines(name, target=5, fetch=15)
+        headlines = naver.get_news_headlines(name, target=5, fetch=15, max_age_days=news_max_age)
         if headlines:
             neg_count = sum(1 for h in headlines if any(kw in h for kw in neg_kws))
             p["neg_ratio"] = round(neg_count / len(headlines), 3)
-            return p["neg_ratio"] > 0
-        return False
+        return p.get("neg_ratio", 0.0) > 0
 
     neg_detected = 0
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -1833,21 +1976,56 @@ def run_step1(precomputed,cfg):
                 neg_detected += 1
 
     logger.info(f"부정 키워드 감지: {neg_detected}개 종목 (neg_ratio > 0)")
-    items=sorted(precomputed.items(),key=lambda x:x[1].get("hype_latest",0),reverse=True)
+    # 버그 수정: V-Surge 순위는 hype_slope 기준 (hype_latest는 DataLab 자기정규화라 100 동률 다수 → 난수 순위)
+    items=sorted(precomputed.items(),key=lambda x:x[1].get("hype_slope",0),reverse=True)
     for rank,(t,_) in enumerate(items,1): precomputed[t]["hype_rank"]=rank
 
-    pool_a={}; ea_hit=eb_hit=both_hit=0; tier_counts={}
     surge_pct=ea_cfg.get("vol_surge_pct",0.50)
+    require_pos=ea_cfg.get("require_positive_total", True)  # Task 2: 수급 부호 가드
+    sign_guarded=0
+    # 1차: 신호 후보 판정 (a=수급/거래량, b=관심상승+부정낮음)
+    candidates=[]
     for ticker,p in precomputed.items():
         vol_base=p.get("vol_60ma",p.get("vol_20ma",1))
         vol_rising=(vol_base>0 and p.get("vol_5d_avg",0)>=vol_base*(1+surge_pct))
-        inst_buy=p.get("net_buy_days",0)>=ea_cfg["net_buy_min_days"]
+        # 수급 부호 가드: 일수 충족이어도 순매수 합계가 음수면 매집 아님 → inst_buy 불인정
+        days_ok=p.get("net_buy_days",0)>=ea_cfg["net_buy_min_days"]
+        inst_buy=days_ok and ((not require_pos) or p.get("net_buy_total",0) > 0)
+        if require_pos and days_ok and not inst_buy:
+            sign_guarded += 1
         a=vol_rising or inst_buy
-        b=(p.get("hype_slope", 0) > 0 and
-           p.get("neg_ratio",  0) < eb_cfg["max_negative_sentiment"])
-        if not (a or b): continue
-        # Phase A.2: neg_ratio gate (Engine B only -> POOL_A whole gate)
-        if p.get("neg_ratio", 0) >= eb_cfg["max_negative_sentiment"]:
+        b=(p.get("hype_slope", 0) > 0 and p.get("neg_ratio", 0) < max_neg)
+        if a or b:
+            candidates.append((ticker, a, b, vol_rising))
+    logger.info(f"수급일수충족·합계음수 제외: {sign_guarded}개")
+
+    # 버그 수정: top_n 밖의 POOL_A 후보는 neg_ratio 미조회 상태 → 부정뉴스 게이트가 무조건 통과됨.
+    # 후보 중 미조회 종목만 뉴스 2차 조회해 neg_ratio 채운 뒤 게이트 적용.
+    need = [t for (t,a,b,_) in candidates if t not in enriched]
+    if need:
+        def _neg_only(t):
+            name = precomputed[t].get("name", t)
+            hl = naver.get_news_headlines(name, target=5, fetch=15, max_age_days=news_max_age)
+            if hl:
+                nc = sum(1 for h in hl if any(kw in h for kw in neg_kws))
+                precomputed[t]["neg_ratio"] = round(nc/len(hl), 3)
+            else:
+                precomputed[t]["neg_ratio"] = 0.0
+            return t
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            list(ex.map(_neg_only, need))
+        logger.info(f"POOL_A 후보 부정뉴스 2차 조회: {len(need)}개")
+
+    # 2차: 부정뉴스 게이트 + POOL_A 구성
+    pool_a={}; ea_hit=eb_hit=both_hit=0; tier_counts={}; neg_gated=0
+    for ticker,a,b,vol_rising in candidates:
+        p=precomputed[ticker]
+        b=(p.get("hype_slope", 0) > 0 and p.get("neg_ratio", 0) < max_neg)  # neg_ratio 갱신 반영
+        if not (a or b):
+            continue
+        # Phase A.2: neg_ratio gate (POOL_A 전체 게이트)
+        if p.get("neg_ratio", 0) >= max_neg:
+            neg_gated += 1
             continue
         source="both" if (a and b) else ("engine_a" if a else "engine_b")
         if a and b: both_hit+=1
@@ -1867,31 +2045,39 @@ def run_step1(precomputed,cfg):
             "rsi":p.get("rsi",50.0),"bb_pos":p.get("bb_pos",50.0),
             "hype_slope":p.get("hype_slope",0),"hype_rank":p.get("hype_rank",9999),
         }
-    logger.info(f"POOL_A: {len(pool_a)}개 (A:{ea_hit} B:{eb_hit} 동시:{both_hit})\n"
+    logger.info(f"POOL_A: {len(pool_a)}개 (A:{ea_hit} B:{eb_hit} 동시:{both_hit}) | 부정게이트 제외:{neg_gated}\n"
                 f"  대형:{tier_counts.get('large',0)} 중형:{tier_counts.get('mid',0)} 소형:{tier_counts.get('small',0)}")
-    today=datetime.now().strftime("%Y%m%d")
-    save_engine_b_history([t for t,m in pool_a.items() if m["engine_b"]], precomputed, today)
+    save_engine_b_history([t for t,m in pool_a.items() if m["engine_b"]], precomputed, scan_date)
     return pool_a
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Step 2 — 하드 필터링
 # ══════════════════════════════════════════════════════════════════════════════
-def run_step2(pool_a, precomputed, cfg):
+def run_step2(pool_a, precomputed, cfg, date=None):
     fcfg = cfg["filter"]
+    scan_date = date or datetime.now().strftime("%Y%m%d")
 
     upper = {
-        "large": fcfg.get("max_disparity_large", 115),
-        "mid":   fcfg.get("max_disparity_mid",   120),
-        "small": fcfg.get("max_disparity_small",  130),
+        "large": fcfg.get("max_disparity_large", 110),
+        "mid":   fcfg.get("max_disparity_mid",   115),
+        "small": fcfg.get("max_disparity_small",  120),
     }
     min_disp        = fcfg.get("min_disparity",      93)
     require_trend   = fcfg.get("require_ma_trend",   True)
-    max_rsi         = fcfg.get("max_rsi",            80)
+    max_rsi         = fcfg.get("max_rsi",            70)
     min_turnover    = fcfg.get("min_turnover_ratio",  0.01)
     min_amount      = fcfg.get("min_turnover_amount", 2_000_000_000)
 
+    # Task 3: 과열 배제 필터 (기본 ON, config filter.exclude_overheat)
+    oh_cfg   = fcfg.get("exclude_overheat", {}) or {}
+    oh_on    = oh_cfg.get("enabled", True)
+    oh_r5    = oh_cfg.get("max_ret_5d",       0.20)
+    oh_r20   = oh_cfg.get("max_ret_20d",      0.40)
+    oh_prox  = oh_cfg.get("max_w52_proximity", 0.97)
+
     pool_b = {}
-    removed = {"disp_upper": [], "disp_lower": [], "ma_trend": [], "rsi": [], "turnover": []}
+    removed = {"overheat": [], "disp_upper": [], "disp_lower": [], "ma_trend": [], "rsi": [], "turnover": []}
+    gated_rows = []
 
     for ticker, meta in pool_a.items():
         p      = precomputed.get(ticker, {})
@@ -1902,6 +2088,21 @@ def run_step2(pool_a, precomputed, cfg):
         ma60   = p.get("ma60",  0)
         ma120  = p.get("ma120", 0)
         mktcap = p.get("market_cap", 0)
+
+        # 과열 배제: 이미 급등(누적수익률)·고점 근접 → 물밑 목적과 반대이므로 제외 + 반사실 기록
+        if oh_on:
+            r5   = p.get("ret_5d", 0.0)
+            r20  = p.get("ret_20d", 0.0)
+            prox = p.get("w52_proximity", 0.0)
+            oh_reason = []
+            if r5   > oh_r5:   oh_reason.append("ret5d")
+            if r20  > oh_r20:  oh_reason.append("ret20d")
+            if prox > oh_prox: oh_reason.append("w52prox")
+            if oh_reason:
+                removed["overheat"].append(ticker)
+                gated_rows.append({"ticker": ticker, "reason": "overheat:" + "+".join(oh_reason),
+                                   "ret_5d": r5, "ret_20d": r20, "w52_proximity": prox})
+                continue
 
         if disp >= upper[tier]:
             removed["disp_upper"].append(ticker)
@@ -1949,12 +2150,16 @@ def run_step2(pool_a, precomputed, cfg):
     total_removed = sum(len(v) for v in removed.values())
     logger.info(
         f"하드 필터 제거: {total_removed}개 | "
+        f"과열배제 {len(removed['overheat'])} | "
         f"이격도상한 {len(removed['disp_upper'])} | "
         f"이격도하한 {len(removed['disp_lower'])} | "
         f"MA추세 {len(removed['ma_trend'])} | "
         f"RSI과열 {len(removed['rsi'])} | "
         f"거래대금 {len(removed['turnover'])}"
     )
+    if gated_rows:
+        save_gated_tickers(gated_rows, scan_date)
+        logger.info(f"과열 gated 기록: {len(gated_rows)}개 → gated_tickers")
     tier_s = Counter(m["cap_tier"] for m in pool_b.values())
     logger.info(
         f"POOL_B: {len(pool_b)}개 | "
@@ -1983,7 +2188,36 @@ def _calc_t(meta):
 
     return min(score, 100)
 
-def _calc_d(ticker, meta, all_vol, all_hype, top_pct, scfg):
+def _calc_t_presurge(meta):
+    """Task 4 — shadow 기술점수(물밑 축적 가설). legacy _calc_t 무변경, 병행 계산용.
+    신고가 근접·저항 돌파 보상 없음. 중장기 구조 생존 + 눌림목/저이격/에너지 응축 보상."""
+    score = 0
+    ma20  = meta.get("ma20", 0)
+    ma60  = meta.get("ma60", 0)
+    ma120 = meta.get("ma120", 0)
+    price = meta.get("current_price", 0)
+    disp  = meta.get("disparity", 0)       # (price/ma20)*100
+    bb    = meta.get("bb_pos", 50)
+    v5    = meta.get("vol_5d_avg", 0)
+    v60   = meta.get("vol_60ma", 0)
+    w52h  = meta.get("w52_high", 0)
+
+    if ma60 > ma120 > 0:                       # 중장기 구조 생존
+        score += 20
+    if ma20 > 0 and 0.97 <= price/ma20 <= 1.05:  # MA20 밀착 눌림목
+        score += 20
+    if 93 <= disp <= 105:                       # 저이격
+        score += 15
+    if bb <= 60:                                # 볼밴 하단~중립 (에너지 응축)
+        score += 15
+    if v60 > 0 and v5/v60 <= 1.3:               # 거래량 미폭발
+        score += 15
+    if w52h > 0 and 0.75 <= price/w52h <= 0.95:  # 바닥 탈출·고점 미도달
+        score += 15
+
+    return min(score, 100)
+
+def _calc_d(ticker, meta, all_vol, all_hype, top_pct, scfg, scan_date=None):
     source = meta.get("source", "engine_a")
     base   = 50 if source == "both" else 30 if source == "engine_a" else 20
 
@@ -2004,10 +2238,11 @@ def _calc_d(ticker, meta, all_vol, all_hype, top_pct, scfg):
     cross = 0; n_accel = False; v_surge = False
 
     if meta.get("engine_a", False):
-        if get_engine_b_history(ticker, scfg.get("n_accel_window", 3)):
+        if get_engine_b_history(ticker, scan_date, scfg.get("n_accel_window", 3)):
             cross += 15; n_accel = True
 
-    if meta.get("hype_rank", 9999) <= scfg.get("v_surge_rank", 20):
+    # 버그 수정: hype_slope>0 조건 추가 (기존엔 순위만 봐서, 관심 하락 종목도 V-Surge 발화)
+    if meta.get("hype_slope", 0) > 0 and meta.get("hype_rank", 9999) <= scfg.get("v_surge_rank", 20):
         cross += 10; v_surge = True
 
     return min(base + strength + cross, 100), n_accel, v_surge
@@ -2020,7 +2255,8 @@ def run_step3(pool_b,precomputed,cfg,date):
     dart=DartClient(); naver=NaverClient()
     finbert=FinBertClient(scfg.get("finbert_model","snunlp/KR-FinBert-SC"))
     news_w=scfg.get("news_weight",0.60); dart_w=scfg.get("dart_weight",0.40)
-    news_cnt=scfg.get("news_count",10); dart_days=scfg.get("dart_days",90)
+    news_cnt=scfg.get("news_count",10); dart_days=scfg.get("dart_days",30)
+    news_max_age=scfg.get("news_max_age_days",14)
     all_vol=[m.get("vol_slope",0) for m in pool_b.values()]
     all_hype=[m.get("hype_slope",0) for m in pool_b.values()]
     top_pct=scfg.get("strength_top_pct",0.20)
@@ -2039,7 +2275,7 @@ def run_step3(pool_b,precomputed,cfg,date):
     # A2: 일자별 incremental 캐시 — 같은 날 재실행 시 외부 API 0건 (Phase A)
     news_texts, dart_texts = collect_texts_with_cache(
         pool_b, naver, dart, news_cnt, dart_days, date,
-        workers=scfg.get("text_workers", 6),
+        workers=scfg.get("text_workers", 6), news_max_age=news_max_age,
     )
 
     logger.info(f"FinBERT 감성 분석 ({finbert.mode} 모드)...")
@@ -2067,6 +2303,7 @@ def run_step3(pool_b,precomputed,cfg,date):
     skipped_low_confidence = 0
     for ticker,meta in pool_b.items():
         t_score=_calc_t(meta)
+        t_presurge=_calc_t_presurge(meta)   # Task 4: shadow 기술점수 병행 계산
         n_sc, n_headline, n_pct, n_conf = news_data.get(ticker, (50.0,"",0.0,0.0))
         d_sc=dart_scores.get(ticker,50.0)
         # Phase A.1 (C1): 신뢰도 < 0.5 면 감성 점수 폐기 (중립 50 처리)
@@ -2077,12 +2314,18 @@ def run_step3(pool_b,precomputed,cfg,date):
         else:
             s_text = round(n_sc*news_w + d_sc*dart_w, 1)
             news_skipped = False
-        d_score,n_accel,v_surge=_calc_d(ticker,meta,all_vol,all_hype,top_pct,scfg)
+        d_score,n_accel,v_surge=_calc_d(ticker,meta,all_vol,all_hype,top_pct,scfg,date)
         score=round(t_score*w_tech + s_text*w_text + d_score*w_cross, 2)
+        # Task 4: shadow 종합점수(발송·등급에 미사용, 결과 측정 전용)
+        score_presurge=round(t_presurge*w_tech + s_text*w_text + d_score*w_cross, 2)
         results.append({
             "ticker":ticker,"name":meta.get("name",ticker),"sector":meta.get("sector","기타"),
+            "rating_bond":meta.get("rating_bond"),"rating_cp":meta.get("rating_cp"),
+            "fg_sector":meta.get("fg_sector"),"fg_industry":meta.get("fg_industry"),
+            "ksic":meta.get("ksic"),"largest_holder":meta.get("largest_holder"),
             "cap_tier":meta.get("cap_tier","large"),"score":score,
-            "t":t_score,"s_text":s_text,"news_score":n_sc,"dart_score":d_sc,"d":d_score,
+            "t":t_score,"t_presurge":t_presurge,"score_presurge":score_presurge,
+            "s_text":s_text,"news_score":n_sc,"dart_score":d_sc,"d":d_score,
             "source":meta.get("source","?"),"n_accel":n_accel,"v_surge":v_surge,
             "finbert_mode":finbert.mode,
             "best_headline":n_headline,"best_headline_pct":n_pct,
@@ -2137,6 +2380,9 @@ def run_step4(results,cfg,dry_run=False):
         change_str = (f"+{change_pct:.1f}%" if change_pct>=0 else f"{change_pct:.1f}%")
         change_icon= "▲" if change_pct>0 else ("▼" if change_pct<0 else "─")
         price_str  = f"{price:,.0f}원 {change_icon}{change_str}" if price>0 else "─"
+        # master 보강 신용등급 — 값 있을 때만 표시 (채권/CP)
+        _rb=str(r.get("rating_bond") or "").strip(); _rcp=str(r.get("rating_cp") or "").strip()
+        rating_str=(f"  |  🏷 {_esc(_rb)}"+(f"/{_esc(_rcp)}" if _rcp else "")) if _rb else ""
 
         inst_v    = r.get("inst_net",    0)
         foreign_v = r.get("foreign_net", 0)
@@ -2182,7 +2428,7 @@ def run_step4(results,cfg,dry_run=False):
 
         return (
             f"\n\n<b>{i}. {_esc(r['name'])} ({r['ticker']})</b>\n"
-            f"   {_esc(r['sector'])}  {tier_icon}  |  💵 {price_str}\n"
+            f"   {_esc(r['sector'])}  {tier_icon}{rating_str}  |  💵 {price_str}\n"
             f"   🏦 기관 {inst_str}  |  🌏 외인 {foreign_str}  ({r['net_buy_days']}일){retail_tag}\n"
             f"   📊 BB {bb:.0f}% {bb_label}  |  RSI {rsi:.0f} {rsi_label}{vol_line}\n"
             f"   📐 이격도 {r['disparity']:.1f}%  (20일 평균 대비 현재가 위치)\n"
@@ -2325,7 +2571,7 @@ def main():
 
     if args.step in (None,1):
         logger.info("▶ Step 1: 신호 탐지")
-        pool_a=run_step1(precomputed,cfg)
+        pool_a=run_step1(precomputed,cfg,date_str)
         CACHE_DIR.mkdir(parents=True,exist_ok=True)
         with open(CACHE_DIR/f"pool_a_{date_str}.pkl","wb") as f: pickle.dump(pool_a,f)
         logger.info(f"  → POOL_A: {len(pool_a)}개")
@@ -2340,7 +2586,7 @@ def main():
 
     if args.step in (None,2):
         logger.info("▶ Step 2: 하드 필터링")
-        pool_b=run_step2(pool_a,precomputed,cfg)
+        pool_b=run_step2(pool_a,precomputed,cfg,date_str)
         logger.info(f"  → POOL_B: {len(pool_b)}개")
         if args.step==2: return
     else: pool_b=pool_a

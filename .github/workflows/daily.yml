@@ -101,6 +101,13 @@ jobs:
           echo "실행 인자: python alpharadar.py $ARGS"
           python alpharadar.py $ARGS
 
+      - name: Track forward outcomes
+        if: success()
+        continue-on-error: true      # 추적 실패해도 스캔 발송 결과에 영향 없음
+        run: |
+          echo "forward outcomes 추적 실행"
+          python track_outcomes.py
+
       - name: Commit DB & DART master cache
         if: always()
         run: |
