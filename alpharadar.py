@@ -480,11 +480,24 @@ def save_engine_b_history(tickers, precomputed, scan_date):
             slope = precomputed.get(t,{}).get("hype_slope",0)
             con.execute("INSERT OR REPLACE INTO engine_b_history VALUES (?,?,?)", (scan_date,t,slope))
 
-def get_engine_b_history(ticker, window_days=3):
+def get_engine_b_history(ticker, scan_date=None, window_days=3):
+    """기준일(scan_date) '이전' window_days*2 캘린더일 창의 엔진B 이력만 반환.
+    버그 수정: 기존 LIMIT 방식은 수개월 전 이력이 N-Accel을 영구 발화시키고,
+    당일 자기 기록까지 포함해 'both' 종목이 자동 +15되던 문제가 있었다.
+    scan_date < 기준일 → 당일 자기기록 제외, scan_date >= 하한 → 과거 이력 제외."""
+    if not scan_date:
+        scan_date = datetime.now().strftime("%Y%m%d")
+    try:
+        base = datetime.strptime(str(scan_date), "%Y%m%d")
+    except (ValueError, TypeError):
+        base = datetime.now(); scan_date = base.strftime("%Y%m%d")
+    lower = (base - timedelta(days=window_days*2)).strftime("%Y%m%d")
     with _conn() as con:
         rows = con.execute(
-            "SELECT scan_date FROM engine_b_history WHERE ticker=? ORDER BY scan_date DESC LIMIT ?",
-            (ticker, window_days*2)).fetchall()
+            "SELECT scan_date FROM engine_b_history "
+            "WHERE ticker=? AND scan_date < ? AND scan_date >= ? "
+            "ORDER BY scan_date DESC",
+            (ticker, scan_date, lower)).fetchall()
     return [r["scan_date"] for r in rows]
 
 def was_sent_today(ticker, scan_date):
@@ -1878,16 +1891,19 @@ def run_step0(date,cfg,market="ALL",limit=None):
 # ══════════════════════════════════════════════════════════════════════════════
 # Step 1 — 신호 탐지
 # ══════════════════════════════════════════════════════════════════════════════
-def run_step1(precomputed,cfg):
+def run_step1(precomputed,cfg,date=None):
     ea_cfg=cfg["engine_a"]; eb_cfg=cfg["engine_b"]
     neg_kws=cfg["negative_keywords"]
     naver=NaverClient()
+    scan_date = date or datetime.now().strftime("%Y%m%d")
+    max_neg = eb_cfg["max_negative_sentiment"]
     logger.info("관심 지수 및 부정 뉴스 비율 조회 중...")
 
     top_n = eb_cfg.get("hype_top_n", 100)
     max_workers = eb_cfg.get("hype_workers", 6)
     targets = sorted(precomputed.items(),
                      key=lambda x:x[1].get("vol_5d_avg",0), reverse=True)[:top_n]
+    enriched = {t for t,_ in targets}   # neg_ratio 산출을 시도한 종목 집합
 
     def _enrich(item):
         ticker, p = item
@@ -1903,8 +1919,7 @@ def run_step1(precomputed,cfg):
         if headlines:
             neg_count = sum(1 for h in headlines if any(kw in h for kw in neg_kws))
             p["neg_ratio"] = round(neg_count / len(headlines), 3)
-            return p["neg_ratio"] > 0
-        return False
+        return p.get("neg_ratio", 0.0) > 0
 
     neg_detected = 0
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -1913,21 +1928,49 @@ def run_step1(precomputed,cfg):
                 neg_detected += 1
 
     logger.info(f"부정 키워드 감지: {neg_detected}개 종목 (neg_ratio > 0)")
-    items=sorted(precomputed.items(),key=lambda x:x[1].get("hype_latest",0),reverse=True)
+    # 버그 수정: V-Surge 순위는 hype_slope 기준 (hype_latest는 DataLab 자기정규화라 100 동률 다수 → 난수 순위)
+    items=sorted(precomputed.items(),key=lambda x:x[1].get("hype_slope",0),reverse=True)
     for rank,(t,_) in enumerate(items,1): precomputed[t]["hype_rank"]=rank
 
-    pool_a={}; ea_hit=eb_hit=both_hit=0; tier_counts={}
     surge_pct=ea_cfg.get("vol_surge_pct",0.50)
+    # 1차: 신호 후보 판정 (a=수급/거래량, b=관심상승+부정낮음)
+    candidates=[]
     for ticker,p in precomputed.items():
         vol_base=p.get("vol_60ma",p.get("vol_20ma",1))
         vol_rising=(vol_base>0 and p.get("vol_5d_avg",0)>=vol_base*(1+surge_pct))
         inst_buy=p.get("net_buy_days",0)>=ea_cfg["net_buy_min_days"]
         a=vol_rising or inst_buy
-        b=(p.get("hype_slope", 0) > 0 and
-           p.get("neg_ratio",  0) < eb_cfg["max_negative_sentiment"])
-        if not (a or b): continue
-        # Phase A.2: neg_ratio gate (Engine B only -> POOL_A whole gate)
-        if p.get("neg_ratio", 0) >= eb_cfg["max_negative_sentiment"]:
+        b=(p.get("hype_slope", 0) > 0 and p.get("neg_ratio", 0) < max_neg)
+        if a or b:
+            candidates.append((ticker, a, b, vol_rising))
+
+    # 버그 수정: top_n 밖의 POOL_A 후보는 neg_ratio 미조회 상태 → 부정뉴스 게이트가 무조건 통과됨.
+    # 후보 중 미조회 종목만 뉴스 2차 조회해 neg_ratio 채운 뒤 게이트 적용.
+    need = [t for (t,a,b,_) in candidates if t not in enriched]
+    if need:
+        def _neg_only(t):
+            name = precomputed[t].get("name", t)
+            hl = naver.get_news_headlines(name, target=5, fetch=15)
+            if hl:
+                nc = sum(1 for h in hl if any(kw in h for kw in neg_kws))
+                precomputed[t]["neg_ratio"] = round(nc/len(hl), 3)
+            else:
+                precomputed[t]["neg_ratio"] = 0.0
+            return t
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            list(ex.map(_neg_only, need))
+        logger.info(f"POOL_A 후보 부정뉴스 2차 조회: {len(need)}개")
+
+    # 2차: 부정뉴스 게이트 + POOL_A 구성
+    pool_a={}; ea_hit=eb_hit=both_hit=0; tier_counts={}; neg_gated=0
+    for ticker,a,b,vol_rising in candidates:
+        p=precomputed[ticker]
+        b=(p.get("hype_slope", 0) > 0 and p.get("neg_ratio", 0) < max_neg)  # neg_ratio 갱신 반영
+        if not (a or b):
+            continue
+        # Phase A.2: neg_ratio gate (POOL_A 전체 게이트)
+        if p.get("neg_ratio", 0) >= max_neg:
+            neg_gated += 1
             continue
         source="both" if (a and b) else ("engine_a" if a else "engine_b")
         if a and b: both_hit+=1
@@ -1947,10 +1990,9 @@ def run_step1(precomputed,cfg):
             "rsi":p.get("rsi",50.0),"bb_pos":p.get("bb_pos",50.0),
             "hype_slope":p.get("hype_slope",0),"hype_rank":p.get("hype_rank",9999),
         }
-    logger.info(f"POOL_A: {len(pool_a)}개 (A:{ea_hit} B:{eb_hit} 동시:{both_hit})\n"
+    logger.info(f"POOL_A: {len(pool_a)}개 (A:{ea_hit} B:{eb_hit} 동시:{both_hit}) | 부정게이트 제외:{neg_gated}\n"
                 f"  대형:{tier_counts.get('large',0)} 중형:{tier_counts.get('mid',0)} 소형:{tier_counts.get('small',0)}")
-    today=datetime.now().strftime("%Y%m%d")
-    save_engine_b_history([t for t,m in pool_a.items() if m["engine_b"]], precomputed, today)
+    save_engine_b_history([t for t,m in pool_a.items() if m["engine_b"]], precomputed, scan_date)
     return pool_a
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1960,13 +2002,13 @@ def run_step2(pool_a, precomputed, cfg):
     fcfg = cfg["filter"]
 
     upper = {
-        "large": fcfg.get("max_disparity_large", 115),
-        "mid":   fcfg.get("max_disparity_mid",   120),
-        "small": fcfg.get("max_disparity_small",  130),
+        "large": fcfg.get("max_disparity_large", 110),
+        "mid":   fcfg.get("max_disparity_mid",   115),
+        "small": fcfg.get("max_disparity_small",  120),
     }
     min_disp        = fcfg.get("min_disparity",      93)
     require_trend   = fcfg.get("require_ma_trend",   True)
-    max_rsi         = fcfg.get("max_rsi",            80)
+    max_rsi         = fcfg.get("max_rsi",            70)
     min_turnover    = fcfg.get("min_turnover_ratio",  0.01)
     min_amount      = fcfg.get("min_turnover_amount", 2_000_000_000)
 
@@ -2063,7 +2105,7 @@ def _calc_t(meta):
 
     return min(score, 100)
 
-def _calc_d(ticker, meta, all_vol, all_hype, top_pct, scfg):
+def _calc_d(ticker, meta, all_vol, all_hype, top_pct, scfg, scan_date=None):
     source = meta.get("source", "engine_a")
     base   = 50 if source == "both" else 30 if source == "engine_a" else 20
 
@@ -2084,10 +2126,11 @@ def _calc_d(ticker, meta, all_vol, all_hype, top_pct, scfg):
     cross = 0; n_accel = False; v_surge = False
 
     if meta.get("engine_a", False):
-        if get_engine_b_history(ticker, scfg.get("n_accel_window", 3)):
+        if get_engine_b_history(ticker, scan_date, scfg.get("n_accel_window", 3)):
             cross += 15; n_accel = True
 
-    if meta.get("hype_rank", 9999) <= scfg.get("v_surge_rank", 20):
+    # 버그 수정: hype_slope>0 조건 추가 (기존엔 순위만 봐서, 관심 하락 종목도 V-Surge 발화)
+    if meta.get("hype_slope", 0) > 0 and meta.get("hype_rank", 9999) <= scfg.get("v_surge_rank", 20):
         cross += 10; v_surge = True
 
     return min(base + strength + cross, 100), n_accel, v_surge
@@ -2157,7 +2200,7 @@ def run_step3(pool_b,precomputed,cfg,date):
         else:
             s_text = round(n_sc*news_w + d_sc*dart_w, 1)
             news_skipped = False
-        d_score,n_accel,v_surge=_calc_d(ticker,meta,all_vol,all_hype,top_pct,scfg)
+        d_score,n_accel,v_surge=_calc_d(ticker,meta,all_vol,all_hype,top_pct,scfg,date)
         score=round(t_score*w_tech + s_text*w_text + d_score*w_cross, 2)
         results.append({
             "ticker":ticker,"name":meta.get("name",ticker),"sector":meta.get("sector","기타"),
@@ -2411,7 +2454,7 @@ def main():
 
     if args.step in (None,1):
         logger.info("▶ Step 1: 신호 탐지")
-        pool_a=run_step1(precomputed,cfg)
+        pool_a=run_step1(precomputed,cfg,date_str)
         CACHE_DIR.mkdir(parents=True,exist_ok=True)
         with open(CACHE_DIR/f"pool_a_{date_str}.pkl","wb") as f: pickle.dump(pool_a,f)
         logger.info(f"  → POOL_A: {len(pool_a)}개")
