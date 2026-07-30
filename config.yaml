@@ -83,8 +83,17 @@ scoring:
   # Task4: shadow presurge 스코어링. 발송·등급은 항상 legacy score 기준.
   # 본 사이클에서는 false 고정 — outcomes로 IC 우위 검증 전 true 전환 금지.
   pre_surge_mode: false
-  news_weight: 0.60                # S_text 안에서 뉴스 비중
-  dart_weight: 0.40                # S_text 안에서 공시 비중
+  news_weight: 0.60                # S_text(표시·DB용 결합 감성) 안에서 뉴스 비중
+  dart_weight: 0.40                # S_text(표시·DB용 결합 감성) 안에서 공시 비중
+
+  # P1-4: news/dart 최종점수 독립 가중 (선택) — 아래 두 줄 주석 해제 시 활성화.
+  #   백테스트 진단(2026-07): 뉴스 감성이 IC를 훼손(10일 IC≈-0.08), 공시는 무해(≈0).
+  #   기존엔 news/dart가 w_text 하나로 묶여 뉴스만 낮출 수 없었음 → 이 두 값으로 분리 조절.
+  #   미지정 시 기존과 완전 동일: w_news = w_text×news_weight(0.24), w_dart = w_text×dart_weight(0.16).
+  #   활성화 시 검증 규칙: w_tech + w_news + w_dart + w_cross == 1.0
+  #   (예: 뉴스 축소·공시 유지 → w_tech:0.30, w_news:0.05, w_dart:0.16, w_cross:0.49)
+  # w_news: 0.24
+  # w_dart: 0.16
   dart_days: 30                    # 공시 검색 기간 (일) — Task1: 90→30 (접수일 기준 창)
 
   # 교차 신호 조건

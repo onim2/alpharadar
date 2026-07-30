@@ -136,10 +136,15 @@ def load_config() -> dict:
 
 def validate_config(cfg: dict):
     s = cfg["scoring"]
-    w = round(s.get("w_tech", s.get("w1",0)) +
-              s.get("w_text", s.get("w2",0)) +
-              s.get("w_cross", s.get("w3",0)), 10)
-    assert w == 1.0, f"가중치 합계 오류: {w}"
+    w_tech  = s.get("w_tech",  s.get("w1", 0))
+    w_cross = s.get("w_cross", s.get("w3", 0))
+    # P1-4: w_news/w_dart 지정 시 이 둘이 S_text 가중을 대체 (합=w_text 자리)
+    if "w_news" in s or "w_dart" in s:
+        w_text_eff = s.get("w_news", 0) + s.get("w_dart", 0)
+    else:
+        w_text_eff = s.get("w_text", s.get("w2", 0))
+    w = round(w_tech + w_text_eff + w_cross, 10)
+    assert w == 1.0, f"가중치 합계 오류: {w} (w_tech+{'w_news+w_dart' if ('w_news' in s or 'w_dart' in s) else 'w_text'}+w_cross)"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # KSIC (한국표준산업분류) 코드 → 한글 업종명 매핑
@@ -2255,6 +2260,13 @@ def run_step3(pool_b,precomputed,cfg,date):
     dart=DartClient(); naver=NaverClient()
     finbert=FinBertClient(scfg.get("finbert_model","snunlp/KR-FinBert-SC"))
     news_w=scfg.get("news_weight",0.60); dart_w=scfg.get("dart_weight",0.40)
+    # P1-4: news/dart를 최종 score에서 독립 가중. config에 w_news/w_dart가 있으면 활성,
+    #       없으면 기존값(w_text×news_w, w_text×dart_w)으로 폴백 → 기존 동작과 완전 동일.
+    split_text = ("w_news" in scfg) or ("w_dart" in scfg)
+    w_news = scfg.get("w_news", round(w_text * news_w, 6))
+    w_dart = scfg.get("w_dart", round(w_text * dart_w, 6))
+    if split_text:
+        logger.info(f"[P1-4] news/dart 독립 가중 활성 — w_news={w_news}, w_dart={w_dart} (w_text 대체)")
     news_cnt=scfg.get("news_count",10); dart_days=scfg.get("dart_days",30)
     news_max_age=scfg.get("news_max_age_days",14)
     all_vol=[m.get("vol_slope",0) for m in pool_b.values()]
@@ -2306,18 +2318,22 @@ def run_step3(pool_b,precomputed,cfg,date):
         t_presurge=_calc_t_presurge(meta)   # Task 4: shadow 기술점수 병행 계산
         n_sc, n_headline, n_pct, n_conf = news_data.get(ticker, (50.0,"",0.0,0.0))
         d_sc=dart_scores.get(ticker,50.0)
-        # Phase A.1 (C1): 신뢰도 < 0.5 면 감성 점수 폐기 (중립 50 처리)
-        if n_conf < 0.5:
-            s_text = round(50.0*news_w + d_sc*dart_w, 1)
-            news_skipped = True
+        # Phase A.1 (C1): 신뢰도 < 0.5 면 뉴스 감성 폐기 (중립 50 처리)
+        news_skipped = n_conf < 0.5
+        news_eff = 50.0 if news_skipped else n_sc
+        if news_skipped:
             skipped_low_confidence += 1
+        # s_text: 표시·DB용 결합 감성 (0~100 스케일 유지 위해 news_w/dart_w 사용)
+        s_text = round(news_eff*news_w + d_sc*dart_w, 1)
+        # P1-4: S_text의 최종점수 기여 — split_text=False면 기존식(s_text×w_text)과 동일
+        if split_text:
+            text_contrib = news_eff*w_news + d_sc*w_dart
         else:
-            s_text = round(n_sc*news_w + d_sc*dart_w, 1)
-            news_skipped = False
+            text_contrib = s_text * w_text
         d_score,n_accel,v_surge=_calc_d(ticker,meta,all_vol,all_hype,top_pct,scfg,date)
-        score=round(t_score*w_tech + s_text*w_text + d_score*w_cross, 2)
+        score=round(t_score*w_tech + text_contrib + d_score*w_cross, 2)
         # Task 4: shadow 종합점수(발송·등급에 미사용, 결과 측정 전용)
-        score_presurge=round(t_presurge*w_tech + s_text*w_text + d_score*w_cross, 2)
+        score_presurge=round(t_presurge*w_tech + text_contrib + d_score*w_cross, 2)
         results.append({
             "ticker":ticker,"name":meta.get("name",ticker),"sector":meta.get("sector","기타"),
             "rating_bond":meta.get("rating_bond"),"rating_cp":meta.get("rating_cp"),
