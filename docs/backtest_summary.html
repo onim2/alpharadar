@@ -1,0 +1,347 @@
+<title>AlphaRadar 백테스트 — 개인 투자 참고 메모</title>
+<style>
+  :root{
+    --bg:#FAFBFC; --surface:#FFFFFF; --surface-2:#F2F5F8; --surface-3:#EAEEF3;
+    --ink:#161B22; --ink-2:#3B4553; --muted:#69727F; --line:#E2E7EE;
+    --accent:#2E5A82; --accent-soft:#E5EDF4;
+    --neg:#B23A32; --neg-soft:#F5E3E1;
+    --warn:#8F6B18; --warn-soft:#F5ECD8;
+    --pos:#2F7A55; --pos-soft:#E0EFE6;
+    --shadow:0 1px 2px rgba(20,30,45,.05), 0 8px 24px rgba(20,30,45,.05);
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Apple SD Gothic Neo","Malgun Gothic",Segoe UI,sans-serif;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0F1318; --surface:#161B22; --surface-2:#1B222B; --surface-3:#222B36;
+      --ink:#E8ECF2; --ink-2:#B7C1CF; --muted:#828C9A; --line:#28303B;
+      --accent:#74ABD9; --accent-soft:#1A2836;
+      --neg:#E27C71; --neg-soft:#2E1E1C;
+      --warn:#D8B25E; --warn-soft:#2C2618;
+      --pos:#6FC090; --pos-soft:#16261D;
+      --shadow:0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#FAFBFC; --surface:#FFFFFF; --surface-2:#F2F5F8; --surface-3:#EAEEF3;
+    --ink:#161B22; --ink-2:#3B4553; --muted:#69727F; --line:#E2E7EE;
+    --accent:#2E5A82; --accent-soft:#E5EDF4;
+    --neg:#B23A32; --neg-soft:#F5E3E1; --warn:#8F6B18; --warn-soft:#F5ECD8;
+    --pos:#2F7A55; --pos-soft:#E0EFE6;
+    --shadow:0 1px 2px rgba(20,30,45,.05), 0 8px 24px rgba(20,30,45,.05);
+  }
+  :root[data-theme="dark"]{
+    --bg:#0F1318; --surface:#161B22; --surface-2:#1B222B; --surface-3:#222B36;
+    --ink:#E8ECF2; --ink-2:#B7C1CF; --muted:#828C9A; --line:#28303B;
+    --accent:#74ABD9; --accent-soft:#1A2836;
+    --neg:#E27C71; --neg-soft:#2E1E1C; --warn:#D8B25E; --warn-soft:#2C2618;
+    --pos:#6FC090; --pos-soft:#16261D;
+    --shadow:0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+  }
+
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+    line-height:1.6;-webkit-font-smoothing:antialiased;}
+  .wrap{max-width:860px;margin:0 auto;padding:clamp(28px,5vw,64px) clamp(18px,4vw,40px) 96px;}
+
+  /* ── Masthead ── */
+  .masthead{border-bottom:1px solid var(--line);padding-bottom:26px;margin-bottom:34px;}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--accent);font-weight:600;margin:0 0 14px;}
+  h1{font-size:clamp(28px,4.4vw,40px);line-height:1.12;letter-spacing:-.02em;font-weight:750;
+    margin:0 0 12px;text-wrap:balance;}
+  .dek{font-size:17px;color:var(--ink-2);margin:0;max-width:60ch;}
+  .meta{display:flex;flex-wrap:wrap;gap:6px 26px;margin-top:22px;font-family:var(--mono);font-size:12.5px;color:var(--muted);}
+  .meta b{color:var(--ink-2);font-weight:600;}
+
+  /* ── Verdict ── */
+  .verdict{background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--neg);
+    border-radius:12px;padding:22px 24px;box-shadow:var(--shadow);margin-bottom:14px;}
+  .verdict .tag{font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;
+    color:var(--neg);font-weight:700;}
+  .verdict p{margin:8px 0 0;font-size:18px;font-weight:600;line-height:1.5;letter-spacing:-.01em;}
+  .verdict p .hl{color:var(--neg);}
+
+  .tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:14px 0 40px;}
+  .tile{background:var(--surface);border:1px solid var(--line);border-radius:11px;padding:16px 18px;}
+  .tile .k{font-family:var(--mono);font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);margin:0;}
+  .tile .v{font-family:var(--mono);font-size:26px;font-weight:680;letter-spacing:-.02em;margin:6px 0 2px;
+    font-variant-numeric:tabular-nums;}
+  .tile .s{font-size:12.5px;color:var(--ink-2);margin:0;}
+  .v.neg{color:var(--neg)} .v.warn{color:var(--warn)} .v.pos{color:var(--pos)}
+
+  /* ── Sections ── */
+  section{margin-top:46px;}
+  .sec-head{display:flex;align-items:baseline;gap:12px;margin-bottom:6px;}
+  .sec-num{font-family:var(--mono);font-size:13px;font-weight:600;color:var(--accent);}
+  h2{font-size:21px;letter-spacing:-.015em;font-weight:700;margin:0;}
+  .sec-sub{color:var(--muted);font-size:14px;margin:0 0 20px;padding-left:29px;}
+  p.body{color:var(--ink-2);font-size:15.5px;margin:14px 0;}
+  p.body b{color:var(--ink);font-weight:650;}
+
+  /* ── Table ── */
+  .tbl-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:11px;background:var(--surface);}
+  table{width:100%;border-collapse:collapse;font-size:14px;min-width:440px;}
+  th,td{padding:11px 15px;text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono);
+    border-bottom:1px solid var(--line);white-space:nowrap;}
+  th:first-child,td:first-child{text-align:left;font-family:var(--sans);}
+  thead th{font-size:11.5px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);font-weight:600;
+    background:var(--surface-2);}
+  tbody tr:last-child td{border-bottom:none;}
+  td.neg{color:var(--neg);font-weight:600} td.pos{color:var(--pos);font-weight:600}
+  td.warn{color:var(--warn);font-weight:600} td.mut{color:var(--muted)}
+  caption{caption-side:bottom;text-align:left;font-size:12px;color:var(--muted);padding:10px 4px 0;font-family:var(--sans);}
+
+  /* ── IC bar viz ── */
+  .icbars{display:flex;flex-direction:column;gap:10px;margin:18px 0 6px;}
+  .icrow{display:grid;grid-template-columns:74px 1fr 62px;align-items:center;gap:12px;}
+  .icrow .lbl{font-size:13px;color:var(--ink-2);}
+  .icrow .val{font-family:var(--mono);font-size:13px;text-align:right;font-variant-numeric:tabular-nums;font-weight:600;}
+  .track{position:relative;height:22px;background:var(--surface-2);border-radius:5px;overflow:hidden;}
+  .track .zero{position:absolute;left:50%;top:0;bottom:0;width:1px;background:var(--line);}
+  .track .fill{position:absolute;top:3px;bottom:3px;border-radius:3px;}
+
+  /* ── Callout ── */
+  .note{border-radius:11px;padding:16px 18px;margin:18px 0;font-size:14.5px;line-height:1.55;border:1px solid;}
+  .note .lead{font-weight:700;display:block;margin-bottom:3px;font-size:13px;letter-spacing:.03em;text-transform:uppercase;font-family:var(--mono);}
+  .note.warn{background:var(--warn-soft);border-color:color-mix(in srgb,var(--warn) 32%,transparent);color:var(--ink);}
+  .note.warn .lead{color:var(--warn);}
+  .note.pos{background:var(--pos-soft);border-color:color-mix(in srgb,var(--pos) 32%,transparent);color:var(--ink);}
+  .note.pos .lead{color:var(--pos);}
+  .note.neg{background:var(--neg-soft);border-color:color-mix(in srgb,var(--neg) 32%,transparent);color:var(--ink);}
+  .note.neg .lead{color:var(--neg);}
+
+  ul.clean{margin:14px 0;padding-left:0;list-style:none;display:flex;flex-direction:column;gap:9px;}
+  ul.clean li{position:relative;padding-left:22px;color:var(--ink-2);font-size:15px;}
+  ul.clean li::before{content:"";position:absolute;left:2px;top:9px;width:7px;height:7px;border-radius:2px;background:var(--accent);}
+  ul.clean li.b-neg::before{background:var(--neg)} ul.clean li.b-pos::before{background:var(--pos)} ul.clean li.b-warn::before{background:var(--warn)}
+  ul.clean li b{color:var(--ink);font-weight:650;}
+
+  .conc{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:26px 28px;box-shadow:var(--shadow);}
+  .conc h2{margin-bottom:16px;}
+  .rec{display:grid;grid-template-columns:auto 1fr;gap:4px 16px;margin-top:8px;align-items:baseline;}
+  .rec .n{font-family:var(--mono);color:var(--accent);font-weight:700;font-size:14px;}
+  .rec .t{font-size:15px;color:var(--ink-2);padding-bottom:12px;}
+  .rec .t b{color:var(--ink);font-weight:650;}
+
+  footer{margin-top:54px;padding-top:22px;border-top:1px solid var(--line);
+    font-family:var(--mono);font-size:12px;color:var(--muted);display:flex;flex-wrap:wrap;gap:6px 20px;justify-content:space-between;}
+
+  @media (max-width:560px){
+    .tiles{grid-template-columns:1fr;}
+    .icrow{grid-template-columns:64px 1fr 54px;gap:8px;}
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <p class="eyebrow">개인 투자 참고용 · 비공개 메모 (발표 아님)</p>
+    <h1>AlphaRadar 백테스트 — 내 투자 판단용 기록</h1>
+    <p class="dek">내가 이 시스템을 실제 투자에 쓸지 판단하려고 데이터로 검증한 결과를, 좋게 포장하지 않고 그대로 남긴 개인 메모. 발표·공유용이 아니다.</p>
+    <div class="meta">
+      <span>기간 <b>2026-05-25 → 07-29</b></span>
+      <span>스캔 <b>53일</b></span>
+      <span>시그널 <b>4,538건</b></span>
+      <span>종목 <b>447</b></span>
+      <span>매칭 <b>9,810건</b></span>
+      <span>데이터 <b>라이브 일일수집</b></span>
+    </div>
+  </header>
+
+  <div class="verdict">
+    <span class="tag">Bottom line</span>
+    <p>현재 국면에서 이 시스템의 종합 스코어는 <span class="hl">예측력(IC)이 사실상 0</span>이며, 가중치 재튜닝·부분 필터로는 개선되지 않는다. 뉴스 감성은 일관되게 <span class="hl">역효과</span>다.</p>
+  </div>
+
+  <div class="tiles">
+    <div class="tile">
+      <p class="k">종합 IC (10일)</p>
+      <p class="v neg">−0.020</p>
+      <p class="s">유의미 기준 0.05 미달 · ★약함</p>
+    </div>
+    <div class="tile">
+      <p class="k">news_score IC (10일)</p>
+      <p class="v neg">−0.080</p>
+      <p class="s">감성 역효과의 핵심 주범</p>
+    </div>
+    <div class="tile">
+      <p class="k">그리드서치 최적 w_text</p>
+      <p class="v warn">0.00</p>
+      <p class="s">전 horizon·Top10 일관</p>
+    </div>
+  </div>
+
+  <section>
+    <div class="sec-head"><span class="sec-num">01</span><h2>분석 개요</h2></div>
+    <p class="sec-sub">대상 시스템과 데이터, 검증 방법</p>
+    <p class="body">AlphaRadar v3.3은 한국 주식 스캐너로, 종합점수를 <b>S = T×0.30 + S_text×0.40 + D×0.30</b> (기술·감성·수급)으로 산출한다. 검증에는 GitHub Actions로 매일 자동 수집된 라이브 DB를 사용했다(백필 아님 → 뉴스 lookahead 편향 최소). 성과는 절대수익이 아니라 <b>시장중립 지표인 IC(Information Coefficient, Spearman 순위상관)와 Decile 단조성</b>으로 판단한다 — 전 구간이 하락장이라 절대수익은 시장 영향이 지배적이기 때문이다.</p>
+    <div class="note warn">
+      <span class="lead">해석 프레임</span>
+      IC ≥ 0.05 유의미 / 0.02–0.05 약함 / &lt;0.02 신호 없음. 등급은 집중 27 · 주시 137 · 참고 4,184건.
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-num">02</span><h2>신호 예측력 (IC)</h2></div>
+    <p class="sec-sub">홀딩 5·10·20일에 걸친 종합점수의 순위상관</p>
+    <div class="icbars">
+      <div class="icrow"><span class="lbl">홀딩 5일</span><div class="track"><span class="zero"></span><span class="fill" style="right:50%;width:19.7%;background:var(--neg);"></span></div><span class="val" style="color:var(--neg)">−0.039</span></div>
+      <div class="icrow"><span class="lbl">홀딩 10일</span><div class="track"><span class="zero"></span><span class="fill" style="right:50%;width:10%;background:var(--neg);"></span></div><span class="val" style="color:var(--neg)">−0.020</span></div>
+      <div class="icrow"><span class="lbl">홀딩 20일</span><div class="track"><span class="zero"></span><span class="fill" style="right:50%;width:15.7%;background:var(--neg);"></span></div><span class="val" style="color:var(--neg)">−0.031</span></div>
+    </div>
+    <p class="body" style="font-size:13px;color:var(--muted)">막대는 IC=0(중앙선) 기준. 모든 홀딩 구간에서 IC가 <b style="color:var(--neg)">음의 방향</b>으로, 점수가 높을수록 이후 수익률이 오히려 낮은 경향.</p>
+
+    <div class="tbl-wrap" style="margin-top:18px;">
+      <table>
+        <thead><tr><th>Holding</th><th>종합 IC</th><th>정형 T+D IC</th><th>s_text 기여</th><th>등급 집중 승률</th></tr></thead>
+        <tbody>
+          <tr><td>5일</td><td class="neg">−0.039</td><td class="neg">−0.024</td><td class="neg">−61.5%</td><td class="mut">22.4%</td></tr>
+          <tr><td>10일</td><td class="neg">−0.020</td><td class="mut">−0.000</td><td class="neg">−6450%</td><td class="mut">15.5%</td></tr>
+          <tr><td>20일</td><td class="neg">−0.031</td><td class="neg">−0.022</td><td class="neg">−40.0%</td><td class="neg">0.0%</td></tr>
+        </tbody>
+        <caption>정형(T+D)만 봐도 IC가 0 근처 → 스코어 로직 전반의 예측력 부재. Decile 분석에서도 상위 10%가 하위 10%를 못 이김(단조성 없음).</caption>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-num">03</span><h2>가중치 그리드서치</h2></div>
+    <p class="sec-sub">T·S_text·D 배합 전수 탐색 (목적함수 = IC)</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>Holding</th><th>최적 w_tech</th><th>최적 w_text</th><th>최적 w_cross</th><th>최적 IC</th></tr></thead>
+        <tbody>
+          <tr><td>5일</td><td class="mut">0.00</td><td class="pos">0.00</td><td>1.00 (D)</td><td class="warn">0.016</td></tr>
+          <tr><td>10일</td><td>1.00 (T)</td><td class="pos">0.00</td><td class="mut">0.00</td><td class="warn">0.021</td></tr>
+          <tr><td>20일</td><td class="mut">0.00</td><td class="pos">0.00</td><td>1.00 (D)</td><td class="warn">0.016</td></tr>
+        </tbody>
+        <caption>Top10 조합 전부 w_text=0.00. 최적 IC조차 0.02 수준(여전히 ★약함).</caption>
+      </table>
+    </div>
+    <div class="note warn">
+      <span class="lead">과최적화 경고</span>
+      최적해가 horizon마다 <b>정반대 코너로 튄다</b>(5·20일=수급 100%, 10일=기술 100%). 진짜 신호라면 가중치가 안정적이어야 한다 → 각 구간 잡음에 과적합. <b>1.0/0.0/0.0 같은 코너해는 config에 박제 금지.</b>
+    </div>
+    <div class="note pos">
+      <span class="lead">유일하게 견고한 결론</span>
+      w_text=0.00이 전 horizon·거의 전 조합에서 일관 → <b>뉴스 감성(s_text)은 어느 배합에서도 예측에 해롭다.</b>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-num">04</span><h2>s_text 역효과 원인 진단</h2></div>
+    <p class="sec-sub">감성이 왜 IC를 깎는가 — 컴포넌트 분해와 데이터 실증</p>
+    <p class="body"><b>범인은 뉴스(news_score)이고, 공시(dart)는 무죄다.</b> 현재 s_text는 news와 dart를 한 덩어리로 섞어, 무해한 dart까지 함께 오염된다.</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>Holding</th><th>s_text IC</th><th>news_score IC</th><th>dart_score IC</th></tr></thead>
+        <tbody>
+          <tr><td>5일</td><td class="neg">−0.022</td><td class="neg">−0.032</td><td class="mut">−0.008</td></tr>
+          <tr><td>10일</td><td class="neg">−0.043</td><td class="neg">−0.080</td><td class="pos">+0.013</td></tr>
+          <tr><td>20일</td><td class="mut">+0.004</td><td class="mut">−0.006</td><td class="mut">−0.005</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="body" style="margin-top:22px;">부호 버그가 아니다. s_text 구간별 10일 수익률을 보면 <b>중간 호재(60–70)가 최악, 악재·중립(≤50)이 오히려 최선</b>인 역U자 — 라벨이 뒤집혔다면 정반대여야 한다. 즉 positive 뉴스가 <b>정확히</b> 라벨링됐는데도 그 종목들이 이후 더 빠진다.</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>s_text 구간</th><th>N</th><th>10일 평균수익</th><th>판정</th></tr></thead>
+        <tbody>
+          <tr><td>≤50 (악재·중립)</td><td class="mut">5,210</td><td class="pos">−10.3%</td><td class="mut">가장 덜 나쁨</td></tr>
+          <tr><td>50–55</td><td class="mut">11,175</td><td>−10.8%</td><td class="mut">·</td></tr>
+          <tr><td>55–60</td><td class="mut">3,747</td><td class="warn">−12.3%</td><td class="mut">·</td></tr>
+          <tr><td>60–70</td><td class="mut">2,854</td><td class="neg">−14.6%</td><td class="neg">최악 (정점)</td></tr>
+          <tr><td>≥70 (강호재)</td><td class="mut">2,848</td><td class="warn">−11.8%</td><td class="mut">오히려 회복</td></tr>
+        </tbody>
+        <caption>N은 엔진 소스 중복 포함 join 기준. 부호·패턴은 공식 리포트 IC와 일치.</caption>
+      </table>
+    </div>
+    <div class="note neg">
+      <span class="lead">근본 원인</span>
+      코드 버그가 아니라 <b>신호 자체의 문제</b>. 유니버스가 이미 급등·화제주로 편향된 상태에서 positive 뉴스 가중을 또 더해 <b>과열 종목에 이중 베팅</b> → 되돌림(mean-reversion)에 노출. 즉 이 국면에서 뉴스 감성은 <b>역행 지표(contrarian)</b>로 작동한다.
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-num">05</span><h2>리스크 필터 검증 — 강호재+과열 제외</h2></div>
+    <p class="sec-sub">"positive 뉴스 + 이격 과열" 종목을 빼면 개선되는가?</p>
+    <ul class="clean">
+      <li class="b-pos"><b>전제는 맞음</b> — 넓은 유니버스에서 제외 대상(s_text≥70 &amp; disparity≥115)은 10일 승률 0.0%(55건 전멸)로 확실히 독성.</li>
+      <li class="b-warn"><b>그러나 포트폴리오 효과 미미</b> — 대상이 4,500건 중 55–119건뿐. 전체 ΔIC = +0.005~0.007, Δ평균 +0.1%p 수준. IC≈0을 못 고침.</li>
+      <li class="b-neg"><b>정작 실행 등급(집중+주시)에선 역효과</b> — 제외한 35건은 동료 대비 <b>더 나쁘지 않았다</b>(5일 −3.0% vs 전체 −9.1%). 빼면 실행 성과가 오히려 하락.</li>
+    </ul>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>집중+주시 성과</th><th>필터 전</th><th>필터 후</th><th>제외 35건</th></tr></thead>
+        <tbody>
+          <tr><td>5일 평균</td><td>−9.09%</td><td class="neg">−10.36%</td><td class="pos">−3.00%</td></tr>
+          <tr><td>10일 평균</td><td>−14.40%</td><td class="neg">−15.10%</td><td>−11.04%</td></tr>
+          <tr><td>20일 평균</td><td>−26.54%</td><td class="neg">−27.23%</td><td>−23.32%</td></tr>
+        </tbody>
+        <caption>필터 후 열이 필터 전보다 나쁨 = 좋은 종목을 잘라냄. 표본(제외 35건, 단일국면)도 매우 얇음.</caption>
+      </table>
+    </div>
+    <div class="note neg">
+      <span class="lead">판정 · 배포 부적합</span>
+      필터는 <b>어차피 안 사는 저등급 종목</b>만 걸러낼 뿐, <b>실제 매매하는 고등급 종목</b>에는 중립~역효과. 넓은 풀의 통계가 실행 대상엔 이전되지 않는 전형적 사례.
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-num">06</span><h2>Walk-forward 검증 — 과최적화 확정</h2></div>
+    <p class="sec-sub">시간순 train/test 분할: 과거에서 찾은 최적 가중치가 미래에도 통하는가?</p>
+    <p class="body">그리드서치의 "최적 가중치"가 진짜 예측력인지, 아니면 그 기간 잡음에 맞춘 것(과최적화)인지 가리는 결정적 시험이다. 각 폴드에서 <b>과거구간(train)</b>으로 최적 가중치를 찾은 뒤, <b>미래구간(test)</b>에서 그대로 적용해 성능을 본다.</p>
+
+    <div class="icbars">
+      <div class="icrow"><span class="lbl">IS 최적 IC<br><span style="font-size:11px;color:var(--muted)">(in-sample)</span></span><div class="track"><span class="zero"></span><span class="fill" style="left:50%;width:12.3%;background:var(--pos);"></span></div><span class="val" style="color:var(--pos)">+0.037</span></div>
+      <div class="icrow"><span class="lbl">OOS 최적W<br><span style="font-size:11px;color:var(--muted)">(out-of-sample)</span></span><div class="track"><span class="zero"></span><span class="fill" style="right:50%;width:25%;background:var(--neg);"></span></div><span class="val" style="color:var(--neg)">−0.075</span></div>
+      <div class="icrow"><span class="lbl">OOS 기존설정<br><span style="font-size:11px;color:var(--muted)">(0.30/0.40/0.30)</span></span><div class="track"><span class="zero"></span><span class="fill" style="right:50%;width:15.7%;background:var(--warn);"></span></div><span class="val" style="color:var(--warn)">−0.047</span></div>
+    </div>
+    <p class="body" style="font-size:13px;color:var(--muted)">IS(과거)에선 +로 좋아 보이던 최적 가중치가, OOS(미래)에선 <b style="color:var(--neg)">부호까지 뒤집혀</b> 음수로. 심지어 손 안 댄 기존설정보다도 나쁘다.</p>
+
+    <div class="tbl-wrap" style="margin-top:18px;">
+      <table>
+        <thead><tr><th>Fold</th><th>test 기간</th><th>최적W (IS)</th><th>IS_IC</th><th>OOS_IC (최적)</th><th>OOS_IC (기존)</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td class="mut">06-05~06-17</td><td>0.05/0.00/0.95</td><td class="pos">+0.018</td><td class="neg">−0.044</td><td class="pos">+0.051</td></tr>
+          <tr><td>2</td><td class="mut">06-18~06-30</td><td>1.00/0.00/0.00</td><td class="pos">+0.061</td><td class="neg">−0.148</td><td class="neg">−0.136</td></tr>
+          <tr><td>3</td><td class="mut">07-01~07-14</td><td>1.00/0.00/0.00</td><td class="pos">+0.032</td><td class="neg">−0.035</td><td class="neg">−0.057</td></tr>
+        </tbody>
+        <caption>IS→OOS 평균 낙폭 −0.113. 폴드마다 최적해도 불안정(D-100% ↔ T-100%) = 잡음 과적합의 전형.</caption>
+      </table>
+    </div>
+    <div class="note neg">
+      <span class="lead">판정 · 과최적화 확정</span>
+      IS 최적 가중치의 OOS IC가 <b>음수(−0.075)</b>로 붕괴하고, 기존설정보다도 열위(−0.028). Fold 1은 기존설정이면 OOS +0.051이었는데 최적화가 −0.044로 <b>망쳤다</b>. → 그리드서치 코너해를 config에 박제하면 실전에서 무너진다.
+    </div>
+  </section>
+
+  <section>
+    <div class="conc">
+      <h2>종합 결론 &amp; 권고</h2>
+      <ul class="clean">
+        <li class="b-neg">현 국면에서 종합 스코어의 <b>IC는 사실상 0</b> — 없는 알파는 가중치·필터로 만들 수 없다.</li>
+        <li class="b-neg">뉴스 감성(<b>news_score</b>)이 IC를 −0.08까지 끌어내리는 핵심 드래그. 공시(dart)는 무해.</li>
+        <li class="b-neg">그리드서치 최적해는 <b>과최적화 확정</b> — walk-forward에서 IS +0.037 → OOS −0.075로 붕괴. 가중치 튜닝으론 실전 우위 못 만듦.</li>
+        <li class="b-warn">모든 근거는 <b>단일 하락국면(약 2개월)</b> · |IC|&lt;0.05로 통계적 신뢰도가 낮다.</li>
+      </ul>
+      <div class="note warn" style="margin-top:20px;">
+        <span class="lead">핵심 메시지</span>
+        혼란장 대응의 실질 지렛대는 <b>신호 재튜닝이 아니라 노출(포지션) 축소</b>다. 신호 품질이 낮은 국면엔 베팅 자체를 줄이는 것이 맞다.
+      </div>
+      <h2 style="font-size:16px;margin:26px 0 12px;">다음 단계 (우선순위)</h2>
+      <div class="rec">
+        <span class="n">1</span><span class="t"><b>구조 개선(저위험):</b> s_text를 news/dart로 분리 저장 → news 가중을 독립 조절. 단 보수적 기본값(0~0.1)으로, 코너해 박제 금지.</span>
+        <span class="n">2</span><span class="t"><b>노출 관리:</b> IC가 임계 이하인 국면에 포지션 크기·종목 수를 축소하는 규칙 도입.</span>
+        <span class="n">3</span><span class="t"><b>추가 검증:</b> 상승·횡보 등 <b>다른 국면 데이터가 쌓인 뒤</b> 재검증 — 현재 결론은 하락장 한정.</span>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span>개인 투자 판단용 기록 · 비공개 · 발표/공유 목적 아님</span>
+    <span>작성 2026-07-30 · backtest.py / 라이브 DB (scores_history.db)</span>
+  </footer>
+
+</div>
