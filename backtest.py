@@ -368,20 +368,27 @@ def ablation_ic(merged: pd.DataFrame, ret_col: str = "ret_10d") -> pd.DataFrame:
 
 
 def grade_performance(merged: pd.DataFrame, ret_col: str = "ret_10d") -> pd.DataFrame:
-    """등급별 평균 수익률·승률"""
+    """등급별 평균 수익률·승률 (+ 벤치마크 대비 초과수익)"""
+    ex_col = f"{ret_col}_excess"
+    has_ex = ex_col in merged.columns
     rows = []
     for grade in ["집중", "주시", "참고"]:
-        sub = merged[merged["grade"] == grade][ret_col].dropna()
+        g   = merged[merged["grade"] == grade]
+        sub = g[ret_col].dropna()
         if len(sub) == 0:
             continue
-        rows.append({
+        row = {
             "등급":      grade,
             "N":         len(sub),
             "평균(%)":   round(sub.mean(), 2),
             "중간값(%)": round(sub.median(), 2),
             "승률(%)":   round((sub > 0).mean() * 100, 1),
             "Sharpe":    round(sub.mean() / sub.std(), 3) if sub.std() > 0 else 0,
-        })
+        }
+        if has_ex:
+            ex = g[ex_col].dropna()
+            row["평균초과(%)"] = round(ex.mean(), 2) if len(ex) else np.nan
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -389,34 +396,41 @@ def engine_performance(merged: pd.DataFrame, ret_col: str = "ret_10d") -> pd.Dat
     """엔진별 수익률 — engine_a / engine_b / both"""
     if "source" not in merged.columns:
         return pd.DataFrame()
+    ex_col = f"{ret_col}_excess"
+    has_ex = ex_col in merged.columns
     rows = []
     for src in ["engine_a", "engine_b", "both"]:
-        sub = merged[merged["source"] == src][ret_col].dropna()
+        g   = merged[merged["source"] == src]
+        sub = g[ret_col].dropna()
         if len(sub) == 0:
             continue
-        rows.append({
+        row = {
             "엔진":    src,
             "N":       len(sub),
             "평균(%)": round(sub.mean(), 2),
             "승률(%)": round((sub > 0).mean() * 100, 1),
             "Sharpe":  round(sub.mean() / sub.std(), 3) if sub.std() > 0 else 0,
-        })
+        }
+        if has_ex:
+            ex = g[ex_col].dropna()
+            row["평균초과(%)"] = round(ex.mean(), 2) if len(ex) else np.nan
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
 def decile_analysis(merged: pd.DataFrame, ret_col: str = "ret_10d") -> pd.DataFrame:
     """점수 10분위 분석 — 단조성 확인"""
-    sub = merged[["score_total", ret_col]].dropna()
+    ex_col = f"{ret_col}_excess"
+    cols   = ["score_total", ret_col] + ([ex_col] if ex_col in merged.columns else [])
+    sub = merged[cols].dropna(subset=["score_total", ret_col])
     if len(sub) < 50:
         return pd.DataFrame()
     sub = sub.copy()
     sub["decile"] = pd.qcut(sub["score_total"], 10, labels=False, duplicates="drop") + 1
-    return (
-        sub.groupby("decile")[ret_col]
-        .agg(["count", "mean", "median"])
-        .round(2)
-        .reset_index()
-    )
+    base = sub.groupby("decile")[ret_col].agg(["count", "mean", "median"]).round(2)
+    if ex_col in sub.columns:
+        base["excess_mean"] = sub.groupby("decile")[ex_col].mean().round(2)
+    return base.reset_index()
 
 
 def threshold_search(merged: pd.DataFrame, ret_col: str = "ret_10d") -> dict:
@@ -495,18 +509,40 @@ def grid_search(
 # ══════════════════════════════════════════════════════════════════════════════
 # 리포트
 # ══════════════════════════════════════════════════════════════════════════════
+def _merge_signals_returns(signals_df: pd.DataFrame, returns_df: pd.DataFrame):
+    """
+    P0-3: (scan_date, ticker) 중복으로 인한 cartesian join·과대계상 방지.
+
+    반환:
+      merged_full   — 엔진(source)별 행 보존 (엔진별 성과용)
+      merged_unique — 종목·일자당 1건(최고 score_total)으로 유일화 (포트폴리오 지표용)
+    """
+    # returns_df는 (scan_date,ticker)당 값이 동일 → 중복 제거해 join 폭증 차단
+    returns_u   = returns_df.drop_duplicates(subset=["scan_date", "ticker"])
+    merged_full = signals_df.merge(returns_u, on=["scan_date", "ticker"], how="inner")
+    merged_unique = (
+        merged_full.sort_values("score_total", ascending=False)
+                   .drop_duplicates(subset=["scan_date", "ticker"])
+                   .reset_index(drop=True)
+    )
+    return merged_full, merged_unique
+
+
 def print_report(signals_df: pd.DataFrame, returns_df: pd.DataFrame, horizons: list):
-    merged = signals_df.merge(returns_df, on=["scan_date", "ticker"], how="inner")
-    logger.info(f"매칭된 표본: {len(merged)}건")
+    merged_full, merged = _merge_signals_returns(signals_df, returns_df)
+    logger.info(f"매칭: full={len(merged_full)}건 → 유니크(종목·일자)={len(merged)}건")
+    has_ex = any(f"ret_{h}d_excess" in merged.columns for h in horizons)
 
     print("\n" + "═" * 70)
     print("AlphaRadar Backtest Report")
     print("═" * 70)
     print(f"기간   : {signals_df['scan_date'].min()} ~ {signals_df['scan_date'].max()}")
-    print(f"시그널 : {len(signals_df)}건  |  매칭: {len(merged)}건  |  종목: {merged['ticker'].nunique()}개")
-    if "source" in merged.columns:
-        src_cnt = merged["source"].value_counts().to_dict()
-        print(f"엔진   : " + " / ".join(f"{k}={v}" for k, v in src_cnt.items()))
+    print(f"시그널 : {len(signals_df)}건  |  유니크 매칭: {len(merged)}건  |  종목: {merged['ticker'].nunique()}개")
+    print(f"주의   : 수익률은 원수익률(raw). 하락장 편향을 피하려면 '초과(excess, vs 벤치마크)'로 판단." if has_ex
+          else "주의   : 벤치마크 미설정 — 초과수익 미계산 (--benchmark 지정 권장)")
+    if "source" in merged_full.columns:
+        src_cnt = merged_full["source"].value_counts().to_dict()
+        print(f"엔진(중복포함) : " + " / ".join(f"{k}={v}" for k, v in src_cnt.items()))
 
     for h in horizons:
         ret_col = f"ret_{h}d"
@@ -524,6 +560,18 @@ def print_report(signals_df: pd.DataFrame, returns_df: pd.DataFrame, horizons: l
             else "신호 없음"
         )
         print(f"\n[총점 IC]  IC={ic_res['ic']}  p={ic_res.get('p_value')}  N={ic_res['n']}  → {verdict}")
+
+        # P0-1: 초과수익(벤치마크 대비) IC — 하락장 편향 제거한 진짜 종목변별력
+        ex_col = f"ret_{h}d_excess"
+        if ex_col in merged.columns:
+            ic_ex = ic_analysis(merged["score_total"], merged[ex_col])
+            ver_ex = (
+                "★★★ 강한 신호"  if abs(ic_ex.get("ic") or 0) >= 0.10
+                else "★★ 유의미" if abs(ic_ex.get("ic") or 0) >= 0.05
+                else "★ 약함"    if abs(ic_ex.get("ic") or 0) >= 0.02
+                else "신호 없음"
+            )
+            print(f"[초과 IC]  IC={ic_ex['ic']}  p={ic_ex.get('p_value')}  N={ic_ex['n']}  → {ver_ex}  ◀ 벤치마크 대비(권장 지표)")
 
         # 컴포넌트별 IC (정형만 분리 포함)
         comp = component_ic(merged, ret_col)
@@ -547,8 +595,8 @@ def print_report(signals_df: pd.DataFrame, returns_df: pd.DataFrame, horizons: l
             else:
                 print("  → 비정형이 IC를 낮춤 — s_text 가중치 축소 검토 필요")
 
-        # 엔진별 성과
-        eng = engine_performance(merged, ret_col)
+        # 엔진별 성과 (source 보존 위해 중복포함 merged_full 사용)
+        eng = engine_performance(merged_full, ret_col)
         if not eng.empty:
             print("\n[엔진별 성과]")
             print(eng.to_string(index=False))
@@ -580,7 +628,8 @@ def print_grid_search(
     objective: str = "ic",
     top_n: int = 10,
 ):
-    merged  = signals_df.merge(returns_df, on=["scan_date", "ticker"], how="inner")
+    # P0-3: 유니크(종목·일자)로 유일화해 중복 종목 과대계상 방지
+    _, merged = _merge_signals_returns(signals_df, returns_df)
     ret_col = f"ret_{horizon}d"
     if ret_col not in merged.columns:
         logger.error(f"{ret_col} 컬럼 없음 — --horizons에 {horizon} 포함 확인")
