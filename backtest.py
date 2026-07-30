@@ -669,6 +669,133 @@ def print_grid_search(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Walk-forward 검증 (P0-2) — 그리드서치 과최적화(in-sample) 여부 확인
+# ══════════════════════════════════════════════════════════════════════════════
+def _weighted_ic(df: pd.DataFrame, w: tuple, ret_col: str) -> float:
+    """가중치 w=(w_tech,w_text,w_cross)로 합성점수 만들어 IC 산출"""
+    from scipy.stats import spearmanr
+    s = df["score_t"] * w[0] + df["s_text"] * w[1] + df["score_d"] * w[2]
+    m = s.notna() & df[ret_col].notna()
+    if m.sum() < 10:
+        return np.nan
+    return float(spearmanr(s[m], df[ret_col][m])[0])
+
+
+def walk_forward(
+    signals_df: pd.DataFrame,
+    returns_df: pd.DataFrame,
+    horizon: int = 10,
+    objective: str = "ic",
+    n_splits: int = 3,
+    step: float = 0.05,
+) -> pd.DataFrame:
+    """
+    시간순 확장창(expanding window) walk-forward.
+    각 폴드: 과거구간(train)에서 최적 가중치 탐색 → 미래구간(test)에서 검증.
+    IS(train) 최적 가중치가 OOS(test)에서도 유지되는지가 핵심.
+    """
+    ret_col = f"ret_{horizon}d"
+    ex_col  = f"{ret_col}_excess"
+    _, merged = _merge_signals_returns(signals_df, returns_df)
+    if ret_col not in merged.columns:
+        logger.error(f"{ret_col} 컬럼 없음 — --horizons에 {horizon} 포함 확인")
+        return pd.DataFrame()
+
+    merged = merged[
+        merged["score_t"].notna() & merged["s_text"].notna()
+        & merged["score_d"].notna() & merged[ret_col].notna()
+    ].copy()
+
+    dates = sorted(merged["scan_date"].unique())
+    if len(dates) < (n_splits + 1) * 2:
+        logger.warning(f"스캔일 부족({len(dates)}일, 폴드 {n_splits}) — 폴드 신뢰도 낮음")
+
+    # (n_splits+1) 등분: 폴드 i의 train=[0..bound_i), test=[bound_i..bound_{i+1})
+    bounds   = [int(len(dates) * k / (n_splits + 1)) for k in range(n_splits + 2)]
+    baseline = (0.30, 0.40, 0.30)
+    has_ex   = ex_col in merged.columns
+
+    rows = []
+    for i in range(1, n_splits + 1):
+        tr_dates = set(dates[:bounds[i]])
+        te_dates = set(dates[bounds[i]:bounds[i + 1]])
+        if not tr_dates or not te_dates:
+            continue
+        tr = merged[merged["scan_date"].isin(tr_dates)]
+        te = merged[merged["scan_date"].isin(te_dates)]
+        if len(tr) < 30 or len(te) < 10:
+            logger.warning(f"폴드{i} 표본부족(train={len(tr)}, test={len(te)}) — 건너뜀")
+            continue
+
+        grid = grid_search(tr, ret_col=ret_col, objective=objective, step=step)
+        if grid.empty:
+            continue
+        best = grid.iloc[0]
+        w    = (float(best["w_tech"]), float(best["w_text"]), float(best["w_cross"]))
+
+        row = {
+            "fold":         i,
+            "train_N":      len(tr),
+            "test_N":       len(te),
+            "test_기간":    f"{min(te_dates)}~{max(te_dates)}",
+            "최적W(IS)":    f"{w[0]:.2f}/{w[1]:.2f}/{w[2]:.2f}",
+            "IS_IC":        round(float(best[objective]), 4),
+            "OOS_IC(최적)": round(_weighted_ic(te, w, ret_col), 4),
+            "OOS_IC(기존)": round(_weighted_ic(te, baseline, ret_col), 4),
+        }
+        if has_ex:
+            row["OOS초과(최적)"] = round(_weighted_ic(te, w, ex_col), 4)
+            row["OOS초과(기존)"] = round(_weighted_ic(te, baseline, ex_col), 4)
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def print_walk_forward(
+    signals_df: pd.DataFrame,
+    returns_df: pd.DataFrame,
+    horizon: int = 10,
+    objective: str = "ic",
+    n_splits: int = 3,
+):
+    print("\n" + "═" * 70)
+    print(f"Walk-forward 검증  (holding: {horizon}일, 목적: {objective}, 폴드: {n_splits})")
+    print("═" * 70)
+    print("각 폴드: 과거(train)에서 최적 가중치 탐색 → 미래(test) OOS 성능 측정")
+    print("핵심: IS 최적 가중치가 OOS에서 '기존 설정'보다 나은가? (아니면 과최적화)\n")
+
+    wf = walk_forward(signals_df, returns_df, horizon=horizon,
+                      objective=objective, n_splits=n_splits)
+    if wf.empty:
+        print("결과 없음 — 표본/스캔일 부족"); return
+
+    print(wf.to_string(index=False))
+
+    opt  = wf["OOS_IC(최적)"].dropna()
+    base = wf["OOS_IC(기존)"].dropna()
+    is_ic = wf["IS_IC"].dropna()
+    m_opt, m_base, m_is = opt.mean(), base.mean(), is_ic.mean()
+
+    print(f"\n── 요약 (평균) ──")
+    print(f"  IS 최적 IC (in-sample)       : {m_is:+.4f}")
+    print(f"  OOS 최적W IC (out-of-sample) : {m_opt:+.4f}")
+    print(f"  OOS 기존설정 IC              : {m_base:+.4f}")
+    print(f"  IS→OOS 낙폭(최적W)           : {m_opt - m_is:+.4f}")
+    print(f"  최적W가 기존 대비 OOS 우위    : {m_opt - m_base:+.4f}")
+
+    # 판정
+    wins = int((wf["OOS_IC(최적)"] > wf["OOS_IC(기존)"]).sum())
+    print(f"\n── 판정 ──")
+    if m_opt <= 0:
+        print("  ❌ 과최적화 — IS 최적 가중치의 OOS IC가 0 이하. 일반화 실패.")
+    elif m_opt <= m_base + 0.005:
+        print(f"  ⚠️ 과최적화 의심 — OOS에서 최적W가 기존 대비 우위 없음({wins}/{len(wf)} 폴드만 우세).")
+    else:
+        print(f"  ✅ 일부 일반화 — OOS에서도 최적W가 기존 대비 우세({wins}/{len(wf)} 폴드).")
+    print("  ※ 단일 국면·소표본이면 결과는 잠정적. 국면 다양화 후 재검증 권장.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 진입점
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
@@ -678,6 +805,10 @@ def main():
     parser.add_argument("--horizons",     type=int, nargs="+", default=[5, 10, 20])
     parser.add_argument("--report",       action="store_true")
     parser.add_argument("--grid-search",  action="store_true")
+    parser.add_argument("--walk-forward", action="store_true",
+                        help="P0-2: 시간순 train/test 분할로 그리드서치 과최적화 검증")
+    parser.add_argument("--wf-splits",    type=int,            default=3,
+                        help="walk-forward 폴드 수 (기본 3)")
     parser.add_argument("--objective",    type=str,            default="ic",
                         choices=["ic", "top_decile", "long_short"])
     parser.add_argument("--grid-horizon", type=int,            default=10)
@@ -685,7 +816,7 @@ def main():
     parser.add_argument("--benchmark",    type=str,            default="KS11")
     args = parser.parse_args()
 
-    if not args.report and not args.grid_search:
+    if not args.report and not args.grid_search and not args.walk_forward:
         args.report = True
 
     try:
@@ -705,6 +836,10 @@ def main():
     if args.grid_search:
         print_grid_search(signals_df, returns_df,
                           horizon=args.grid_horizon, objective=args.objective)
+    if args.walk_forward:
+        print_walk_forward(signals_df, returns_df,
+                           horizon=args.grid_horizon, objective=args.objective,
+                           n_splits=args.wf_splits)
 
     print("\n" + "═" * 70)
 
