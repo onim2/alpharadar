@@ -376,11 +376,19 @@ class FinBertClient:
 
         반환: (score, best_headline, headline_pct, confidence)
 
+        반환: (score, best_headline, headline_pct, confidence, raw_score)
+
         name 이 주어지면 각 텍스트가 _is_subject 통과 비율로 confidence 계산.
         confidence < 0.5 → score=50 (중립), 헤드라인 빈 문자열.
+
+        raw_score는 게이트를 적용하기 '전' 점수다. 점수 자체에는 쓰지 않고 DB에만
+        남긴다. 이 게이트는 뉴스 점수의 75%를 정확히 50으로 만들어 가중치 0.24가
+        사실상 죽어 있는데(실측: 게이트 통과 기사 26%), 게이트를 열어야 하는지는
+        raw와 confidence가 쌓여야 실측으로 판단할 수 있다. 지금은 판단을 보류하고
+        근거만 모은다. 유효 기사가 없으면 None.
         """
         if not texts:
-            return 50.0, "", 0.0, 0.0
+            return 50.0, "", 0.0, 0.0, None
         if name:
             valid = []
             for t in texts:
@@ -395,12 +403,16 @@ class FinBertClient:
                     continue
                 valid.append(t)
             confidence = round(len(valid) / len(texts), 3) if texts else 0.0
-            if confidence < 0.5 or not valid:
-                return 50.0, "", 0.0, confidence
-            score, headline, pct = self.score_with_best(valid)
-            return score, headline, pct, confidence
+            if not valid:
+                return 50.0, "", 0.0, confidence, None
+            # 게이트에 걸리더라도 raw는 계산해 남긴다 — 나중에 게이트 방식을
+            # 바꿨을 때 과거 데이터로 전/후를 비교하려면 이 값이 필요하다.
+            raw, headline, pct = self.score_with_best(valid)
+            if confidence < 0.5:
+                return 50.0, "", 0.0, confidence, raw
+            return raw, headline, pct, confidence, raw
         score, headline, pct = self.score_with_best(texts)
-        return score, headline, pct, 1.0
+        return score, headline, pct, 1.0, score
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DB
@@ -448,6 +460,14 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_news_ticker_date
                 ON news_articles(ticker, scan_date DESC);
+            CREATE TABLE IF NOT EXISTS dart_filings (
+                scan_date TEXT, ticker TEXT, title TEXT,
+                rcept_no TEXT, rcept_dt TEXT,
+                collected_at TEXT DEFAULT (datetime('now','localtime')),
+                PRIMARY KEY (scan_date, ticker, title)
+            );
+            CREATE INDEX IF NOT EXISTS idx_dart_ticker_date
+                ON dart_filings(ticker, scan_date DESC);
             CREATE INDEX IF NOT EXISTS idx_scan_date_ticker
                 ON scan_results(scan_date, ticker);
             CREATE INDEX IF NOT EXISTS idx_scan_ticker
@@ -461,6 +481,13 @@ def init_db():
         if "cap_tier" not in cols:
             con.execute("ALTER TABLE scan_results ADD COLUMN cap_tier TEXT")
             logger.info("DB 마이그레이션: cap_tier 컬럼 추가 완료")
+        # 뉴스 감성 게이트 진단용 — news_conf(매핑 신뢰도), news_raw(게이트 적용 전 점수).
+        # 이 둘이 없으면 게이트를 열었을 때 점수가 어떻게 달라지는지 과거 데이터로
+        # 재계산할 수 없다(news_score는 이미 게이트가 적용된 값이라 되돌릴 수 없음).
+        for _c in ("news_conf", "news_raw"):
+            if _c not in cols:
+                con.execute(f"ALTER TABLE scan_results ADD COLUMN {_c} REAL")
+                logger.info(f"DB 마이그레이션: {_c} 컬럼 추가 완료")
         # master universe 보강 메타 컬럼 (없으면 추가)
         for _c in ("rating_bond","rating_cp","fg_sector","fg_industry","ksic","largest_holder"):
             if _c not in cols:
@@ -494,8 +521,8 @@ def save_scan_results(results, scan_date):
                  rsi,bb_pos,change_pct,vol_slope,net_buy_days,
                  hype_slope,hype_rank,disparity,
                  rating_bond,rating_cp,fg_sector,fg_industry,ksic,largest_holder,
-                 t_presurge,score_presurge)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 t_presurge,score_presurge,news_conf,news_raw)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (scan_date, r["ticker"], r.get("name"), r.get("sector"),
                  r.get("cap_tier"),
                  r.get("score"), r.get("t"), None, r.get("d"),
@@ -509,7 +536,8 @@ def save_scan_results(results, scan_date):
                  r.get("hype_slope"), r.get("hype_rank"), r.get("disparity"),
                  r.get("rating_bond"), r.get("rating_cp"), r.get("fg_sector"),
                  r.get("fg_industry"), r.get("ksic"), r.get("largest_holder"),
-                 r.get("t_presurge"), r.get("score_presurge")))
+                 r.get("t_presurge"), r.get("score_presurge"),
+                 r.get("news_conf"), r.get("news_raw")))
 
 def save_engine_b_history(tickers, precomputed, scan_date):
     with _conn() as con:
@@ -550,6 +578,32 @@ def save_news_articles(news_items: dict, scan_date: str) -> int:
                     "VALUES (?,?,?,?,?,?)",
                     (scan_date, ticker, _html.unescape(it.get("title", "")),
                      _html.unescape(it.get("desc", "")), link, it.get("pub", "")))
+                n += 1
+    return n
+
+
+def save_dart_filings(dart_items: dict, scan_date: str) -> int:
+    """스캔에 쓰인 공시 제목을 보존한다.
+
+    공시 점수(dart_score)는 7건 남짓을 평균 내어 50 근처로 뭉개지는데(실측:
+    70%가 40~60 구간), 산식을 바꿔 재계산하려면 제목 원본이 필요하다. 뉴스에서
+    겪은 '되돌릴 수 없음'을 반복하지 않기 위한 것이다.
+
+    PK는 (scan_date, ticker, title) — 채점도 제목 기준으로 중복을 제거하므로
+    같은 기준을 쓴다. rcept_no는 조회용으로 함께 남긴다.
+    """
+    n = 0
+    with _conn() as con:
+        for ticker, items in dart_items.items():
+            for it in items:
+                title = (it.get("title") or "").strip()
+                if not title:
+                    continue
+                con.execute(
+                    "INSERT OR REPLACE INTO dart_filings "
+                    "(scan_date, ticker, title, rcept_no, rcept_dt) VALUES (?,?,?,?,?)",
+                    (scan_date, ticker, title,
+                     it.get("rcept_no", ""), it.get("rcept_dt", "")))
                 n += 1
     return n
 
@@ -619,11 +673,16 @@ class DartClient:
 
     _DART_PUBLICATION_TYPES = ["A", "B", "C", "I"]
 
-    def get_report_titles(self, corp_code, days=90):
+    def get_report_items(self, corp_code, days=90):
+        """공시 목록 — 제목에 접수번호·접수일자를 함께 반환.
+
+        get_report_titles()는 여기서 제목만 뽑는 래퍼다. 점수 계산에 쓰이는
+        제목 목록의 순서·중복제거 방식은 예전과 동일하게 유지한다.
+        """
         if not self.api_key or not corp_code: return []
         bgn = (datetime.now()-timedelta(days=days)).strftime("%Y%m%d")
         end = datetime.now().strftime("%Y%m%d")
-        titles = []
+        items = []
         for pty in self._DART_PUBLICATION_TYPES:
             data = self._get("list.json", {
                 "corp_code":corp_code, "bgn_de":bgn, "end_de":end,
@@ -631,13 +690,20 @@ class DartClient:
             })
             for r in data.get("list", []):
                 nm = r.get("report_nm")
-                if nm: titles.append(nm)
+                if nm:
+                    items.append({"title": nm,
+                                  "rcept_no": r.get("rcept_no", ""),
+                                  "rcept_dt": r.get("rcept_dt", "")})
             time.sleep(0.12)
         seen, unique = set(), []
-        for t in titles:
-            if t not in seen:
-                seen.add(t); unique.append(t)
+        for it in items:
+            if it["title"] not in seen:
+                seen.add(it["title"]); unique.append(it)
         return unique
+
+    def get_report_titles(self, corp_code, days=90):
+        """기존 호출부 호환용 — 제목 문자열만 필요할 때."""
+        return [it["title"] for it in self.get_report_items(corp_code, days)]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1308,6 +1374,7 @@ def collect_texts_with_cache(pool_b, naver, dart, news_cnt, dart_days,
     # 링크·발행일시가 붙은 원본. 텍스트 캐시만으로는 기사를 복원할 수 없어
     # 캐시 적중 런에서 news_articles를 채울 수 없다.
     items_cache = CACHE_DIR / f"news_items_{date}_v2.pkl"
+    dart_items_cache = CACHE_DIR / f"dart_items_{date}_v2.pkl"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     def _load(path):
@@ -1321,6 +1388,7 @@ def collect_texts_with_cache(pool_b, naver, dart, news_cnt, dart_days,
     news_texts: dict = _load(news_cache)
     dart_texts: dict = _load(dart_cache)
     news_items: dict = _load(items_cache)
+    dart_items: dict = _load(dart_items_cache)
 
     def _persist_articles(items: dict, note: str):
         """기사 보존은 캐시 적중 여부와 무관하게 매 런 시도한다.
@@ -1334,14 +1402,25 @@ def collect_texts_with_cache(pool_b, naver, dart, news_cnt, dart_days,
         except Exception as e:
             logger.warning(f"기사 보존 실패(스캔은 계속): {e}")
 
+    def _persist_filings(items: dict, note: str):
+        if not items:
+            return
+        try:
+            saved = save_dart_filings(items, date)
+            logger.info(f"공시 보존({note}): {saved}건 ({len(items)}종목) → dart_filings")
+        except Exception as e:
+            logger.warning(f"공시 보존 실패(스캔은 계속): {e}")
+
     # 원본 캐시가 없는 종목은 텍스트가 있어도 다시 수집한다 —
     # 이 기능 이전에 만들어진 캐시를 물려받아도 기사가 비지 않게.
     missing = [(t, m) for t, m in pool_b.items()
-               if t not in news_texts or t not in dart_texts or t not in news_items]
+               if t not in news_texts or t not in dart_texts
+               or t not in news_items or t not in dart_items]
 
     if not missing:
         logger.info(f"텍스트 캐시 전체 적중: {len(pool_b)}종목 (외부 API 0건)")
         _persist_articles({t: news_items[t] for t in pool_b if t in news_items}, "캐시")
+        _persist_filings({t: dart_items[t] for t in pool_b if t in dart_items}, "캐시")
         return news_texts, dart_texts
 
     logger.info(
@@ -1354,22 +1433,24 @@ def collect_texts_with_cache(pool_b, naver, dart, news_cnt, dart_days,
         nm = meta.get("name", ticker)
         news_it = naver.get_news_items(nm, target=news_cnt, fetch=news_cnt * 3,
                                        max_age_days=news_max_age)
-        dart_t = (dart.get_report_titles(meta.get("corp_code", ""), dart_days)
-                  if meta.get("corp_code") else [])
-        return ticker, news_it, dart_t
+        dart_it = (dart.get_report_items(meta.get("corp_code", ""), dart_days)
+                   if meta.get("corp_code") else [])
+        return ticker, news_it, dart_it
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for ticker, news_it, dart_t in ex.map(_collect, missing):
+        for ticker, news_it, dart_it in ex.map(_collect, missing):
             news_items[ticker] = news_it
             news_texts[ticker] = [NaverClient.item_to_text(it) for it in news_it]
-            dart_texts[ticker] = dart_t
+            dart_items[ticker] = dart_it
+            dart_texts[ticker] = [it["title"] for it in dart_it]
 
     # 이번 런에서 본 종목 전체(신규 + 캐시분)를 보존한다
     _persist_articles({t: news_items[t] for t in pool_b if t in news_items}, "수집")
+    _persist_filings({t: dart_items[t] for t in pool_b if t in dart_items}, "수집")
 
     # 원자적 저장 — 도중 실패해도 옛 캐시 보존
     for path, obj in ((news_cache, news_texts), (dart_cache, dart_texts),
-                      (items_cache, news_items)):
+                      (items_cache, news_items), (dart_items_cache, dart_items)):
         tmp = path.with_suffix(".pkl.tmp")
         with open(tmp, "wb") as f: pickle.dump(obj, f)
         tmp.replace(path)
@@ -2411,7 +2492,8 @@ def run_step3(pool_b,precomputed,cfg,date):
     for ticker,meta in pool_b.items():
         t_score=_calc_t(meta)
         t_presurge=_calc_t_presurge(meta)   # Task 4: shadow 기술점수 병행 계산
-        n_sc, n_headline, n_pct, n_conf = news_data.get(ticker, (50.0,"",0.0,0.0))
+        n_sc, n_headline, n_pct, n_conf, n_raw = news_data.get(
+            ticker, (50.0,"",0.0,0.0,None))
         d_sc=dart_scores.get(ticker,50.0)
         # Phase A.1 (C1): 신뢰도 < 0.5 면 뉴스 감성 폐기 (중립 50 처리)
         news_skipped = n_conf < 0.5
@@ -2437,6 +2519,7 @@ def run_step3(pool_b,precomputed,cfg,date):
             "cap_tier":meta.get("cap_tier","large"),"score":score,
             "t":t_score,"t_presurge":t_presurge,"score_presurge":score_presurge,
             "s_text":s_text,"news_score":n_sc,"dart_score":d_sc,"d":d_score,
+            "news_conf":n_conf,"news_raw":n_raw,
             "source":meta.get("source","?"),"n_accel":n_accel,"v_surge":v_surge,
             "finbert_mode":finbert.mode,
             "best_headline":n_headline,"best_headline_pct":n_pct,
