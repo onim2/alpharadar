@@ -3,19 +3,21 @@ name: AlphaRadar Daily Run
 # ─── 실행 트리거 ─────────────────────────────────────────
 on:
   schedule:
-    # 매주 월~금 KST 06:40 (장 시작 2시간 20분 전) — UTC 일~목 21:40
-    # KST 월요일 06:40 = UTC 일요일 21:40 이므로 요일을 0-4 로 지정
+    # 크론은 UTC 기준이다. KST 월요일 06:40 = UTC 일요일 21:40 이므로
+    # 아침 런의 요일을 0-4(일~목)로, 저녁 런은 1-5(월~금)로 지정한다.
     #
-    # 07:40이었을 때 실측(최근 14회): 큐 지연 약 1시간 + 스캔 25~30분 →
-    # 실제 발송이 KST 09:03~09:11로 개장(09:00) 이후에 도착했다.
-    # 06:40으로 1시간 당겨 개장 전(08:00대) 도착을 노린다. 지연은 없앨 수
-    # 없으므로 마진으로 흡수하는 방식이다.
+    # Actions 큐 지연은 없앨 수 없어 마진으로 흡수한다. 실측(최근 14회):
+    # 아침 약 1시간, 저녁 2~3시간 + 스캔 25~30분.
+
+    # 아침 — KST 월~금 06:40 (장 시작 2시간 20분 전)
+    # 07:40이었을 때 실제 발송이 KST 09:03~09:11로 개장(09:00) 이후에
+    # 도착해, 1시간 당겨 08:00대 도착을 노린다.
     - cron: '40 21 * * 0-4'
+
+    # 저녁 — KST 월~금 18:40 (장 마감 3시간 10분 후)
+    # 지연이 커서 실제 도착은 KST 21~22시대.
     - cron: '40 9 * * 1-5'
 
-    # 매주 월~금 KST 18:40 (장 마감 3시간 10분 후) — UTC 월~금 09:40
-    # 저녁 런은 지연이 2~3시간이라 실제 도착은 KST 21~22시대
-   
   workflow_dispatch:        # 수동 실행 버튼 활성화
     inputs:
       dry_run:
@@ -126,10 +128,31 @@ jobs:
           git add data/logs/scanner_*.log             2>/dev/null || true
           if git diff --staged --quiet; then
             echo "커밋할 변경사항 없음"
-          else
-            git commit -m "auto: daily run $(date -u +%F\ %H:%M\ UTC) [skip ci]"
-            git push
+            exit 0
           fi
+          git commit -m "auto: daily run $(date -u +%F\ %H:%M\ UTC) [skip ci]"
+
+          # 런은 30~40분 걸린다. 그 사이 원격 main이 움직이면(다른 런, PR 머지)
+          # push가 거부되고, 러너는 일회용이라 스캔 결과가 통째로 사라진다.
+          # 실측: 2026-08-05 저녁 런이 PR 머지와 겹쳐 기사 39건을 잃었다.
+          # rebase 후 재시도한다. DB가 양쪽에서 바뀌어 rebase가 실패하면
+          # 조용히 한쪽을 고르지 않고(바이너리라 병합 불가) 중단한다 —
+          # 그 경우 아래 아티팩트로 결과를 건져낼 수 있다.
+          for i in 1 2 3 4 5; do
+            if git push; then
+              echo "푸시 성공 (시도 $i)"
+              exit 0
+            fi
+            echo "푸시 거부됨 — 원격 변경 반영 후 재시도 ($i/5)"
+            if ! git pull --rebase origin main; then
+              git rebase --abort || true
+              echo "::error::rebase 실패(DB 충돌 추정) — 결과를 아티팩트로 남긴다"
+              exit 1
+            fi
+            sleep $((i * 5))
+          done
+          echo "::error::5회 재시도 후에도 푸시 실패"
+          exit 1
 
       - name: Upload logs on failure
         if: failure()
@@ -138,3 +161,13 @@ jobs:
           name: scanner-logs-${{ github.run_id }}
           path: data/logs/
           retention-days: 7
+
+      # 푸시가 끝내 실패하면 스캔 결과가 러너와 함께 사라진다. DB를 남겨
+      # 수동으로 복구할 수 있게 한다.
+      - name: Upload DB on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scores-db-${{ github.run_id }}
+          path: data/scores_history.db
+          retention-days: 14
