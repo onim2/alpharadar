@@ -67,6 +67,7 @@ jobs:
         with:
           path: |
             data/cache/news_titles_*.pkl
+            data/cache/news_items_*.pkl
             data/cache/dart_titles_*.pkl
             data/cache/kis_investor_*.pkl
           key: alpharadar-daily-${{ github.run_id }}
