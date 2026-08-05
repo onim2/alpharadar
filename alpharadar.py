@@ -54,7 +54,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -80,6 +80,17 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 CACHE_DIR = Path("data/cache")
 DB_PATH   = Path("data/scores_history.db")
+
+# ── 날짜 라벨은 항상 KST ───────────────────────────────────────────────────────
+# GitHub Actions 러너는 UTC로 돈다. 아침 크론(22:40 UTC = 07:40 KST)에서 그냥
+# datetime.now()를 쓰면 scan_date가 '전날'로 찍혀, 저녁 런과 아침 런이 같은
+# 날짜에 뒤섞이고 대시보드에는 오늘 날짜가 저녁까지 나타나지 않는다.
+KST = timezone(timedelta(hours=9))
+
+
+def today_kst() -> str:
+    """스캔 날짜 라벨(YYYYMMDD). 실행 환경의 TZ와 무관하게 KST 기준."""
+    return datetime.now(KST).strftime("%Y%m%d")
 LOG_DIR   = Path("data/logs")
 
 DEFAULT_CONFIG = {
@@ -429,6 +440,14 @@ def init_db():
                 ret_5d REAL, ret_20d REAL, w52_proximity REAL,
                 PRIMARY KEY (scan_date, ticker)
             );
+            CREATE TABLE IF NOT EXISTS news_articles (
+                scan_date TEXT, ticker TEXT, title TEXT, description TEXT,
+                link TEXT, pub_date TEXT,
+                collected_at TEXT DEFAULT (datetime('now','localtime')),
+                PRIMARY KEY (scan_date, ticker, link)
+            );
+            CREATE INDEX IF NOT EXISTS idx_news_ticker_date
+                ON news_articles(ticker, scan_date DESC);
             CREATE INDEX IF NOT EXISTS idx_scan_date_ticker
                 ON scan_results(scan_date, ticker);
             CREATE INDEX IF NOT EXISTS idx_scan_ticker
@@ -507,17 +526,45 @@ def save_gated_tickers(rows, scan_date):
                 (scan_date, r["ticker"], r["reason"],
                  r.get("ret_5d"), r.get("ret_20d"), r.get("w52_proximity")))
 
+def save_news_articles(news_items: dict, scan_date: str) -> int:
+    """스캔에 실제로 쓰인 기사를 보존한다.
+
+    이걸 남기지 않으면 '그때 왜 잡혔는지'를 나중에 확인할 수 없다. NAVER 검색
+    API에는 기간 필터가 없어 지나간 날짜의 기사는 소급 조회가 불가능하다.
+    PK가 (scan_date, ticker, link)라 같은 날 두 번 돌아도 중복되지 않는다.
+
+    엔티티(&quot; 등) 디코딩은 여기서만 한다. 점수용 문자열(item_to_text)을 건드리면
+    FinBERT 입력이 달라져 과거 점수와 비교가 깨진다.
+    """
+    import html as _html
+    n = 0
+    with _conn() as con:
+        for ticker, items in news_items.items():
+            for it in items:
+                link = (it.get("link") or "").strip()
+                if not link:
+                    continue   # PK 구성요소라 링크 없으면 보관 불가
+                con.execute(
+                    "INSERT OR REPLACE INTO news_articles "
+                    "(scan_date, ticker, title, description, link, pub_date) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (scan_date, ticker, _html.unescape(it.get("title", "")),
+                     _html.unescape(it.get("desc", "")), link, it.get("pub", "")))
+                n += 1
+    return n
+
+
 def get_engine_b_history(ticker, scan_date=None, window_days=3):
     """기준일(scan_date) '이전' window_days*2 캘린더일 창의 엔진B 이력만 반환.
     버그 수정: 기존 LIMIT 방식은 수개월 전 이력이 N-Accel을 영구 발화시키고,
     당일 자기 기록까지 포함해 'both' 종목이 자동 +15되던 문제가 있었다.
     scan_date < 기준일 → 당일 자기기록 제외, scan_date >= 하한 → 과거 이력 제외."""
     if not scan_date:
-        scan_date = datetime.now().strftime("%Y%m%d")
+        scan_date = today_kst()
     try:
         base = datetime.strptime(str(scan_date), "%Y%m%d")
     except (ValueError, TypeError):
-        base = datetime.now(); scan_date = base.strftime("%Y%m%d")
+        scan_date = today_kst(); base = datetime.strptime(scan_date, "%Y%m%d")
     lower = (base - timedelta(days=window_days*2)).strftime("%Y%m%d")
     with _conn() as con:
         rows = con.execute(
@@ -953,9 +1000,12 @@ class NaverClient:
                 return True
         return False
 
-    def get_news_headlines(self, query, target=10, fetch=30, max_age_days=None):
+    def get_news_items(self, query, target=10, fetch=30, max_age_days=None):
         """
-        뉴스 헤드라인 수집 — FinBERT 입력용.
+        뉴스 수집 — 제목/요약/링크/발행일시를 함께 반환한다.
+
+        get_news_headlines()는 이 결과를 FinBERT 입력용 문자열로 접어서 돌려주는
+        래퍼다. 점수 계산에 쓰이는 문자열 포맷은 예전과 동일하게 유지한다.
         B6: 3자 이상 query 는 자동 따옴표(정확 매칭) — 자회사 흡수 1차 차단.
         max_age_days: 지정 시 pubDate 기준 기준일(오늘)로부터 그보다 오래된 기사 제외.
                       pubDate 파싱 실패 기사도 보수적으로 제외.
@@ -1011,7 +1061,7 @@ class NaverClient:
                 logger.warning(f"뉴스 검색 실패 ({query}): {e}")
                 return []
 
-        clean, seen = [], []
+        items_out, seen = [], []
         stats = {"ad":0, "irrelevant":0, "duplicate":0, "pass":0, "stale":0}
 
         for item in raw_items:
@@ -1047,24 +1097,46 @@ class NaverClient:
                 stats["duplicate"] += 1
                 continue
 
-            text = f"{title}. {desc[:100]}" if desc else title
+            # 보관용 발행일시(ISO). 파싱 실패해도 기사 자체는 버리지 않는다.
+            pub_iso = ""
+            try:
+                pub_iso = datetime.strptime(
+                    item.get("pubDate", ""), "%a, %d %b %Y %H:%M:%S %z"
+                ).astimezone(KST).strftime("%Y-%m-%d %H:%M")
+            except (ValueError, TypeError):
+                pass
 
-            clean.append(text)
+            items_out.append({
+                "title": title,
+                "desc": desc,
+                "link": item.get("originallink") or item.get("link", ""),
+                "pub": pub_iso,
+            })
             seen.append(title)
             stats["pass"] += 1
 
-            if len(clean) >= target:
+            if len(items_out) >= target:
                 break
 
         logger.debug(
             f"뉴스 필터 [{query}]: 수집 {len(raw_items)}건 → "
             f"시점 -{stats['stale']} 광고 -{stats['ad']} 무관 -{stats['irrelevant']} "
-            f"중복 -{stats['duplicate']} → 최종 {len(clean)}건"
+            f"중복 -{stats['duplicate']} → 최종 {len(items_out)}건"
         )
         if max_age_days is not None and stats["stale"]:
             logger.info(f"뉴스 시점 제외 [{query}]: {stats['stale']}건 (>{max_age_days}일/파싱실패)")
         time.sleep(0.10)
-        return clean
+        return items_out
+
+    @staticmethod
+    def item_to_text(it: dict) -> str:
+        """FinBERT 입력 문자열. 기존 포맷을 그대로 유지해야 점수가 안 바뀐다."""
+        return f"{it['title']}. {it['desc'][:100]}" if it["desc"] else it["title"]
+
+    def get_news_headlines(self, query, target=10, fetch=30, max_age_days=None):
+        """기존 호출부 호환용 — 문자열 리스트만 필요할 때."""
+        return [self.item_to_text(it) for it in
+                self.get_news_items(query, target, fetch, max_age_days)]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1261,15 +1333,25 @@ def collect_texts_with_cache(pool_b, naver, dart, news_cnt, dart_days,
     def _collect(item):
         ticker, meta = item
         nm = meta.get("name", ticker)
-        news = naver.get_news_headlines(nm, target=news_cnt, fetch=news_cnt * 3, max_age_days=news_max_age)
+        news_it = naver.get_news_items(nm, target=news_cnt, fetch=news_cnt * 3,
+                                       max_age_days=news_max_age)
         dart_t = (dart.get_report_titles(meta.get("corp_code", ""), dart_days)
                   if meta.get("corp_code") else [])
-        return ticker, news, dart_t
+        return ticker, news_it, dart_t
 
+    news_items: dict = {}
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for ticker, news, dart_t in ex.map(_collect, missing):
-            news_texts[ticker] = news
+        for ticker, news_it, dart_t in ex.map(_collect, missing):
+            news_items[ticker] = news_it
+            news_texts[ticker] = [NaverClient.item_to_text(it) for it in news_it]
             dart_texts[ticker] = dart_t
+
+    # 기사 원문 보존 — 실패해도 스캔 자체는 계속되어야 한다
+    try:
+        saved = save_news_articles(news_items, date)
+        logger.info(f"기사 보존: {saved}건 ({len(news_items)}종목) → news_articles")
+    except Exception as e:
+        logger.warning(f"기사 보존 실패(스캔은 계속): {e}")
 
     # 원자적 저장 — 도중 실패해도 옛 캐시 보존
     tmp_n = news_cache.with_suffix(".pkl.tmp")
@@ -1947,7 +2029,7 @@ def run_step1(precomputed,cfg,date=None):
     ea_cfg=cfg["engine_a"]; eb_cfg=cfg["engine_b"]
     neg_kws=cfg["negative_keywords"]
     naver=NaverClient()
-    scan_date = date or datetime.now().strftime("%Y%m%d")
+    scan_date = date or today_kst()
     max_neg = eb_cfg["max_negative_sentiment"]
     news_max_age = cfg.get("scoring", {}).get("news_max_age_days", 14)
     logger.info("관심 지수 및 부정 뉴스 비율 조회 중...")
@@ -2060,7 +2142,7 @@ def run_step1(precomputed,cfg,date=None):
 # ══════════════════════════════════════════════════════════════════════════════
 def run_step2(pool_a, precomputed, cfg, date=None):
     fcfg = cfg["filter"]
-    scan_date = date or datetime.now().strftime("%Y%m%d")
+    scan_date = date or today_kst()
 
     upper = {
         "large": fcfg.get("max_disparity_large", 110),
@@ -2380,7 +2462,7 @@ def _esc(text: str) -> str:
 GRADE_RANK={"집중":2,"주시":1,"참고":0}
 
 def run_step4(results,cfg,dry_run=False):
-    today=datetime.now().strftime("%Y%m%d"); tg=TelegramClient()
+    today=today_kst(); tg=TelegramClient()
     min_score=cfg.get("grade",{}).get("min_display_score",0)
     results=[r for r in results if r["score"]>=min_score]
     to_send = list(results)
@@ -2451,7 +2533,7 @@ def run_step4(results,cfg,dry_run=False):
             f"   🏆 <b>총점 {r['score']:.1f}</b>  기술 {r['t']:.0f}  수급 {r['d']:.0f}  감성 {r['s_text']:.0f}{cross}{headline_line}"
         )
 
-    now=datetime.now().strftime("%Y-%m-%d %H:%M")
+    now=datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     hi_c=sum(1 for r in results if r["grade"]=="집중")
     mi_c=sum(1 for r in results if r["grade"]=="주시")
     lo_c=sum(1 for r in results if r["grade"]=="참고")
@@ -2553,7 +2635,7 @@ def main():
     parser.add_argument("--setup-dart", action="store_true")
     args=parser.parse_args()
 
-    date_str=args.date or datetime.now().strftime("%Y%m%d")
+    date_str=args.date or today_kst()
     setup_logging(date_str); init_db()
 
     if args.setup_dart: setup_dart(); return
