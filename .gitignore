@@ -59,6 +59,7 @@ data/cache/datalab_*.pkl
 data/cache/news_*.pkl
 data/cache/precompute_*.pkl
 data/cache/news_titles_*.pkl
+data/cache/news_items_*.pkl
 data/cache/dart_titles_*.pkl
 data/cache/universe_*.pkl
 data/cache/pool_a_*.pkl

@@ -1305,24 +1305,43 @@ def collect_texts_with_cache(pool_b, naver, dart, news_cnt, dart_days,
     """
     news_cache = CACHE_DIR / f"news_titles_{date}_v2.pkl"
     dart_cache = CACHE_DIR / f"dart_titles_{date}_v2.pkl"
+    # 링크·발행일시가 붙은 원본. 텍스트 캐시만으로는 기사를 복원할 수 없어
+    # 캐시 적중 런에서 news_articles를 채울 수 없다.
+    items_cache = CACHE_DIR / f"news_items_{date}_v2.pkl"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    news_texts: dict = {}
-    dart_texts: dict = {}
-    if news_cache.exists():
+    def _load(path):
+        if not path.exists():
+            return {}
         try:
-            with open(news_cache, "rb") as f: news_texts = pickle.load(f)
-        except Exception: news_texts = {}
-    if dart_cache.exists():
-        try:
-            with open(dart_cache, "rb") as f: dart_texts = pickle.load(f)
-        except Exception: dart_texts = {}
+            with open(path, "rb") as f: return pickle.load(f)
+        except Exception:
+            return {}
 
+    news_texts: dict = _load(news_cache)
+    dart_texts: dict = _load(dart_cache)
+    news_items: dict = _load(items_cache)
+
+    def _persist_articles(items: dict, note: str):
+        """기사 보존은 캐시 적중 여부와 무관하게 매 런 시도한다.
+        아침 런의 저장이 실패해도 저녁 런이 같은 scan_date로 메워준다.
+        PK가 (scan_date, ticker, link)라 중복 저장은 덮어쓰기로 끝난다."""
+        if not items:
+            return
+        try:
+            saved = save_news_articles(items, date)
+            logger.info(f"기사 보존({note}): {saved}건 ({len(items)}종목) → news_articles")
+        except Exception as e:
+            logger.warning(f"기사 보존 실패(스캔은 계속): {e}")
+
+    # 원본 캐시가 없는 종목은 텍스트가 있어도 다시 수집한다 —
+    # 이 기능 이전에 만들어진 캐시를 물려받아도 기사가 비지 않게.
     missing = [(t, m) for t, m in pool_b.items()
-               if t not in news_texts or t not in dart_texts]
+               if t not in news_texts or t not in dart_texts or t not in news_items]
 
     if not missing:
         logger.info(f"텍스트 캐시 전체 적중: {len(pool_b)}종목 (외부 API 0건)")
+        _persist_articles({t: news_items[t] for t in pool_b if t in news_items}, "캐시")
         return news_texts, dart_texts
 
     logger.info(
@@ -1339,27 +1358,21 @@ def collect_texts_with_cache(pool_b, naver, dart, news_cnt, dart_days,
                   if meta.get("corp_code") else [])
         return ticker, news_it, dart_t
 
-    news_items: dict = {}
     with ThreadPoolExecutor(max_workers=workers) as ex:
         for ticker, news_it, dart_t in ex.map(_collect, missing):
             news_items[ticker] = news_it
             news_texts[ticker] = [NaverClient.item_to_text(it) for it in news_it]
             dart_texts[ticker] = dart_t
 
-    # 기사 원문 보존 — 실패해도 스캔 자체는 계속되어야 한다
-    try:
-        saved = save_news_articles(news_items, date)
-        logger.info(f"기사 보존: {saved}건 ({len(news_items)}종목) → news_articles")
-    except Exception as e:
-        logger.warning(f"기사 보존 실패(스캔은 계속): {e}")
+    # 이번 런에서 본 종목 전체(신규 + 캐시분)를 보존한다
+    _persist_articles({t: news_items[t] for t in pool_b if t in news_items}, "수집")
 
     # 원자적 저장 — 도중 실패해도 옛 캐시 보존
-    tmp_n = news_cache.with_suffix(".pkl.tmp")
-    tmp_d = dart_cache.with_suffix(".pkl.tmp")
-    with open(tmp_n, "wb") as f: pickle.dump(news_texts, f)
-    with open(tmp_d, "wb") as f: pickle.dump(dart_texts, f)
-    tmp_n.replace(news_cache)
-    tmp_d.replace(dart_cache)
+    for path, obj in ((news_cache, news_texts), (dart_cache, dart_texts),
+                      (items_cache, news_items)):
+        tmp = path.with_suffix(".pkl.tmp")
+        with open(tmp, "wb") as f: pickle.dump(obj, f)
+        tmp.replace(path)
 
     logger.info(
         f"수집 완료: 뉴스 {sum(len(v) for v in news_texts.values())}건 | "
