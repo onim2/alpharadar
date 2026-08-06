@@ -82,3 +82,9 @@ data/logs/*.gz
 #   data/scores_history.db
 #   data/logs/scanner_*.log
 # ─────────────────────────────────────────────────────
+
+# 로컬 실행 산출물 — 러너에서 재생성되거나 로컬 전용
+data/logs.zip
+data/*.LOCAL*.log
+data/cache/forward_returns.pkl
+data/cache/price_cache_wr.pkl
