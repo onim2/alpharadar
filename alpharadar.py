@@ -484,6 +484,11 @@ def init_db():
         # 뉴스 감성 게이트 진단용 — news_conf(매핑 신뢰도), news_raw(게이트 적용 전 점수).
         # 이 둘이 없으면 게이트를 열었을 때 점수가 어떻게 달라지는지 과거 데이터로
         # 재계산할 수 없다(news_score는 이미 게이트가 적용된 값이라 되돌릴 수 없음).
+        # A-3 shadow — 수급축 재설계안 병행 계산 결과. 발송·등급에 미사용.
+        for _c in ("d_flow", "score_flow"):
+            if _c not in cols:
+                con.execute(f"ALTER TABLE scan_results ADD COLUMN {_c} REAL")
+                logger.info(f"DB 마이그레이션: {_c} 컬럼 추가 완료")
         for _c in ("news_conf", "news_raw"):
             if _c not in cols:
                 con.execute(f"ALTER TABLE scan_results ADD COLUMN {_c} REAL")
@@ -521,8 +526,8 @@ def save_scan_results(results, scan_date):
                  rsi,bb_pos,change_pct,vol_slope,net_buy_days,
                  hype_slope,hype_rank,disparity,
                  rating_bond,rating_cp,fg_sector,fg_industry,ksic,largest_holder,
-                 t_presurge,score_presurge,news_conf,news_raw)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 t_presurge,score_presurge,news_conf,news_raw,d_flow,score_flow)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (scan_date, r["ticker"], r.get("name"), r.get("sector"),
                  r.get("cap_tier"),
                  r.get("score"), r.get("t"), None, r.get("d"),
@@ -537,7 +542,8 @@ def save_scan_results(results, scan_date):
                  r.get("rating_bond"), r.get("rating_cp"), r.get("fg_sector"),
                  r.get("fg_industry"), r.get("ksic"), r.get("largest_holder"),
                  r.get("t_presurge"), r.get("score_presurge"),
-                 r.get("news_conf"), r.get("news_raw")))
+                 r.get("news_conf"), r.get("news_raw"),
+                 r.get("d_flow"), r.get("score_flow")))
 
 def save_engine_b_history(tickers, precomputed, scan_date):
     with _conn() as con:
@@ -2452,6 +2458,61 @@ def _calc_d(ticker, meta, all_vol, all_hype, top_pct, scfg, scan_date=None):
 
     return min(base + strength + cross, 100), n_accel, v_surge
 
+def _calc_d_flow(ticker, meta, all_vol, all_hype, top_pct, scfg, scan_date=None):
+    """A-3 shadow — 수급축 재설계안. 발송·등급에 미사용, 결과 측정 전용.
+
+    실측 근거(2,757건 / 59일 / 450종목, outcomes 매칭 2,411건):
+
+      ① 구성요소의 부호가 서로 반대인데 모두 가산이라 상쇄된다.
+         순매수 일수 IC5 +0.055 · 외인 순매수 +0.067  (자금 유입 = 양)
+         거래량 기울기 -0.115 · 검색량 기울기 -0.099   (관심 급증 = 음)
+         → 합산한 D수급 종합은 +0.018로 신호가 사라진다.
+         여기서는 관심 급증을 감산으로 뒤집는다.
+
+      ② 기본점 순서가 실측 성과와 반대다.
+         현행 both 50 > engine_a 30 > engine_b 20
+         실측 engine_a -20.38% > engine_b -26.39% > both -25.27%
+         → both를 과열 신호로 보고 낮춘다.
+
+      ③ 관계가 단조가 아니라 역U자다. 중간 구간이 유의하게 낫다
+         (중간 -20.62% vs 극단 -25.12%, p<0.0001).
+         → 50에서 멀어질수록 감점해 중앙을 우대한다.
+
+    주의: 표본이 전 구간 평균 -22%인 하락장 한 국면이다. '관심 급증이 나쁘다'는
+    하락장에서 특히 강한 성질이라 상승장에서 뒤집힐 수 있다. 그래서 legacy
+    _calc_d를 그대로 두고 병행 계산만 한다.
+    """
+    source = meta.get("source", "engine_a")
+    base   = 25 if source == "both" else 40 if source == "engine_a" else 30
+
+    score = base
+
+    # 자금 유입 — 양의 IC. 가산 유지
+    nbd = meta.get("net_buy_days", 0)
+    if nbd >= 5:        score += 10
+    elif nbd >= 4:      score += 5
+    if meta.get("foreign_net", 0) > 0:
+        score += 5
+
+    # 관심 급증 — 음의 IC. 부호를 뒤집어 감산
+    if is_top_percentile(meta.get("vol_slope", 0), all_vol, top_pct):
+        score -= 10
+    if is_top_percentile(meta.get("hype_slope", 0), all_hype, top_pct):
+        score -= 10
+    if meta.get("hype_slope", 0) > 0 and meta.get("hype_rank", 9999) <= scfg.get("v_surge_rank", 20):
+        score -= 5
+
+    if meta.get("has_sector_bonus", False):
+        score += 5
+
+    score = max(0, min(score, 100))
+
+    # 역U자 — 중앙(50)에서 벗어난 만큼 감점. 최대 -12.5
+    score -= abs(score - 50) * 0.25
+
+    return round(max(0.0, min(100.0, score)), 1)
+
+
 def run_step3(pool_b,precomputed,cfg,date):
     scfg=cfg["scoring"]
     w_tech =scfg.get("w_tech",  scfg.get("w1",  0.35))
@@ -2532,9 +2593,12 @@ def run_step3(pool_b,precomputed,cfg,date):
         else:
             text_contrib = s_text * w_text
         d_score,n_accel,v_surge=_calc_d(ticker,meta,all_vol,all_hype,top_pct,scfg,date)
+        d_flow=_calc_d_flow(ticker,meta,all_vol,all_hype,top_pct,scfg,date)   # A-3 shadow
         score=round(t_score*w_tech + text_contrib + d_score*w_cross, 2)
         # Task 4: shadow 종합점수(발송·등급에 미사용, 결과 측정 전용)
         score_presurge=round(t_presurge*w_tech + text_contrib + d_score*w_cross, 2)
+        # A-3 shadow 종합 — 수급축만 교체, 나머지는 동일
+        score_flow=round(t_score*w_tech + text_contrib + d_flow*w_cross, 2)
         results.append({
             "ticker":ticker,"name":meta.get("name",ticker),"sector":meta.get("sector","기타"),
             "rating_bond":meta.get("rating_bond"),"rating_cp":meta.get("rating_cp"),
@@ -2544,6 +2608,7 @@ def run_step3(pool_b,precomputed,cfg,date):
             "t":t_score,"t_presurge":t_presurge,"score_presurge":score_presurge,
             "s_text":s_text,"news_score":n_sc,"dart_score":d_sc,"d":d_score,
             "news_conf":n_conf,"news_raw":n_raw,
+            "d_flow":d_flow,"score_flow":score_flow,
             "source":meta.get("source","?"),"n_accel":n_accel,"v_surge":v_surge,
             "finbert_mode":finbert.mode,
             "best_headline":n_headline,"best_headline_pct":n_pct,
