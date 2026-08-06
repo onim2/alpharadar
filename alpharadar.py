@@ -1215,6 +1215,10 @@ class NaverClient:
         )
         if max_age_days is not None and stats["stale"]:
             logger.info(f"뉴스 시점 제외 [{query}]: {stats['stale']}건 (>{max_age_days}일/파싱실패)")
+        # 봇 요약은 매핑 신뢰도 게이트를 항상 통과하는 유형이라 몇 건을 걸렀는지
+        # 관측 가능해야 한다. 상세 내역은 위 debug 라인에 있고 여기는 발생 시에만.
+        if stats["bot"]:
+            logger.info(f"봇 주가요약 제외 [{query}]: {stats['bot']}건")
         time.sleep(0.10)
         return items_out
 
@@ -1413,6 +1417,20 @@ def collect_texts_with_cache(pool_b, naver, dart, news_cnt, dart_days,
     dart_texts: dict = _load(dart_cache)
     news_items: dict = _load(items_cache)
     dart_items: dict = _load(dart_items_cache)
+
+    # 캐시에서 읽은 항목에는 수집 시점 필터가 적용돼 있지 않다. 필터를 나중에
+    # 추가하면 그날 캐시에 남아 있던 옛 항목이 그대로 통과한다 — 실측으로 8/6 저녁
+    # 런에서 봇 기사 1건이 캐시를 경유해 살아남았다. 로드 직후 한 번 더 거르고,
+    # 점수용 문자열도 같은 기준으로 다시 만들어 캐시와 어긋나지 않게 한다.
+    _dropped = 0
+    for _t, _its in list(news_items.items()):
+        _keep = [i for i in _its if not naver._is_bot_summary(i.get("title", ""))]
+        if len(_keep) != len(_its):
+            _dropped += len(_its) - len(_keep)
+            news_items[_t] = _keep
+            news_texts[_t] = [NaverClient.item_to_text(i) for i in _keep]
+    if _dropped:
+        logger.info(f"캐시 정제: 봇 주가요약 {_dropped}건 제외")
 
     def _persist_articles(items: dict, note: str):
         """기사 보존은 캐시 적중 여부와 무관하게 매 런 시도한다.
