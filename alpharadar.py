@@ -963,8 +963,21 @@ class NaverClient:
         "무료체험","할인쿠폰","신청하세요","이벤트 참여","~하는 방법",
     ]
 
+    # 봇 생성 주가 요약 — "OO 주가, 7월 21일 6,040원 7.86% 상승 마감" 류.
+    # 정보 가치가 0인데 '7.86% 상승' 같은 문구가 감성 모델에 들어가면 가짜 양성을
+    # 만든다. 더 나쁜 건 이 유형이 종목명으로 시작해 매핑 신뢰도 게이트를 항상
+    # 통과한다는 점이다(실측: 데이타솔루션 8/5 수집 6건 중 게이트를 통과한 유일한
+    # 기사가 이 봇 기사였다). 거르지 않으면 감성 점수가 봇 기사만 반영하게 된다.
+    # 날짜 + 금액/퍼센트를 모두 요구해 일반 기사("주가, 7월 들어 30% 상승")는
+    # 걸리지 않게 한다.
+    _BOT_PRICE_SUMMARY_RE = re.compile(
+        r"주가,\s*\d{1,2}\s*월\s*\d{1,2}\s*일.*?[\d,]+\s*(?:원|%)")
+
     def _is_ad(self, text: str) -> bool:
         return any(m in text for m in self._AD_MARKERS)
+
+    def _is_bot_summary(self, title: str) -> bool:
+        return bool(self._BOT_PRICE_SUMMARY_RE.search(title))
 
     def _is_subject(self, text: str, name: str, position_threshold: float = 0.3) -> bool:
         """
@@ -1128,7 +1141,7 @@ class NaverClient:
                 return []
 
         items_out, seen = [], []
-        stats = {"ad":0, "irrelevant":0, "duplicate":0, "pass":0, "stale":0}
+        stats = {"ad":0, "bot":0, "irrelevant":0, "duplicate":0, "pass":0, "stale":0}
 
         for item in raw_items:
             title = re.sub(r"<[^>]+>", "", item.get("title", "")).strip()
@@ -1153,6 +1166,10 @@ class NaverClient:
 
             if self._is_ad(title):
                 stats["ad"] += 1
+                continue
+
+            if self._is_bot_summary(title):
+                stats["bot"] += 1
                 continue
 
             if not self._is_relevant(title, query) and not self._is_relevant(desc, query):
@@ -1186,7 +1203,8 @@ class NaverClient:
 
         logger.debug(
             f"뉴스 필터 [{query}]: 수집 {len(raw_items)}건 → "
-            f"시점 -{stats['stale']} 광고 -{stats['ad']} 무관 -{stats['irrelevant']} "
+            f"시점 -{stats['stale']} 광고 -{stats['ad']} 봇 -{stats['bot']} "
+            f"무관 -{stats['irrelevant']} "
             f"중복 -{stats['duplicate']} → 최종 {len(items_out)}건"
         )
         if max_age_days is not None and stats["stale"]:
@@ -1594,10 +1612,16 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
         mkt=info.get("market","KOSPI")
 
         marcap_real = int(info.get("market_cap", 0) or 0)
-        cap = marcap_real if marcap_real > 0 else int(current * float(vol_20ma) * 50)
 
-        if marcap_real > 0 and marcap_real < ucfg.get("min_market_cap", 30_000_000_000):
+        # 시총을 확인할 수 없으면 통과시키지 않는다. 예전 조건은
+        # `marcap_real > 0 and marcap_real < 컷` 이라, 조회에 실패한 종목이
+        # 컷을 그대로 우회했다 — 극소형주를 걸러내려는 필터인데 정작 검증이
+        # 안 되는 종목만 무사통과하는 구조였다.
+        # 정상 운영에서는 발동하지 않는다(실측: KOSPI 943 + KOSDAQ 1820 종목
+        # 모두 시총 조회 100% 성공). 소스가 망가진 경우의 안전장치다.
+        if marcap_real < ucfg.get("min_market_cap", 30_000_000_000):
             return None
+        cap = marcap_real
 
         _ct       = ucfg.get("cap_tier", {})
         _large_th = _ct.get("large_threshold", 5_000_000_000_000)
