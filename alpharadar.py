@@ -2864,6 +2864,15 @@ def main():
         else:
             precomputed=run_step0(date_str,cfg,market=args.market,limit=args.limit)
         logger.info(f"  → {len(precomputed)}개")
+        # 유니버스가 비면 이후 단계가 전부 0으로 흘러 '발송 0건'으로 조용히 끝난다.
+        # 2026-08-07 아침 런이 그랬다 — fdr.StockListing()이 KOSPI·KOSDAQ 모두
+        # HTTP 404를 반환했는데 목록 조회 실패가 warning으로 처리돼 워크플로는
+        # success로 끝났다. 로그를 열어보기 전에는 알 방법이 없었다.
+        # 데이터 소스 장애는 통제할 수 없어도, 그것이 성공으로 보고되는 것은 막는다.
+        if not precomputed:
+            logger.error("유니버스가 비었다 — 종목 목록 조회 실패로 보인다. "
+                         "위 '목록 조회 실패' 경고를 확인할 것. 스캔을 중단한다.")
+            sys.exit(1)
         if args.step==0: return
     else:
         if not cache_path.exists(): logger.error("캐시 없음. --step 0 먼저 실행"); sys.exit(1)
