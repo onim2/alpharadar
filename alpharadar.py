@@ -452,6 +452,19 @@ def init_db():
                 ret_5d REAL, ret_20d REAL, w52_proximity REAL,
                 PRIMARY KEY (scan_date, ticker)
             );
+            -- 대조군 표본. 스캔을 통과한 종목이 정말 나은지 재려면 통과 못 한 쪽이
+            -- 있어야 한다. stage로 두 종류를 구분한다.
+            --   no_signal : 유니버스는 통과했으나 신호 없음 (POOL_A 미진입)
+            --   filtered  : 신호는 있었으나 하드필터 탈락 (reason에 사유)
+            -- 전량이 아니라 사유별 표본이다. 비율을 되돌리려면 pool_total을 쓴다.
+            CREATE TABLE IF NOT EXISTS pool_history (
+                scan_date TEXT, ticker TEXT, stage TEXT, reason TEXT,
+                name TEXT, sector TEXT, cap_tier TEXT,
+                change_pct REAL, vol_slope REAL, hype_slope REAL,
+                rsi REAL, disparity REAL, net_buy_days INTEGER,
+                pool_total INTEGER,
+                PRIMARY KEY (scan_date, ticker, stage)
+            );
             CREATE TABLE IF NOT EXISTS news_articles (
                 scan_date TEXT, ticker TEXT, title TEXT, description TEXT,
                 link TEXT, pub_date TEXT,
@@ -560,6 +573,52 @@ def save_gated_tickers(rows, scan_date):
                 (scan_date, r["ticker"], r["reason"],
                  r.get("ret_5d"), r.get("ret_20d"), r.get("w52_proximity")))
 
+def sample_pool(tickers, precomputed, scan_date, stage, reason, n, pool_total):
+    """대조군 표본을 뽑아 pool_history 행으로 만든다.
+
+    시드를 scan_date+stage+reason으로 고정한다. 같은 날 두 런이 같은 종목을 뽑게
+    되는데, PK가 (scan_date,ticker,stage)라 중복은 자연히 합쳐져 행이 낭비되지
+    않는다. 재현도 되므로 나중에 "그날 왜 이 종목이 뽑혔나"를 되짚을 수 있다.
+
+    pool_total은 표본을 뽑기 전 모집단 크기다. 이게 없으면 나중에 표본 비율을
+    복원할 수 없어 "몇 개 중 몇 개"를 못 따진다.
+    """
+    pool = sorted(tickers)          # set 순회 순서는 실행마다 달라 시드가 무의미해진다
+    if not pool:
+        return []
+    rng = random.Random(f"{scan_date}:{stage}:{reason}")
+    picked = rng.sample(pool, min(n, len(pool)))
+    rows = []
+    for t in picked:
+        p = precomputed.get(t, {})
+        rows.append({
+            "ticker": t, "stage": stage, "reason": reason,
+            "name": p.get("name", t), "sector": p.get("sector", "기타"),
+            "cap_tier": p.get("cap_tier", "large"),
+            "change_pct": p.get("change_pct", 0.0), "vol_slope": p.get("vol_slope", 0.0),
+            "hype_slope": p.get("hype_slope", 0.0), "rsi": p.get("rsi", 50.0),
+            "disparity": p.get("disparity", 0.0), "net_buy_days": p.get("net_buy_days", 0),
+            "pool_total": pool_total,
+        })
+    return rows
+
+
+def save_pool_history(rows, scan_date):
+    """대조군 표본 영속. 스캔 통과군과 비교할 상대가 없으면 성과를 해석할 수 없다."""
+    if not rows:
+        return 0
+    with _conn() as con:
+        for r in rows:
+            con.execute(
+                "INSERT OR REPLACE INTO pool_history VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (scan_date, r["ticker"], r["stage"], r["reason"],
+                 r.get("name"), r.get("sector"), r.get("cap_tier"),
+                 r.get("change_pct"), r.get("vol_slope"), r.get("hype_slope"),
+                 r.get("rsi"), r.get("disparity"), r.get("net_buy_days"),
+                 r.get("pool_total")))
+    return len(rows)
+
+
 def save_news_articles(news_items: dict, scan_date: str) -> int:
     """스캔에 실제로 쓰인 기사를 보존한다.
 
@@ -640,8 +699,76 @@ def was_sent_today(ticker, scan_date):
                           (ticker,scan_date)).fetchone()
     return row["grade"] if row else None
 
-def mark_sent(ticker, scan_date, grade, score):
+def get_watch_history(tickers, scan_date):
+    """종목별 누적 관찰 이력 — {ticker: (누적등장, 최초이후경과, 직전공백)}.
+
+    등급을 대신할 지표다. 실측(3,024건/469종목/64일, D+1 시가 진입 후 10일 내
+    구간 최고가)에서 점수보다 훨씬 강했다.
+
+      누적 등장 Spearman +0.187 (20일 +0.152)   vs   종합점수 -0.068
+      첫 등장   n=462  +10% 26.6%  평균 6.08  중앙 -0.14   ← 처음 뜬 종목은 무의미
+      4~6회     n=727  +10% 42.0%  평균 13.52
+      7회 이상 vs 1~2회: 평균 10.79 vs 6.91 (p=0.0000)
+
+    최초 등장 후 경과도 같이 본다. 8~14일 구간이 +10% 54.0%, 평균 17.76으로 최고다.
+
+    직전 공백(마지막 등장 이후 건너뛴 스캔일 수)은 별개 신호다. 매일 붙어 있는
+    종목보다 쉬었다 다시 나온 쪽이 낫다 — 연속(공백0) 평균 11.09 vs 4~7일 공백 15.71.
+    같은 누적 등장 안에서 연속 3회 이상은 오히려 성과가 낮았다(4~6회 구간에서
+    15.84 → 11.94). 매일 뜨는 것은 이미 움직이는 종목이고, 쉬었다 나온 것은
+    눌림 뒤 신호가 다시 붙은 것으로 보인다.
+
+    공백은 달력일이 아니라 '스캔일 칸' 수로 센다(분석과 같은 기준). 하루 두 런은
+    같은 scan_date라 DISTINCT로 하루 1칸으로 접는다.
+    """
+    if not tickers:
+        return {}
     with _conn() as con:
+        days = [r[0] for r in con.execute(
+            "SELECT DISTINCT scan_date FROM scan_results WHERE scan_date < ? ORDER BY scan_date",
+            (scan_date,))]
+        idx = {d: i for i, d in enumerate(days)}
+        cur = len(days)                      # 오늘은 마지막 칸 다음
+        out = {}
+        for t in tickers:
+            rows = [r[0] for r in con.execute(
+                "SELECT DISTINCT scan_date FROM scan_results "
+                "WHERE ticker=? AND scan_date < ? ORDER BY scan_date", (t, scan_date))]
+            if not rows:
+                out[t] = (0, 0, None)
+                continue
+            out[t] = (len(rows), cur - idx[rows[0]], cur - idx[rows[-1]])
+    return out
+
+
+_GRADE_RANK = {"참고": 0, "주시": 1, "집중": 2}
+
+def mark_sent(ticker, scan_date, grade, score):
+    """그날 그 종목이 발송된 사실을 남긴다. 등급은 강등되지 않는다.
+
+    PK가 (ticker, send_date)인데 하루 두 런이 같은 날짜를 쓴다. 예전에는
+    INSERT OR REPLACE라 나중 런이 앞 런을 통째로 갈아쳤다. 아침에 집중으로 상세
+    카드가 나간 종목이 저녁 런에서 참고로 떨어지면 기록이 참고로 바뀌어, 실제로
+    받은 알림이 통계에서 사라졌다 — 실측으로 집중 5건·주시 26건이 그렇게 묻혔다
+    (라온시큐어 집중 78.4 → 참고 64.9 등). 기록된 집중 17/주시 64는 실제
+    집중 22/주시 90보다 적다.
+
+    그래서 이미 더 높은 등급으로 기록돼 있으면 덮어쓰지 않는다. 같은 등급이면
+    점수가 높은 쪽을 남겨 어느 런의 발송인지 되짚을 수 있게 한다.
+    한계: 한 종목이 하루에 두 등급으로 두 번 발송되면 강한 쪽만 남는다.
+    두 발송을 모두 남기려면 PK에 런 구분이 들어가야 한다(별도 과제).
+    """
+    with _conn() as con:
+        row = con.execute(
+            "SELECT grade, score FROM sent_history WHERE ticker=? AND send_date=?",
+            (ticker, scan_date)).fetchone()
+        if row is not None:
+            old_rank = _GRADE_RANK.get(row["grade"], -1)
+            new_rank = _GRADE_RANK.get(grade, -1)
+            if new_rank < old_rank:
+                return
+            if new_rank == old_rank and (row["score"] or 0) >= (score or 0):
+                return
         con.execute("INSERT OR REPLACE INTO sent_history VALUES (?,?,?,?)",
                     (ticker,scan_date,grade,score))
 
@@ -1653,7 +1780,9 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
         cap_tier  = ("large" if cap >= _large_th
                      else "mid" if cap >= _mid_th
                      else "small")
-        net_days,net_total,retail_days,inst_net,foreign_net=_get_investor_data(ticker,start_date,end_date)
+        net_days,net_total,retail_days,inst_net,foreign_net=_get_investor_data(
+            ticker,start_date,end_date,
+            exclude_today=ucfg.get("investor_exclude_today", True))
         rsi    = calc_rsi(close_s)
         bb_pos = calc_bb_position(close_s)
         change_pct = float(df["Change"].iloc[-1]*100) if "Change" in df.columns else 0.0
@@ -1812,8 +1941,9 @@ def _safe_int(v, default=0):
     except (ValueError, TypeError):
         return default
 
-def _get_investor_data(ticker, start_date, end_date):
+def _get_investor_data(ticker, start_date, end_date, exclude_today=True):
     global _KIS_WARNED
+    ex_today = exclude_today
     app_key = os.getenv("KIS_APP_KEY", "")
     if not app_key or app_key == "your_kis_app_key":
         if not _KIS_WARNED:
@@ -1868,7 +1998,27 @@ def _get_investor_data(ticker, start_date, end_date):
                 return False
             return any(str(r.get(k, "")).strip() not in ("", "-") for k in _FIELDS)
 
-        valid = [r for r in output2 if _settled(r)]
+        # 당일 행은 창에서 뺀다. 응답은 stck_bsop_date 내림차순이라 행 0이 오늘이다.
+        #
+        # 빼는 이유: 같은 scan_date의 두 런이 서로 다른 5일 창을 보게 되기 때문이다.
+        # 아침 런(06:10)은 당일 행이 아직 없어 D-1..D-5를 보는데, 저녁 런(18:40)은
+        # 당일이 집계돼 D..D-4를 본다. 창이 하루 밀리면서 net_buy_days가 뒤집히고,
+        # 그게 engine_a(net_buy_days>=3)를 껐다 켰다 한다. source가 both→engine_b로
+        # 바뀌면 _calc_d의 base가 50→20으로 30점 움직이고, w_cross 0.30을 곱해도
+        # 총점이 9점 흔들린다. 실측: 다중 런 1,500 종목일 중 576건에서 순매수일이
+        # 변했고, 엔진이 바뀐 231건의 총점 변동은 평균 10.64(최대 25.5)로
+        # 엔진이 그대로인 1,269건의 1.56보다 7배 컸다.
+        # (예: 큐에스아이 20260527 — 06:07 both/순매수3일/62.2점 → 13:06 engine_b/0일/45.7점)
+        #
+        # 장중에는 미확정이라 빼는 게 맞고, 장 마감 후에는 값이 차 있지만 그래도 뺀다.
+        # 한쪽 런만 최신 데이터를 보면 같은 날짜의 두 관측이 계속 어긋나기 때문이다.
+        # 당일 수급은 버려지지 않고 다음 런(D+1 아침)에서 D-1로 들어온다.
+        today = today_kst()
+        if ex_today:
+            valid = [r for r in output2
+                     if _settled(r) and str(r.get("stck_bsop_date", "")).strip() != today]
+        else:
+            valid = [r for r in output2 if _settled(r)]
         rows  = valid[:5]
         if not rows:
             logger.debug(f"KIS 수급 미집계 ({ticker})")
@@ -2277,6 +2427,16 @@ def run_step1(precomputed,cfg,date=None):
     logger.info(f"POOL_A: {len(pool_a)}개 (A:{ea_hit} B:{eb_hit} 동시:{both_hit}) | 부정게이트 제외:{neg_gated}\n"
                 f"  대형:{tier_counts.get('large',0)} 중형:{tier_counts.get('mid',0)} 소형:{tier_counts.get('small',0)}")
     save_engine_b_history([t for t,m in pool_a.items() if m["engine_b"]], precomputed, scan_date)
+
+    # 대조군 ①: 유니버스는 통과했으나 어느 엔진도 켜지지 않은 종목.
+    # 신호 탐지 자체가 값을 만드는지 재려면 이 집단이 있어야 한다.
+    cs_cfg = cfg.get("control_sample", {}) or {}
+    if cs_cfg.get("enabled", True):
+        no_sig = set(precomputed) - set(pool_a)
+        rows = sample_pool(no_sig, precomputed, scan_date, "no_signal", "no_signal",
+                           cs_cfg.get("no_signal", 40), len(no_sig))
+        n = save_pool_history(rows, scan_date)
+        logger.info(f"대조군 표본(무신호): {n}개 / 모집단 {len(no_sig)}개 → pool_history")
     return pool_a
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2389,6 +2549,22 @@ def run_step2(pool_a, precomputed, cfg, date=None):
     if gated_rows:
         save_gated_tickers(gated_rows, scan_date)
         logger.info(f"과열 gated 기록: {len(gated_rows)}개 → gated_tickers")
+
+    # 대조군 ②: 신호는 켜졌지만 하드필터에서 탈락한 종목을 사유별로 표본 추출.
+    # 과열(overheat)도 함께 넣는다 — gated_tickers에 전수가 있긴 하지만, 전수와
+    # 표본을 한 분석에서 섞으면 비율이 왜곡된다. pool_history 안에서는 모든 사유가
+    # 같은 방식으로 뽑혀 있어야 서로 비교할 수 있다.
+    cs_cfg = cfg.get("control_sample", {}) or {}
+    if cs_cfg.get("enabled", True):
+        per = cs_cfg.get("per_reason", 40)
+        sampled = []
+        for reason, tickers in removed.items():
+            sampled += sample_pool(tickers, precomputed, scan_date, "filtered",
+                                   reason, per, len(tickers))
+        n = save_pool_history(sampled, scan_date)
+        logger.info(f"대조군 표본(필터탈락): {n}개 / 모집단 {sum(len(v) for v in removed.values())}개 "
+                    f"→ pool_history")
+
     tier_s = Counter(m["cap_tier"] for m in pool_b.values())
     logger.info(
         f"POOL_B: {len(pool_b)}개 | "
@@ -2664,13 +2840,27 @@ def _esc(text: str) -> str:
 
 GRADE_RANK={"집중":2,"주시":1,"참고":0}
 
-def run_step4(results,cfg,dry_run=False):
-    today=today_kst(); tg=TelegramClient()
+def run_step4(results,cfg,date=None,dry_run=False):
+    # 발송 날짜는 스캔이 쓴 날짜와 같아야 한다. 예전에는 여기서 today_kst()를 따로
+    # 계산해, 런이 KST 자정을 넘기면 save_scan_results가 쓴 scan_date와 하루 어긋났다.
+    # 실측: 발송 점수가 그날 스캔에 존재하지 않는 기록 128건, 그중 51건은 정확히
+    # 하루씩 밀려 있었다(예: 티씨머티리얼즈 6/9 60.9 발송 → 6/10에 기록, 6/10 실제 45.9).
+    # 크론을 앞당겨 최근에는 안 보이지만 구조는 그대로였다.
+    scan_date = date or today_kst()
+    today = scan_date
+    tg=TelegramClient()
     min_score=cfg.get("grade",{}).get("min_display_score",0)
     results=[r for r in results if r["score"]>=min_score]
     to_send = list(results)
-    high=[r for r in to_send if r["grade"]=="집중"]
-    mid=[r for r in to_send if r["grade"]=="주시"]
+    # 등급으로 나누지 않는다. 점수는 성과 순위를 만들지 못했고(일자내 IC -0.068,
+    # 70점 이상 구간이 평균 최고상승 6.80으로 꼴찌), 🔴집중이라는 표시는 읽는 쪽에서
+    # 매수 신호로 받아들여진다. 대신 누적 관찰 이력을 붙여 보낸다(IC +0.187).
+    watch = get_watch_history([r["ticker"] for r in to_send], scan_date)
+    for r in to_send:
+        n, since, gap = watch.get(r["ticker"], (0, 0, None))
+        r["watch_n"], r["watch_since"], r["watch_gap"] = n, since, gap
+    # 누적 관찰이 많은 순 → 같으면 공백이 큰 순(쉬었다 나온 쪽이 나았다)
+    to_send.sort(key=lambda r: (r["watch_n"], r["watch_gap"] or 0), reverse=True)
 
     def fmt(i,r):
         tier_icon={"large":"[대형]","mid":"[중형]","small":"[소형]"}.get(r.get("cap_tier","large"),"[?]")
@@ -2737,44 +2927,46 @@ def run_step4(results,cfg,dry_run=False):
         )
 
     now=datetime.now(KST).strftime("%Y-%m-%d %H:%M")
-    hi_c=sum(1 for r in results if r["grade"]=="집중")
-    mi_c=sum(1 for r in results if r["grade"]=="주시")
-    lo_c=sum(1 for r in results if r["grade"]=="참고")
+
+    def watch_tag(r):
+        """관찰 이력 한 줄. 강조 구간은 실측 근거가 있는 곳만 표시한다."""
+        n, since, gap = r.get("watch_n",0), r.get("watch_since",0), r.get("watch_gap")
+        if n == 0:
+            return "신규"                      # 첫 등장은 중앙값 -0.14 — 기대할 것이 없다
+        s = f"{n+1}회째 · {since}일 관찰"
+        if gap is not None and gap >= 2:
+            s += f" · {gap}일 만에 재등장"
+        mark = []
+        if 3 <= n <= 9:   mark.append("주목")   # 누적 4~10회 = 성과 최상 구간
+        if 8 <= since <= 14: mark.append("적기") # 최초 등장 후 8~14일 = +10% 54.0%
+        if gap is not None and 4 <= gap <= 7: mark.append("눌림후")  # 공백 4~7일 = 평균 15.71
+        return s + ("  ⟨" + "·".join(mark) + "⟩" if mark else "")
 
     msg_items = []
     msg_items.append(("header",
         f"📡 <b>AlphaRadar 관망 리스트</b>\n📅 {now}\n━━━━━━━━━━━━━━━━━━━━\n"
-        f"탐지: {len(results)}종목  →  발송: {len(to_send)}종목\n"
-        f"🔴 집중 {hi_c}  🟠 주시 {mi_c}  ⚪ 참고 {lo_c}\n"
-        f"정형:비정형 = 6:4  |  S=T×0.30+ST×0.40+D×0.30"))
-    if high:
-        msg_items.append(("high",
-            "<b>🔴 집중</b>\n━━━━━━━━━━━━━━━━━━━━"
-            + "".join(fmt(i+1,r) for i,r in enumerate(high))
-            + "\n━━━━━━━━━━━━━━━━━━━━"))
-    if mid:
-        msg_items.append(("mid",
-            "<b>🟠 주시</b>\n━━━━━━━━━━━━━━━━━━━━"
-            + "".join(fmt(i+1,r) for i,r in enumerate(mid))
-            + "\n━━━━━━━━━━━━━━━━━━━━"))
+        f"탐지 {len(results)}종목 → 발송 {len(to_send)}종목  (기준 {min_score}점 이상)\n"
+        f"<i>매수 신호 아님. 차트·수급 확인 후 판단하세요.</i>"))
+    if to_send:
+        lines = ["<b>관찰 종목</b>", "━━━━━━━━━━━━━━━━━━━━"]
+        for r in to_send:
+            lines.append(f"\n<b>{_esc(r['name'])}</b> ({r['ticker']})  {r['score']:.1f}점\n"
+                         f"   👁 {watch_tag(r)}")
+        lines.append("\n━━━━━━━━━━━━━━━━━━━━")
+        lines.append("⟨주목⟩ 누적 4~10회 · ⟨적기⟩ 최초 후 8~14일 · ⟨눌림후⟩ 4~7일 공백")
+        lines.append("상세는 대시보드에서 — 차트·수급·관찰 이력")
+        msg_items.append(("list", "\n".join(lines)))
 
-    low=[r for r in results if r["grade"]=="참고" and r["score"]>=min_score]
-    if low:
-        low_lines=["⚪ <b>참고</b>","━━━━━━━━━━━━━━━━━━━━"]
-        for r in low:
-            low_lines.append(f"  {_esc(r['name'])} ({r['ticker']})  |  {_esc(r['sector'])}")
-        low_lines.append("━━━━━━━━━━━━━━━━━━━━")
-        msg_items.append(("low", "\n".join(low_lines)))
-
-    sg = defaultdict(lambda: {"집중": 0, "주시": 0, "참고": 0})
-    for r in results:
-        sg[r["sector"]][r["grade"]] += 1
-    icon_map={"집중":"🔴","주시":"🟠","참고":"⚪"}
+    # 섹터 요약도 등급 대신 관찰 이력으로. 재등장이 몰린 섹터를 보이게 한다.
+    sg = defaultdict(lambda: {"n": 0, "watched": 0})
+    for r in to_send:
+        sg[r["sector"]]["n"] += 1
+        if r.get("watch_n", 0) >= 3:
+            sg[r["sector"]]["watched"] += 1
     sl=["🗂 <b>섹터별 현황</b>","━━━━━━━━━━━━━━━━━━━━"]
-    for sec,cnt in sorted(sg.items(),key=lambda x:sum(x[1].values()),reverse=True)[:10]:
-        total=sum(cnt.values())
-        det=" ".join(f"{icon_map[g]}{cnt[g]}" for g in ["집중","주시","참고"] if cnt[g]>0)
-        sl.append(f"🔷 {_esc(sec)} ({total}종목)  {det}")
+    for sec,cnt in sorted(sg.items(),key=lambda x:x[1]["n"],reverse=True)[:10]:
+        det=f"  (누적 4회+ {cnt['watched']})" if cnt["watched"] else ""
+        sl.append(f"🔷 {_esc(sec)} ({cnt['n']}종목){det}")
     w=cfg["scoring"]
     sl+=["━━━━━━━━━━━━━━━━━━━━",
          f"⚙️ T×{w.get('w_tech',w.get('w1',0.35))} · ST×{w.get('w_text',w.get('w2',0.30))} · D×{w.get('w_cross',w.get('w3',0.35))}",
@@ -2789,12 +2981,21 @@ def run_step4(results,cfg,dry_run=False):
     else:
         send_results = tg.send_many(msgs)
         kind_ok = {kind: ok for (kind, _), ok in zip(msg_items, send_results)}
+        # 등급마다 실려 나가는 메시지가 다르다. 집중은 "high", 주시는 "mid",
+        # 참고는 "low"(이름·섹터 한 줄) 블록이다. 예전에는 집중이 아니면 전부 "mid"로
+        # 판정해서, 참고의 발송 성공 여부를 주시 메시지로 물었다. 주시가 하나도 없는
+        # 날은 "mid" 메시지 자체가 만들어지지 않아 kind_ok에 키가 없고, ⚪참고 목록은
+        # 정상 발송됐는데도 전부 skip으로 빠졌다(20260812·0805·0804·0727 등).
+        # 그러면서 실패한 것이 없는데도 아래 경고가 남았다(8/4·8/7 로그 실측).
+        # 등급별 블록을 없애 전부 "list" 하나로 나간다. 예전에는 참고를 "mid"(주시)
+        # 메시지로 판정해, 주시가 없는 날 ⚪참고가 정상 발송됐는데도 전부 skip으로
+        # 빠지고 허위 경고까지 남았다(20260812·0805·0804·0727 등, 8/4·8/7 로그 실측).
         sent_count = 0
         skipped_count = 0
         for r in to_send:
-            group = "high" if r["grade"] == "집중" else "mid"
+            group = "list"
             if kind_ok.get(group, False):
-                mark_sent(r["ticker"], today, r["grade"], r["score"])
+                mark_sent(r["ticker"], scan_date, r["grade"], r["score"])
                 sent_count += 1
             else:
                 skipped_count += 1
@@ -2804,7 +3005,9 @@ def run_step4(results,cfg,dry_run=False):
                 f"(다음 실행 시 재발송 대상)"
             )
         logger.info(f"DB 기록: {sent_count}개 / 전체 to_send {len(to_send)}개")
-    logger.info(f"발송: 집중 {len(high)} / 주시 {len(mid)}")
+    _w4 = sum(1 for r in to_send if 3 <= r.get("watch_n", 0) <= 9)
+    _new = sum(1 for r in to_send if r.get("watch_n", 0) == 0)
+    logger.info(f"발송: {len(to_send)}종목 | 누적 4~10회 {_w4} | 신규 {_new}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DART 법인코드 초기화
@@ -2915,7 +3118,7 @@ def main():
 
     if args.step in (None,4):
         logger.info("▶ Step 4: 발송")
-        run_step4(results,cfg,dry_run=args.dry_run)
+        run_step4(results,cfg,date=date_str,dry_run=args.dry_run)
 
     logger.info(f"완료  |  소요: {time.time()-start:.1f}초")
 
