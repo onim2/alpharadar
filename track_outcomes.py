@@ -35,6 +35,23 @@ HORIZONS = [1, 5, 10, 20]          # 거래일
 COL = {1: "fwd1", 5: "fwd5", 10: "fwd10", 20: "fwd20"}
 
 
+def _track_control() -> bool:
+    """대조군(pool_history)까지 추적할지 — config의 control_sample.track_outcomes.
+
+    끄고 싶은 이유가 실재한다. 대조군은 하루 ~160종목이 늘고 종목마다 가격 조회가
+    붙는데, 이 스크립트는 스캔(32~44분) 뒤 같은 60분 워크플로 안에서 돈다.
+    시간이 모자라면 스캔 결과 자체를 잃는 것보다 대조군을 포기하는 편이 낫다.
+    설정이 없으면 켠 것으로 본다 — 대조군 없이는 성과 해석이 성립하지 않는다.
+    """
+    try:
+        import yaml
+        cfg = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8"))
+        return bool((cfg.get("control_sample") or {}).get("track_outcomes", True))
+    except Exception as e:
+        logger.warning(f"config 읽기 실패 → 대조군 추적 켬 ({type(e).__name__}: {e})")
+        return True
+
+
 def _init_outcomes(con):
     con.execute("""
         CREATE TABLE IF NOT EXISTS outcomes (
@@ -46,7 +63,25 @@ def _init_outcomes(con):
 
 
 def _load_targets(con):
-    """(scan_date, ticker, origin) 목록 — scan_results + gated_tickers."""
+    """(scan_date, ticker, origin) 목록 — scan_results + gated_tickers + pool_history.
+
+    pool_history는 대조군 표본이다. 이게 추적되지 않으면 "스캔을 통과한 종목이
+    정말 나은가"를 물을 상대가 없다. 실제로 그 부재 때문에 비교 대상이 무작위
+    KRX 표본밖에 없었고, 거기엔 유니버스 필터(주가·시총·거래대금)를 통과하지
+    못할 종목이 섞여 결론이 뒤집혔다 — 무작위 대비로는 +30% 급등 2.3배였는데
+    유니버스를 맞추자 오히려 열세로 나왔다.
+
+    origin 값:
+      scan       스캔 통과 (스코어링·발송 대상)
+      gated      과열 배제 (전수)
+      ns         유니버스는 통과했으나 신호 없음 (POOL_A 미진입) — 표본
+      f:<사유>   신호는 있었으나 하드필터 탈락 — 사유별 표본
+                 (ma_trend / turnover / disp_upper / disp_lower / rsi / overheat)
+
+    사유를 origin에 접어 넣는 이유: outcomes 스키마를 바꾸지 않고도 사유별로
+    성과를 가를 수 있어야 한다. "MA추세로 자른 종목이 실제로 못 갔는가" 같은
+    질문이 여기서 답해진다 — 지금은 근거 없이 하루 600~1,000개를 자르고 있다.
+    """
     targets = []
     for row in con.execute("SELECT DISTINCT scan_date, ticker FROM scan_results"):
         targets.append((row[0], row[1], "scan"))
@@ -56,6 +91,21 @@ def _load_targets(con):
             targets.append((row[0], row[1], "gated"))
     except sqlite3.OperationalError:
         logger.info("gated_tickers 테이블 없음 → scan만 추적")
+    # pool_history도 마찬가지로 나중에 생긴 테이블이라 없을 수 있다
+    if not _track_control():
+        logger.info("control_sample.track_outcomes=false → 대조군 추적 생략")
+        return targets
+    try:
+        n = 0
+        for row in con.execute(
+                "SELECT DISTINCT scan_date, ticker, stage, reason FROM pool_history"):
+            origin = "ns" if row[2] == "no_signal" else f"f:{row[3]}"
+            targets.append((row[0], row[1], origin))
+            n += 1
+        if n:
+            logger.info(f"pool_history 대조군 {n}건 추적 대상 포함")
+    except sqlite3.OperationalError:
+        logger.info("pool_history 테이블 없음 → 대조군 추적 생략")
     return targets
 
 
@@ -121,6 +171,15 @@ def main():
         logger.info("갱신할 outcomes 없음 (전부 완료) — 멱등 종료")
         con.close()
         return
+
+    # 가격 조회는 고유 종목 수에 비례하고, 이 스크립트는 스캔 뒤 같은 60분 워크플로
+    # 안에서 돈다. 대조군이 얼마나 부담을 더하는지 로그로 드러내야 timeout이
+    # 닥쳤을 때 무엇을 끌지 판단할 수 있다.
+    _ctrl = {t for t in pending if t[2] == "ns" or t[2].startswith("f:")}
+    _base_tk = {t[1] for t in pending if t not in _ctrl}
+    _ctrl_tk = {t[1] for t in _ctrl} - _base_tk
+    logger.info(f"  가격 조회 고유 종목 {len(_base_tk) + len(_ctrl_tk)}개 "
+                f"(기존 {len(_base_tk)} + 대조군 추가 {len(_ctrl_tk)})")
 
     dates = [t[0] for t in pending]
     lo = pd.to_datetime(min(dates), format="%Y%m%d") - timedelta(days=7)
