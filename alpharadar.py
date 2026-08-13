@@ -2850,6 +2850,9 @@ def run_step4(results,cfg,date=None,dry_run=False):
     today = scan_date
     tg=TelegramClient()
     min_score=cfg.get("grade",{}).get("min_display_score",0)
+    # 필터 전 개수를 따로 잡는다. 예전에는 results를 필터 결과로 덮어쓴 뒤 그걸로
+    # '탐지' 수를 세서, 헤더가 구조적으로 항상 "탐지 N종목 → 발송 N종목"이었다.
+    detected = len(results)
     results=[r for r in results if r["score"]>=min_score]
     to_send = list(results)
     # 등급으로 나누지 않는다. 점수는 성과 순위를 만들지 못했고(일자내 IC -0.068,
@@ -2861,6 +2864,22 @@ def run_step4(results,cfg,date=None,dry_run=False):
         r["watch_n"], r["watch_since"], r["watch_gap"] = n, since, gap
     # 누적 관찰이 많은 순 → 같으면 공백이 큰 순(쉬었다 나온 쪽이 나았다)
     to_send.sort(key=lambda r: (r["watch_n"], r["watch_gap"] or 0), reverse=True)
+
+    def phase_tag(r):
+        """물밑 점수와 총점의 격차 = 기술축 관점 불일치. 감성·수급은 두 점수가 같으므로
+        격차는 오직 '이미 튀어나왔나 / 아직 물밑인가'만 말한다.
+        숫자로 병기하지 않는 이유: 실측 IC가 어느 지평에서도 유의하지 않아(fwd10
+        -0.054 p=0.33) 다섯 번째 점수로 읽히면 오해만 만든다. 라벨로만 남겨
+        누적 뒤 outcomes로 검증한다.
+        기준선은 실측 분포(n=418)의 사분위 — 격차 중앙값이 0이 아니라 +6이라
+        대칭 ±5로 끊으면 절반이 물밑으로 찍힌다."""
+        ps = r.get("score_presurge")
+        if ps is None:
+            return ""
+        gap = ps - r.get("score", 0)
+        if gap >= 12:  return "  ⟨물밑⟩"
+        if gap <= -1:  return "  ⟨돌출⟩"
+        return ""
 
     def fmt(i,r):
         tier_icon={"large":"[대형]","mid":"[중형]","small":"[소형]"}.get(r.get("cap_tier","large"),"[?]")
@@ -2917,13 +2936,20 @@ def run_step4(results,cfg,date=None,dry_run=False):
         else:
             headline_line=""
 
+        # 공시는 수집만 하고 버려지고 있었다(best_dart_title을 읽는 곳이 없었다).
+        # 뉴스보다 단단한 재료인 경우가 많아 헤드라인과 같은 자리에 붙인다.
+        dart_title=str(r.get("best_dart_title") or "").strip()
+        dart_line=(f"\n   📄 [공시] {_esc(dart_title[:45])}"
+                   + ("..." if len(dart_title)>45 else "")) if dart_title else ""
+
         return (
             f"\n\n<b>{i}. {_esc(r['name'])} ({r['ticker']})</b>\n"
             f"   {_esc(r['sector'])}  {tier_icon}{rating_str}  |  💵 {price_str}\n"
             f"   🏦 기관 {inst_str}  |  🌏 외인 {foreign_str}  ({r['net_buy_days']}일){retail_tag}\n"
             f"   📊 BB {bb:.0f}% {bb_label}  |  RSI {rsi:.0f} {rsi_label}{vol_line}\n"
             f"   📐 이격도 {r['disparity']:.1f}%  (20일 평균 대비 현재가 위치)\n"
-            f"   🏆 <b>총점 {r['score']:.1f}</b>  기술 {r['t']:.0f}  수급 {r['d']:.0f}  감성 {r['s_text']:.0f}{cross}{headline_line}"
+            f"   🏆 <b>총점 {r['score']:.1f}</b>  기술 {r['t']:.0f}  수급 {r['d']:.0f}  감성 {r['s_text']:.0f}{cross}{phase_tag(r)}"
+            f"{headline_line}{dart_line}"
         )
 
     now=datetime.now(KST).strftime("%Y-%m-%d %H:%M")
@@ -2945,16 +2971,21 @@ def run_step4(results,cfg,date=None,dry_run=False):
     msg_items = []
     msg_items.append(("header",
         f"📡 <b>AlphaRadar 관망 리스트</b>\n📅 {now}\n━━━━━━━━━━━━━━━━━━━━\n"
-        f"탐지 {len(results)}종목 → 발송 {len(to_send)}종목  (기준 {min_score}점 이상)\n"
+        f"탐지 {detected}종목 → 발송 {len(to_send)}종목  (기준 {min_score}점 이상)\n"
         f"<i>매수 신호 아님. 차트·수급 확인 후 판단하세요.</i>"))
     if to_send:
-        lines = ["<b>관찰 종목</b>", "━━━━━━━━━━━━━━━━━━━━"]
-        for r in to_send:
-            lines.append(f"\n<b>{_esc(r['name'])}</b> ({r['ticker']})  {r['score']:.1f}점\n"
-                         f"   👁 {watch_tag(r)}")
+        # 정렬이 점수순이 아니라는 걸 밝혀둔다. 번호만 보면 1번이 최고점으로 읽힌다.
+        lines = ["<b>관찰 종목</b>  <i>— 누적 관찰 순 (점수순 아님)</i>",
+                 "━━━━━━━━━━━━━━━━━━━━"]
+        # 등급을 없애면서 상세 블록까지 같이 떨어져 나갔었다. 상세는 등급에 딸린 것이
+        # 아니라 종목 판단에 필요한 정보였으므로, 옛 집중/주시가 받던 fmt() 블록을
+        # 등급 구분 없이 전 종목에 붙인다. 관찰 이력 줄은 그 아래 유지.
+        for i, r in enumerate(to_send, 1):
+            lines.append(fmt(i, r) + f"\n   👁 {watch_tag(r)}")
         lines.append("\n━━━━━━━━━━━━━━━━━━━━")
         lines.append("⟨주목⟩ 누적 4~10회 · ⟨적기⟩ 최초 후 8~14일 · ⟨눌림후⟩ 4~7일 공백")
-        lines.append("상세는 대시보드에서 — 차트·수급·관찰 이력")
+        lines.append("⟨물밑⟩ 아직 안 튀어나온 구조 · ⟨돌출⟩ 이미 움직인 구조  (검증 중)")
+        lines.append("차트·수급·관찰 이력 전체는 대시보드에서")
         msg_items.append(("list", "\n".join(lines)))
 
     # 섹터 요약도 등급 대신 관찰 이력으로. 재등장이 몰린 섹터를 보이게 한다.
