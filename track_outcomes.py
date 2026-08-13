@@ -3,11 +3,22 @@
 # track_outcomes.py — 스캔·gated 종목의 forward return 추적 (로컬+Actions 겸용, 멱등)
 #
 # scan_results(발송 후보)와 gated_tickers(과열 배제)의 과거 행에 대해
-# FinanceDataReader로 T+1/T+5/T+10/T+20 '거래일' 종가 수익률을 계산해
-# outcomes 테이블에 저장한다. 진입가 = scan_date 당일(또는 그 이후 첫 거래일) 종가.
+# FinanceDataReader로 두 종류의 성과를 계산해 outcomes 테이블에 저장한다.
 #
-# 멱등성: 이미 4개 지평이 모두 채워진 (scan_date,ticker,origin)은 스킵.
+#   fwd1/5/10/20   종가 진입 → N거래일 후 종가 수익률(%)
+#                  진입가 = scan_date 당일(또는 그 이후 첫 거래일) 종가
+#   mfe5/10/20     D+1 시가 진입 → N거래일 '내' 최고가 도달률(%)
+#   mae10          같은 진입 기준, 10거래일 '내' 최저가 도달률(%)
+#
+# 두 벌을 다 두는 이유: 이 시스템의 설계 근거(등급 폐지, 누적 관찰 이력 정렬,
+# 발송 하한)는 전부 MFE 정의로 만들어졌는데 저장은 fwd*만 하고 있었다. 서로 다른
+# 자를 섞어 재면 결론이 뒤집힌다 — 누적 관찰 횟수는 MFE 기준 Spearman +0.187인데
+# 종가 기준 fwd10 일자내로는 -0.117이 나온다. 시장·대조군 대비 비교에는 여전히
+# 종가 수익률이 맞으므로 fwd*도 그대로 둔다.
+#
+# 멱등성: 모든 값 컬럼이 채워진 (scan_date,ticker,origin)은 스킵.
 #         미도래(미래) 지평은 NULL로 두고 다음 실행에서 채움. 신규 PK 삽입 0이면 멱등.
+#         기존 DB에는 없는 컬럼만 ALTER로 덧붙인다.
 #
 # ── 사전 등록(pre-registered) 주 지표 ──────────────────────────────────────────
 #   [과열필터 판정] median fwd10(origin='gated', reason LIKE 'overheat%')
@@ -34,6 +45,24 @@ DB_PATH = Path("data/scores_history.db")
 HORIZONS = [1, 5, 10, 20]          # 거래일
 COL = {1: "fwd1", 5: "fwd5", 10: "fwd10", 20: "fwd20"}
 
+# ── 구간 최고/최저 (MFE/MAE) ──────────────────────────────────────────────────
+# fwd*는 '종가 진입 → N거래일 후 종가'다. 그런데 이 시스템의 설계 근거는 전부
+# 'D+1 시가 진입 후 N일 내 구간 최고가'로 만들어졌다 — 등급 폐지, 누적 관찰 이력
+# 정렬, 발송 하한 45가 모두 그 지표에서 나왔다(get_watch_history 주석 참조).
+# 두 지표를 섞으면 결론이 뒤집힌다. 실제로 누적 관찰 횟수는 구간 최고가 기준
+# Spearman +0.187인데, 종가 기준 fwd10으로 재면 일자내 -0.117이 나온다.
+# 같은 자로 재기 위해 설계 근거와 동일한 정의를 컬럼으로 들인다. fwd*는 그대로
+# 둔다 — 시장·대조군 대비 비교에는 종가 수익률이 맞다.
+EXC_HORIZONS = [5, 10, 20]         # 거래일
+MFE_COL = {5: "mfe5", 10: "mfe10", 20: "mfe20"}
+# 최저가는 10일만 둔다. 보유 지평이 1~3일/1~2주라 실제 의사결정을 가르는 것은
+# 이 구간의 하락 폭이다. 최고가만 보면 "갔다"는 사실만 남고 그 전에 얼마나
+# 빠졌는지가 지워져 낙관 편향이 생긴다.
+MAE_COL = {10: "mae10"}
+VAL_COLS = ([COL[h] for h in HORIZONS]
+            + [MFE_COL[h] for h in EXC_HORIZONS]
+            + [MAE_COL[h] for h in MAE_COL])
+
 
 def _track_control() -> bool:
     """대조군(pool_history)까지 추적할지 — config의 control_sample.track_outcomes.
@@ -57,9 +86,16 @@ def _init_outcomes(con):
         CREATE TABLE IF NOT EXISTS outcomes (
             scan_date TEXT, ticker TEXT, origin TEXT,
             fwd1 REAL, fwd5 REAL, fwd10 REAL, fwd20 REAL,
+            mfe5 REAL, mfe10 REAL, mfe20 REAL, mae10 REAL,
             PRIMARY KEY (scan_date, ticker, origin)
         )
     """)
+    # 이미 있는 DB는 fwd*만 갖고 있다. 없는 컬럼만 덧붙인다(멱등).
+    have = {r[1] for r in con.execute("PRAGMA table_info(outcomes)")}
+    for c in VAL_COLS:
+        if c not in have:
+            con.execute(f"ALTER TABLE outcomes ADD COLUMN {c} REAL")
+            logger.info(f"outcomes 컬럼 추가: {c}")
 
 
 def _load_targets(con):
@@ -110,31 +146,40 @@ def _load_targets(con):
 
 
 def _load_existing(con):
-    """{(scan_date,ticker,origin): {fwd1..fwd20}} — 기존 outcomes."""
+    """{(scan_date,ticker,origin): {값 컬럼들}} — 기존 outcomes."""
+    cols = ",".join(VAL_COLS)
     out = {}
-    for r in con.execute("SELECT scan_date,ticker,origin,fwd1,fwd5,fwd10,fwd20 FROM outcomes"):
-        out[(r[0], r[1], r[2])] = {"fwd1": r[3], "fwd5": r[4], "fwd10": r[5], "fwd20": r[6]}
+    for r in con.execute(f"SELECT scan_date,ticker,origin,{cols} FROM outcomes"):
+        out[(r[0], r[1], r[2])] = dict(zip(VAL_COLS, r[3:]))
     return out
 
 
 def _fetch_prices(tickers, start, end):
+    """{ticker: OHLC DataFrame}. MFE/MAE에 고가·저가·시가가 필요해 Close만 담지 않는다."""
     import FinanceDataReader as fdr
     cache = {}
     for tk in sorted(set(tickers)):
         try:
             df = fdr.DataReader(tk, start, end)
             if df is not None and not df.empty and "Close" in df.columns:
-                cache[tk] = df["Close"].astype(float)
+                cache[tk] = df
         except Exception as e:
             logger.debug(f"가격 조회 실패 {tk}: {e}")
     return cache
 
 
-def _forward_returns(close_s, scan_date):
-    """진입가=scan_date 당일 이후 첫 거래일 종가. 각 지평 h거래일 후 수익률(%). 미도래→None."""
+def _entry_idx(index, scan_date):
+    """scan_date 당일(또는 그 이후 첫 거래일) 바의 위치. 없으면 None."""
     scan_dt = pd.to_datetime(scan_date, format="%Y%m%d")
-    idx0 = close_s.index.searchsorted(scan_dt, side="left")  # date >= scan_date 첫 바
-    if idx0 >= len(close_s):
+    i = index.searchsorted(scan_dt, side="left")
+    return None if i >= len(index) else i
+
+
+def _forward_returns(df, scan_date):
+    """진입가=scan_date 당일 이후 첫 거래일 종가. 각 지평 h거래일 후 수익률(%). 미도래→None."""
+    close_s = df["Close"].astype(float)
+    idx0 = _entry_idx(close_s.index, scan_date)
+    if idx0 is None:
         return {COL[h]: None for h in HORIZONS}
     entry = float(close_s.iloc[idx0])
     res = {}
@@ -144,6 +189,39 @@ def _forward_returns(close_s, scan_date):
             res[COL[h]] = round((float(close_s.iloc[j]) / entry - 1) * 100, 4)
         else:
             res[COL[h]] = None          # 미도래
+    return res
+
+
+def _excursions(df, scan_date):
+    """D+1 시가 진입 후 N거래일 '내' 최고가(MFE)·최저가(MAE) 도달률(%).
+
+    설계 근거와 같은 정의다 — 진입은 신호 다음 날 시가이고, 구간은 진입 바부터
+    N개 바다(idx0+1 .. idx0+h). 구간이 다 차지 않았으면 None으로 둔다. 부분
+    구간으로 채우면 최고가가 과소 계상되고, 나중에 채워질 때 값의 의미가 바뀐다.
+    """
+    none = {**{MFE_COL[h]: None for h in EXC_HORIZONS},
+            **{MAE_COL[h]: None for h in MAE_COL}}
+    if not {"Open", "High", "Low"} <= set(df.columns):
+        return none                      # OHLC가 없는 소스 → 조용히 건너뜀
+    idx0 = _entry_idx(df.index, scan_date)
+    if idx0 is None:
+        return none
+    e = idx0 + 1                         # D+1 진입 바
+    if e >= len(df):
+        return none                      # 진입 자체가 미도래
+    entry = float(df["Open"].iloc[e])
+    if not entry > 0:
+        return none
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    res = dict(none)
+    for h in EXC_HORIZONS:
+        end = idx0 + h                   # 포함 구간 e..end → h개 바
+        if end >= len(df):
+            continue                     # 미도래
+        res[MFE_COL[h]] = round((float(high.iloc[e:end + 1].max()) / entry - 1) * 100, 4)
+        if h in MAE_COL:
+            res[MAE_COL[h]] = round((float(low.iloc[e:end + 1].min()) / entry - 1) * 100, 4)
     return res
 
 
@@ -165,7 +243,7 @@ def main():
 
     # 이미 4개 지평 모두 채워진 키는 스킵 (재조회 불필요)
     pending = [t for t in targets
-               if any(existing.get(t, {}).get(COL[h]) is None for h in HORIZONS)]
+               if any(existing.get(t, {}).get(c) is None for c in VAL_COLS)]
     logger.info(f"대상 {len(targets)}건 | 갱신 필요 {len(pending)}건 | 완료 스킵 {len(targets)-len(pending)}건")
     if not pending:
         logger.info("갱신할 outcomes 없음 (전부 완료) — 멱등 종료")
@@ -192,20 +270,23 @@ def main():
     for (scan_date, ticker, origin) in pending:
         if ticker not in prices:
             continue
-        vals = _forward_returns(prices[ticker], scan_date)
+        df = prices[ticker]
+        vals = {**_forward_returns(df, scan_date), **_excursions(df, scan_date)}
         prev = existing.get((scan_date, ticker, origin))
         # 기존 non-null 값은 보존, 새로 도래한 지평만 채움
         if prev:
-            merged = {c: (prev.get(c) if prev.get(c) is not None else vals.get(c)) for c in COL.values()}
+            merged = {c: (prev.get(c) if prev.get(c) is not None else vals.get(c)) for c in VAL_COLS}
             if merged == prev:            # 변화 없음(전부 미도래 유지 등) → 재기록 생략
                 continue
         else:
             merged = vals
             new_pk += 1
+        cols = ",".join(VAL_COLS)
+        ph = ",".join("?" * len(VAL_COLS))
         con.execute(
-            "INSERT OR REPLACE INTO outcomes (scan_date,ticker,origin,fwd1,fwd5,fwd10,fwd20) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (scan_date, ticker, origin, merged["fwd1"], merged["fwd5"], merged["fwd10"], merged["fwd20"]))
+            f"INSERT OR REPLACE INTO outcomes (scan_date,ticker,origin,{cols}) "
+            f"VALUES (?,?,?,{ph})",
+            (scan_date, ticker, origin, *(merged[c] for c in VAL_COLS)))
         updated += 1
     con.commit()
     con.close()
