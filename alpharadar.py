@@ -933,6 +933,42 @@ def calc_dart_keyword_score(titles: list[str]) -> tuple[float, str]:
     return (round(score, 1), best_title)
 
 
+# 표시용 공시 제목은 점수용과 분리한다.
+# calc_dart_keyword_score의 best_title은 '감성 영향도'로 뽑히고 그대로 max_impact가
+# 되어 점수에 들어간다. 그 기준으로는 형식적 절차 공시가 실질 공시를 이긴다 —
+# 20260813 금호타이어는 공시 5건 중 '주주총회소집결의'(mild_positive 60)가
+# '연결재무제표기준영업(잠정)실적'(사전에 없어 neutral 50)을 눌렀다.
+# 사전을 고치면 dart_score와 발송 구성까지 움직이므로, 표시 순위만 따로 매긴다.
+_DART_PROCEDURAL: tuple[str, ...] = (
+    "주주총회소집결의", "주주명부폐쇄", "기준일설정",
+    "기업설명회", "IR개최", "결산실적공시예고",
+    "정관변경", "특정증권등소유상황보고",
+)
+
+
+def pick_dart_display_title(titles: list[str]) -> str:
+    """메시지에 띄울 공시 한 건. 실질 정보가 있는 쪽을 우선하고 절차성 공시는 뒤로 민다.
+    점수에는 관여하지 않는다."""
+    if not titles:
+        return ""
+
+    def _procedural(t: str) -> bool:
+        s = t.replace(" ", "")
+        return any(k.replace(" ", "") in s for k in _DART_PROCEDURAL)
+
+    pool = [t for t in titles if not _procedural(t)] or titles
+    # 같은 pool 안에서는 감성 영향도가 큰 것 → 동점이면 악재 우선.
+    # 동점 처리를 빠뜨리면 거래정지가 가려진다: 데이타솔루션은 '주권매매거래정지'(25)와
+    # '단일판매ㆍ공급계약체결'(75)이 |영향도|=25로 같아, 수집 순서만으로 호재가 이겼다.
+    # 점수용 best_title도 같은 이유로 악재를 우선한다(min의 두 번째 키).
+    best = max(pool,
+               key=lambda t: (abs(classify_dart_title(t)[1] - 50),
+                              -classify_dart_title(t)[1]))
+    # DART 원문에는 제목 중간에 공백이 길게 들어간다
+    # ("주권매매거래정지              (무상증자)"). 표시용이므로 여기서 정리한다.
+    return " ".join(best.split())
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 뉴스-종목 매핑 정밀화 — Phase A 모듈 상수 + 단어 경계 헬퍼
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2759,12 +2795,14 @@ def run_step3(pool_b,precomputed,cfg,date):
     dart_best_titles = {}
     for ticker, texts in dart_texts.items():
         finbert_sc = finbert.score(texts)
-        kw_sc, best_title = calc_dart_keyword_score(texts)
+        kw_sc, _ = calc_dart_keyword_score(texts)   # best_title은 표시에 쓰지 않는다
         if abs(kw_sc - 50) < 1:
             dart_scores[ticker] = finbert_sc
         else:
             dart_scores[ticker] = round(finbert_sc * 0.5 + kw_sc * 0.5, 1)
-        dart_best_titles[ticker] = best_title
+        # 표시용 제목은 점수와 분리해서 따로 뽑는다(pick_dart_display_title 주석 참조).
+        # dart_scores는 위에서 확정됐고 여기서 건드리지 않는다.
+        dart_best_titles[ticker] = pick_dart_display_title(texts)
 
     results=[]
     skipped_low_confidence = 0
