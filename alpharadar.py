@@ -1862,15 +1862,37 @@ _KIS_WARNED      = False
 _KIS_TB_LOGGED   = 0
 _KIS_TOKEN_LOCK  = threading.Lock()
 _KIS_RATE_LOCK   = threading.Lock()
+_KIS_FAIL_COUNT  = 0
+_KIS_DISABLED    = False
+_KIS_FAIL_LIMIT  = 3
+
+def _kis_is_real() -> bool:
+    raw = os.getenv("KIS_IS_REAL", "0").strip().lower()
+    return raw in ("1", "true", "yes", "y", "real")
 
 def _kis_base_url() -> str:
-    raw = os.getenv("KIS_IS_REAL", "0").strip().lower()
-    is_real = raw in ("1", "true", "yes", "y", "real")
-    return ("https://openapi.koreainvestment.com:9443" if is_real
+    return ("https://openapi.koreainvestment.com:9443" if _kis_is_real()
             else "https://openapivts.koreainvestment.com:29443")
 
+def _kis_note_token_failure() -> None:
+    """토큰 발급 실패 누적. 연속 _KIS_FAIL_LIMIT회면 이번 런 KIS 조회를 봉인한다.
+
+    KIS(특히 VTS)가 죽은 날, 종목마다 재발급을 재시도하면 connect timeout 10초가
+    수백 회 쌓여 workflow timeout으로 런 전체가 죽는다. 래치가 서면 수급 데이터만
+    빠진 채(_kis_get이 {} 반환 — 기존 실패 경로) 런은 완주한다.
+    """
+    global _KIS_FAIL_COUNT, _KIS_DISABLED
+    _KIS_FAIL_COUNT += 1
+    if _KIS_FAIL_COUNT >= _KIS_FAIL_LIMIT and not _KIS_DISABLED:
+        _KIS_DISABLED = True
+        logger.warning(
+            f"KIS 토큰 연속 {_KIS_FAIL_COUNT}회 실패 → 이번 런 KIS 조회 전체 스킵"
+        )
+
 def _kis_token() -> str:
-    global _KIS_TOKEN_CACHE
+    global _KIS_TOKEN_CACHE, _KIS_FAIL_COUNT
+    if _KIS_DISABLED:
+        return ""
     now = datetime.now()
 
     if _KIS_TOKEN_CACHE.get("token") and _KIS_TOKEN_CACHE.get("expires"):
@@ -1898,6 +1920,7 @@ def _kis_token() -> str:
         app_key    = os.getenv("KIS_APP_KEY", "")
         app_secret = os.getenv("KIS_APP_SECRET", "")
         if not app_key or app_key == "your_kis_app_key":
+            _kis_note_token_failure()
             return ""
 
         try:
@@ -1916,14 +1939,18 @@ def _kis_token() -> str:
             expires = datetime.now() + timedelta(seconds=exp_sec)
             _KIS_TOKEN_CACHE = {"token": token, "expires": expires}
             token_file.write_text(yaml.dump({"token": token, "expires": expires.isoformat()}))
+            _KIS_FAIL_COUNT = 0
             logger.info("KIS 토큰 발급 완료")
             return token
         except Exception as e:
             logger.warning(f"KIS 토큰 발급 실패: {e}")
+            _kis_note_token_failure()
             return ""
 
 def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3) -> dict:
     global _KIS_LAST_CALL
+    if _KIS_DISABLED:
+        return {}
     token = _kis_token()
     if not token:
         return {}
@@ -3117,6 +3144,8 @@ def main():
 
     try: cfg=load_config(); validate_config(cfg); logger.info("config 검증 완료 ✓")
     except AssertionError as e: logger.error(f"설정 오류: {e}"); sys.exit(1)
+
+    logger.info(f"KIS 조회 도메인: {'실전' if _kis_is_real() else 'VTS'} ({_kis_base_url()})")
 
     start=time.time()
     logger.info("="*60)
