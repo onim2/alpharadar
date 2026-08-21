@@ -95,7 +95,7 @@ LOG_DIR   = Path("data/logs")
 
 DEFAULT_CONFIG = {
     "universe": {
-        "min_price": 500, "min_market_cap": 30_000_000_000,
+        "min_price": 500, "min_market_cap": 200_000_000_000,
         "min_listed_days": 126, "lookback_days": 125,
     },
     "engine_a": {
@@ -1806,7 +1806,7 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
         # 안 되는 종목만 무사통과하는 구조였다.
         # 정상 운영에서는 발동하지 않는다(실측: KOSPI 943 + KOSDAQ 1820 종목
         # 모두 시총 조회 100% 성공). 소스가 망가진 경우의 안전장치다.
-        if marcap_real < ucfg.get("min_market_cap", 30_000_000_000):
+        if marcap_real < ucfg.get("min_market_cap", 200_000_000_000):
             return None
         cap = marcap_real
 
