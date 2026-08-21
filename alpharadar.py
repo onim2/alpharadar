@@ -2228,6 +2228,19 @@ def _load_master_universe_meta() -> dict:
         import sqlite3
         db = "/Users/summer123/Project_2/data_store/master.db"
         if not os.path.exists(db):
+            # 러너에는 master.db가 없다. 그때는 리포에 커밋된 캐시를 쓴다
+            # (export_sector_map.py가 만든다). 이게 없으면 Actions 런에서
+            # FnGuide 섹터·KSIC·등급 보강이 통째로 빠지고, sector가 소속부나
+            # 기타로 남아 동조화 보너스가 엉뚱하게 발화한다 — 실제로
+            # scores_history.db의 fg_sector 컬럼이 100% 비어 있었다.
+            cache = Path("data/cache/sector_map_v1.pkl")
+            if cache.exists():
+                with open(cache, "rb") as f:
+                    blob = pickle.load(f)
+                meta = blob.get("meta", {})
+                logger.info(f"master universe 메타: 캐시 사용 {len(meta)}개 "
+                            f"(year={blob.get('year')})")
+                return meta
             return {}
         with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as c:
             yr = c.execute("SELECT MAX(year) FROM universe").fetchone()[0]
@@ -2269,7 +2282,14 @@ def run_step0(date,cfg,market="ALL",limit=None):
                 cl=c.lower()
                 if "symbol" in cl or cl in ("code","티커"):        cols[c]="ticker"
                 elif cl in ("name","종목명","회사명"):              cols[c]="name"
-                elif any(x in cl for x in ("sector","industry","업종","dept")):
+                # "dept"는 넣지 않는다. FDR 종목목록에는 업종 컬럼이 없고
+                # Dept(소속부)만 있는데, KOSDAQ은 이게 100% 채워져 있어 sector가
+                # 우량기업부/중견기업부/벤처기업부/기술성장기업부 4종으로 뭉갠다.
+                # 그러면 min_sector_peers=2가 항상 충족돼 POOL_B의 모든 KOSDAQ
+                # 종목이 섹터 동조화 보너스(+5)를 무조건 받는다 — 정보가 없는
+                # 상수 가산이다. KOSPI는 Dept가 비어 DART 섹터맵이 채워지므로,
+                # 같은 필드에 두 taxonomy가 섞이기까지 했다.
+                elif any(x in cl for x in ("sector","industry","업종")):
                                                                     cols[c]="sector"
                 elif "listing" in cl or ("date" in cl and "update" not in cl):
                                                                     cols[c]="listing_date"
@@ -2297,10 +2317,11 @@ def run_step0(date,cfg,market="ALL",limit=None):
                 ticker_info[ticker]["sector"] = dart_sector_map[ticker]
                 patched += 1
 
-    # 중앙 datastore(master.db) universe 보강: 신용등급·FnGuide·KSIC·최대주주(신규 보조필드)
-    # + 스코어링용 sector는 비어있을 때만 gap-fill(기존 KSIC 택소노미 보존 → 스코어링 영향 없음)
+    # 중앙 datastore(master.db) universe 보강: 신용등급·FnGuide·KSIC·최대주주
+    # + 스코어링용 sector를 fg_industry로 덮어쓴다(2026-08-21부터). 예전엔 비어
+    # 있을 때만 채웠는데, KOSDAQ은 Dept(소속부)가 sector를 선점해 영영 안 채워졌다.
     master_meta = _load_master_universe_meta()
-    m_rating = m_fg = m_gap = 0
+    m_rating = m_fg = m_sec = 0
     if master_meta:
         for ticker, info in ticker_info.items():
             mm = master_meta.get(str(ticker))
@@ -2316,11 +2337,15 @@ def run_step0(date,cfg,market="ALL",limit=None):
                 info["ksic"]           = mm.get("ksic")
                 info["largest_holder"] = mm.get("largest_holder")
                 m_fg += 1
-                sec = str(info.get("sector") or "").strip()
-                if sec in ("", "nan", "None", "기타"):
-                    info["sector"] = mm["fg_sector"]
-                    m_gap += 1
-        logger.info(f"master 보강: 등급 {m_rating}개 | FnGuide/KSIC {m_fg}개 | 섹터 gap-fill {m_gap}개")
+                # 스코어링용 sector는 fg_industry를 우선한다(gap-fill이 아니라 덮어쓰기).
+                # 동조화 보너스가 물어야 할 것은 "같은 업종이 POOL_B에 겹쳤는가"인데,
+                # fg_sector 대분류 10종으로는 POOL_B(런당 15~20개)에서 83% 발화해
+                # 변별력이 없다. fg_industry 62종이면 56%로 갈린다(실측).
+                # DART 섹터맵은 KOSPI 88%·KOSDAQ 0%라 단독으로는 절반이 빈다.
+                if mm.get("fg_industry"):
+                    info["sector"] = mm["fg_industry"]
+                    m_sec += 1
+        logger.info(f"master 보강: 등급 {m_rating}개 | FnGuide/KSIC {m_fg}개 | 섹터(fg_industry) {m_sec}개")
 
     # 신용등급 하드 필터 (config filter.exclude_ratings) — 기본 빈 목록이면 무동작
     excl = {str(x).strip() for x in (cfg.get("filter", {}).get("exclude_ratings") or [])}
