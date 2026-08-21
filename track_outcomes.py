@@ -21,13 +21,37 @@
 import argparse
 import logging
 import sqlite3
-from datetime import timedelta
+import sys
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] track_outcomes — %(message)s")
+KST = timezone(timedelta(hours=9))
+LOG_DIR = Path("data/logs")
+
+
+def _setup_logging():
+    """스캐너가 쓰는 그 날짜 로그 파일에 이어 쓴다.
+
+    stdout만 쓰면 적재 결과가 Actions 콘솔에만 남고 90일 뒤 사라진다. 대조군
+    추적이 언제부터 몇 건씩 밀렸는지 사후에 물을 수 없다. 워크플로가 커밋하는
+    data/logs/scanner_*.log에 붙여 스캔 로그와 같은 자리에서 보이게 한다.
+    날짜 라벨은 스캐너와 같은 KST 기준 — 러너는 UTC로 돈다.
+    """
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    date_str = datetime.now(KST).strftime("%Y%m%d")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] track_outcomes — %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(LOG_DIR / f"scanner_{date_str}.log", encoding="utf-8"),
+        ])
+
+
+_setup_logging()
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path("data/scores_history.db")
@@ -35,6 +59,7 @@ HORIZONS = [1, 5, 10, 20]          # 거래일
 COL = {1: "fwd1", 5: "fwd5", 10: "fwd10", 20: "fwd20"}
 
 
+@lru_cache(maxsize=1)
 def _track_control() -> bool:
     """대조군(pool_history)까지 추적할지 — config의 control_sample.track_outcomes.
 
@@ -120,13 +145,23 @@ def _load_existing(con):
 def _fetch_prices(tickers, start, end):
     import FinanceDataReader as fdr
     cache = {}
-    for tk in sorted(set(tickers)):
+    uniq = sorted(set(tickers))
+    failed = []
+    for tk in uniq:
         try:
             df = fdr.DataReader(tk, start, end)
             if df is not None and not df.empty and "Close" in df.columns:
                 cache[tk] = df["Close"].astype(float)
+            else:
+                failed.append((tk, "빈 응답"))
         except Exception as e:
-            logger.debug(f"가격 조회 실패 {tk}: {e}")
+            failed.append((tk, f"{type(e).__name__}: {e}"))
+    # debug로 묻어두면 추적이 조용히 비는 것과 구별되지 않는다. 종목마다 한 줄씩
+    # 쌓으면 수백 줄이 되므로 한 줄로 접어 warning으로 올린다.
+    if failed:
+        head = ", ".join(f"{tk}({why})" for tk, why in failed[:5])
+        logger.warning(f"가격 조회 실패 {len(failed)}/{len(uniq)}종목 — {head}"
+                       + (" …" if len(failed) > 5 else ""))
     return cache
 
 
@@ -163,10 +198,33 @@ def main():
     targets  = _load_targets(con)
     existing = _load_existing(con)
 
+    def _incomplete(vals) -> bool:
+        return any(vals.get(COL[h]) is None for h in HORIZONS)
+
     # 이미 4개 지평 모두 채워진 키는 스킵 (재조회 불필요)
-    pending = [t for t in targets
-               if any(existing.get(t, {}).get(COL[h]) is None for h in HORIZONS)]
-    logger.info(f"대상 {len(targets)}건 | 갱신 필요 {len(pending)}건 | 완료 스킵 {len(targets)-len(pending)}건")
+    pending = [t for t in targets if _incomplete(existing.get(t, {}))]
+
+    # targets에서 사라진 미완 키(고아)도 계속 추적 대상에 넣는다.
+    #
+    # pool_history의 PK는 (scan_date, ticker, stage)라 reason이 빠져 있다.
+    # 같은 scan_date에 아침·저녁 두 런이 도는데(둘 다 KST 같은 날짜 라벨),
+    # 두 번째 런이 같은 종목의 reason을 덮어쓰면 첫 런이 만들어둔 outcomes의
+    # origin='f:<옛 reason>' 행이 targets에서 통째로 사라진다. 그러면 그 행은
+    # 4지평 전부 NULL인 채 영원히 고정된다 — 2026-08-20 실측 44건(대조군 2.2%),
+    # 8/13·8/18·8/19에 발생했다. 가격을 못 구해서가 아니다: 같은 날짜·같은
+    # 종목의 다른 origin 행은 값이 멀쩡히 채워져 있다.
+    #
+    # 대조군 추적이 꺼져 있으면(런타임 예산) 대조군 고아는 되살리지 않는다 —
+    # 끈 이유가 조회 종목 수를 줄이는 것이었으므로.
+    seen = set(targets)
+    orphans = [k for k, v in existing.items()
+               if k not in seen and _incomplete(v)
+               and (_track_control() or k[2] in ("scan", "gated"))]
+    if orphans:
+        logger.info(f"고아 행 {len(orphans)}건 복원 (targets에서 탈락한 미완 키)")
+        pending += orphans
+
+    logger.info(f"대상 {len(targets)}건 | 갱신 필요 {len(pending)}건 | 완료 스킵 {len(targets)-len(pending)+len(orphans)}건")
     if not pending:
         logger.info("갱신할 outcomes 없음 (전부 완료) — 멱등 종료")
         con.close()
