@@ -1,0 +1,108 @@
+name: AlphaRadar Afterhours (NXT)
+
+# NXT 애프터마켓(15:40~20:00 KST) 상승 종목 관찰 로깅.
+# 관찰 전용이다 — 점수 파이프라인에 들어가지 않고 텔레그램도 쏘지 않는다.
+#
+# 크론 시각 근거: 애프터마켓 수량·대금을 NXT 분봉(과거 데이터)에서 뽑으므로
+# 장중에 붙어 있을 필요가 없다. 20:00 KST 마감 뒤에 돌리면 15:40~20:00 구간이
+# 완결된 상태로 잡힌다. 그래서 Actions 큐 지연(daily.yml 실측 아침 중앙 56분,
+# 저녁 중앙 117분, 최악 204분)이 문제가 되지 않는다 — 늦게 도착할수록 완전해진다.
+#   11:30 UTC = 20:30 KST 발사 → 지연이 얼마든 붙어도 같은 데이터가 나온다.
+# 스캐너는 15:40 KST 이전 실행만 거부하고, 실제 포착 시각은 captured_kst·
+# session_min 컬럼에 남는다(session_min >= 260 이면 구간 완결).
+on:
+  schedule:
+    - cron: '30 11 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '개시(15:40 KST) 전에도 강제 실행'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+
+# daily 런과 별도 그룹이다. 겹쳐도 서로 취소하지 않는다 —
+# DB 충돌은 아래 push 재시도에서 --replay 로 흡수한다.
+concurrency:
+  group: alpharadar-afterhours
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 러너는 일회용이라 체크아웃 시점의 DB가 원격보다 뒤처져 있을 수 있다.
+      # 실행 직전에 한 번 당겨두면 push 충돌 확률이 크게 줄어든다.
+      - name: Sync latest DB
+        run: git pull --rebase origin main || true
+
+      - name: Run afterhours scanner
+        env:
+          KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KIS_IS_REAL:    '1'
+        run: |
+          python afterhours_scanner.py \
+            ${{ github.event.inputs.force == 'true' && '--force' || '' }}
+
+      - name: Commit & push
+        if: always()
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name  "alpharadar-bot"
+          git add data/scores_history.db 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "적재된 행 없음 (창 밖이거나 포착 0건) — 커밋 생략"
+            exit 0
+          fi
+          git commit -m "auto: afterhours $(date -u +%F\ %H:%M\ UTC) [skip ci]"
+
+          # DB는 바이너리라 rebase로 병합할 수 없다. 원격이 움직였으면 원격 DB를
+          # 그대로 받아들이고, 이번 런이 뽑은 행만 --replay 로 다시 얹는다.
+          # 저녁 시세는 소급 수집이 불가능하니 조용히 버리면 안 된다.
+          # afterhours_rows.json 은 untracked라 reset --hard 후에도 남는다.
+          for i in 1 2 3 4 5; do
+            if git push; then
+              echo "푸시 성공 (시도 $i)"
+              exit 0
+            fi
+            echo "푸시 거부됨 — 원격 DB 채택 후 재적재 ($i/5)"
+            git fetch origin main
+            git reset --hard origin/main
+            python afterhours_scanner.py --replay afterhours_rows.json || exit 1
+            git add data/scores_history.db
+            git commit -m "auto: afterhours $(date -u +%F\ %H:%M\ UTC) [skip ci]"
+            sleep $((i * 5))
+          done
+          echo "::error::5회 재시도 후에도 푸시 실패"
+          exit 1
+
+      - name: Upload rows on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: afterhours-rows
+          path: afterhours_rows.json
+          if-no-files-found: ignore

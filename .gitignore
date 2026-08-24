@@ -88,3 +88,7 @@ data/logs.zip
 data/*.LOCAL*.log
 data/cache/forward_returns.pkl
 data/cache/price_cache_wr.pkl
+
+# afterhours 재적재용 임시 산출물 (Actions 내부에서만 쓴다)
+afterhours_rows.json
+afterhours_*.csv

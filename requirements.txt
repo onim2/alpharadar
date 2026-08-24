@@ -11,6 +11,7 @@ python-dotenv>=1.0.0
 pyyaml>=6.0
 scipy>=1.11.0                 # backtest.py 전용 (Spearman IC)
 tqdm>=4.66.0
+pykrx>=1.0.45                 # afterhours_scanner 유니버스(K200+KQ150)
 
 # ── FinBERT 감성 분석 ────────────────────────────────
 # 미설치 시: 키워드 매칭으로 자동 폴백 (정확도 ↓)
