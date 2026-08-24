@@ -2469,7 +2469,91 @@ def _calc_t_presurge(meta):
 
     return min(score, 100)
 
-def _overheat_penalty(meta, all_vol, all_hype, ocfg):
+def load_overheat_reference(scan_date, ocfg):
+    """과열 감점의 분위 비교 모집단 — 최근 N일 누적 풀 분포를 DB에서 읽는다.
+
+    ref_window_days 기본값은 0이다. 즉 평상시 이 함수는 None을 돌려주고 호출부는
+    당일 풀을 쓴다. 켜지 말 것 — 아래 반박이 남아 있는 한 재검증 전용이다.
+
+    만들게 된 우려: 당일 풀이 8월 들어 4~26종목까지 줄어(시총 하한 2000억 상향
+    이후) n=21이면 순위 한 칸이 4.8%p라 knee 0.80~full 0.85 사이에 자리가 한 칸뿐,
+    n<=10이면 램프 전체가 한 칸 안 — 감점이 0 아니면 만점으로만 나온다는 것.
+
+    리플레이 반박(2026-08-24, scan_results 5,380행 / 72 스캔일 / 130런):
+      ① 이진성은 풀 축소의 결과가 아니다. 램프값이 0이나 1로만 나오는 비율은
+         캘리브레이션 구간(풀 40~236)에서 이미 95.0%였고, 8월 풀에서 94.8%,
+         20일 누적으로 바꿔도 94.6%다. 밴드에 드는 종목 비율은 모집단 크기가
+         아니라 램프 폭이 정한다 — 폭 0.05는 어느 분포에서든 5%, 0.20이면 19%,
+         0.50이면 48%다(당일 풀과 누적 풀이 동일하게 나온다). 늘어나는 건 밴드
+         '안'의 해상도뿐이고(8월 고유값 12 → 19) 그 밴드는 전체의 5%다.
+      ② IC로도 이득이 없다. 일자(런)별 Spearman 평균이 당일 풀 대비
+         fwd1 -0.0319→-0.0321 / fwd5 -0.0645→-0.0655 / fwd10 -0.0410→-0.0443 /
+         fwd20 -0.0803→-0.0815 — 4개 지평 전부 같거나 미세하게 나쁘다.
+      ③ 부작용이 있다. 누적 분포는 절대 기준이라 시장 전체가 달아오른 날 다수가
+         함께 감점된다. 런별 '감점 받은 종목 비율'의 표준편차가 15.3%p에서
+         21.2%p로 벌어져, 감점을 같은 날 동료 대비로 매긴다는 설계가 깨진다.
+         ref_demean=True로 일자평균을 빼면 16.2%p로 돌아오지만 IC 이득은
+         fwd10·fwd20에만 있고 주력 지평인 fwd1·fwd5는 당일 풀이 낫다.
+
+    남겨둔 이유: 풀이 지금보다 더 줄면(런당 한 자릿수) ①의 결론이 바뀔 수 있다.
+    그때 이 옵션으로 재측정한다. 돌려주는 값이 None이면 호출부는 당일 풀을 쓴다
+    (기본값 0 / cold start / 누적 표본 부족 / DB 장애 폴백).
+    """
+    win = int(ocfg.get("ref_window_days", 0) or 0)
+    if win <= 0:
+        return None
+    min_n  = int(ocfg.get("ref_min_n", 100))
+    demean = bool(ocfg.get("ref_demean", False))
+    try:
+        with _conn() as con:
+            dates = [r[0] for r in con.execute(
+                "SELECT DISTINCT scan_date FROM scan_results "
+                "WHERE scan_date < ? ORDER BY scan_date DESC LIMIT ?",
+                (str(scan_date), win)).fetchall()]
+            if not dates:
+                logger.info("과열 감점 모집단: 과거 스캔 없음 → 당일 풀 사용")
+                return None
+            qs = ",".join("?" * len(dates))
+            rows = con.execute(
+                f"SELECT scan_date, vol_slope, hype_slope FROM scan_results "
+                f"WHERE scan_date IN ({qs})", dates).fetchall()
+    except sqlite3.Error as e:
+        logger.warning(f"과열 감점 모집단 조회 실패 → 당일 풀 사용: {e}")
+        return None
+
+    by_date = defaultdict(lambda: {"vol": [], "hype": []})
+    for r in rows:
+        if r["vol_slope"] is not None:
+            by_date[r["scan_date"]]["vol"].append(float(r["vol_slope"]))
+        if r["hype_slope"] is not None:
+            by_date[r["scan_date"]]["hype"].append(float(r["hype_slope"]))
+
+    ref = {"vol": [], "hype": [], "demean": demean, "n_dates": len(by_date)}
+    for key in ("vol", "hype"):
+        for _d, buckets in by_date.items():
+            vals = buckets[key]
+            if not vals:
+                continue
+            if demean:
+                # 감점의 원래 의미는 '같은 날 동료 대비'다. 누적 분포를 쓰되 각 날의
+                # 평균을 뺀 잔차끼리 비교해 그 의미를 지킨다. 근거 통계도 일자평균을
+                # 차감해 측정했으므로 이쪽이 측정과 집행의 기준을 일치시킨다.
+                c = sum(vals) / len(vals)
+                ref[key].extend(v - c for v in vals)
+            else:
+                ref[key].extend(vals)
+
+    n_min = min(len(ref["vol"]), len(ref["hype"]))
+    if n_min < min_n:
+        logger.info(f"과열 감점 모집단 부족 (vol {len(ref['vol'])} / hype {len(ref['hype'])} "
+                    f"< {min_n}) → 당일 풀 사용")
+        return None
+    logger.info(f"과열 감점 모집단: 최근 {len(by_date)}일 누적 "
+                f"vol {len(ref['vol'])}건 / hype {len(ref['hype'])}건"
+                f"{' (일자평균 차감)' if demean else ''}")
+    return ref
+
+def _overheat_penalty(meta, all_vol, all_hype, ocfg, ref=None):
     """과열(관심·거래량 급증) 연속 감점. 0 이상의 실수를 돌려주며 D점수에서 뺀다.
 
     기존 V-Surge(검색량 순위 20위 이내 → cross +10)를 대체한다. 교체 근거는
@@ -2526,19 +2610,29 @@ def _overheat_penalty(meta, all_vol, all_hype, ocfg):
         if cap <= knee: return 1.0 if x >= cap else 0.0
         return max(0.0, min(1.0, (x - knee) / (cap - knee)))
 
+    def _pct(value, today_pool, key):
+        """분위의 비교 모집단을 고른다 — ref가 없으면 기존대로 당일 풀."""
+        if not ref or not ref.get(key):
+            return percentile_rank(value, today_pool)
+        if ref.get("demean"):
+            pool = [v for v in today_pool if v is not None]
+            center = (sum(pool) / len(pool)) if pool else 0.0
+            return percentile_rank(value - center, ref[key])
+        return percentile_rank(value, ref[key])
+
     knee = ocfg.get("pct_knee", 0.80)          # 분위 몇 부터 감점을 시작할지
     full = ocfg.get("pct_full", 0.85)          # 어디서 만점 감점에 도달할지
     pen  = 0.0
 
     # 거래량 기울기 — 일자 내 상위 20%에서만 유효. 좁은 램프 = 완만한 계단.
     pen += ocfg.get("w_vol", 5.0) * _ramp(
-        percentile_rank(meta.get("vol_slope", 0), all_vol), knee, full)
+        _pct(meta.get("vol_slope", 0), all_vol, "vol"), knee, full)
 
     # 검색량 기울기 — V-Surge가 이진으로 잡던 차원. 관심이 오를 때만 과열로 본다
     # (hype_slope<=0인데 순위만 높은 건 그냥 원래 관심 많은 종목이다).
     if meta.get("hype_slope", 0) > 0:
         pen += ocfg.get("w_hype", 5.0) * _ramp(
-            percentile_rank(meta.get("hype_slope", 0), all_hype), knee, full)
+            _pct(meta.get("hype_slope", 0), all_hype, "hype"), knee, full)
 
     # 당일 등락률 — 편측(상단) 램프. 여기는 진짜 완만하다(>=5% -2.96 → >=10% -4.41).
     pen += ocfg.get("w_chg", 5.0) * _ramp(
@@ -2547,7 +2641,7 @@ def _overheat_penalty(meta, all_vol, all_hype, ocfg):
 
     return round(min(pen, ocfg.get("max_total", 15.0)), 2)
 
-def _calc_d(ticker, meta, all_vol, all_hype, top_pct, scfg, scan_date=None):
+def _calc_d(ticker, meta, all_vol, all_hype, top_pct, scfg, scan_date=None, ref=None):
     source = meta.get("source", "engine_a")
     base   = 50 if source == "both" else 30 if source == "engine_a" else 20
 
@@ -2580,7 +2674,7 @@ def _calc_d(ticker, meta, all_vol, all_hype, top_pct, scfg, scan_date=None):
     ocfg = scfg.get("overheat_penalty", {}) or {}
     if ocfg.get("enabled", True):
         # 연속 과열 감점으로 교체 (근거는 _overheat_penalty docstring)
-        overheat_pen = _overheat_penalty(meta, all_vol, all_hype, ocfg)
+        overheat_pen = _overheat_penalty(meta, all_vol, all_hype, ocfg, ref)
     else:
         # 되돌리기 스위치 — 기존 V-Surge 이진 가점 그대로
         overheat_pen = 0.0
@@ -2665,6 +2759,8 @@ def run_step3(pool_b,precomputed,cfg,date):
     all_vol=[m.get("vol_slope",0) for m in pool_b.values()]
     all_hype=[m.get("hype_slope",0) for m in pool_b.values()]
     top_pct=scfg.get("strength_top_pct",0.20)
+    # 과열 감점 분위의 비교 모집단. 런당 1회만 읽는다(종목마다 DB를 때리지 않는다).
+    overheat_ref = load_overheat_reference(date, scfg.get("overheat_penalty", {}) or {})
 
     min_peers = cfg.get("filter", {}).get("min_sector_peers", 2)
     sector_counts = Counter(
@@ -2724,7 +2820,7 @@ def run_step3(pool_b,precomputed,cfg,date):
             text_contrib = news_eff*w_news + d_sc*w_dart
         else:
             text_contrib = s_text * w_text
-        d_score,n_accel,v_surge,overheat_pen=_calc_d(ticker,meta,all_vol,all_hype,top_pct,scfg,date)
+        d_score,n_accel,v_surge,overheat_pen=_calc_d(ticker,meta,all_vol,all_hype,top_pct,scfg,date,overheat_ref)
         d_flow=_calc_d_flow(ticker,meta,all_vol,all_hype,top_pct,scfg,date)   # A-3 shadow
         score=round(t_score*w_tech + text_contrib + d_score*w_cross, 2)
         # Task 4: shadow 종합점수(발송·등급에 미사용, 결과 측정 전용)
