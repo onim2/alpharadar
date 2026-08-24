@@ -258,6 +258,24 @@ def percentile_rank(value, all_values) -> float:
     equal = sum(1 for v in arr if v == value)
     return (below + equal / 2.0) / len(arr)
 
+def _subject_ok(text, name, position_threshold=0.3) -> bool:
+    """종목명이 이 텍스트의 '주체'인지. 위치(앞 N%) + 횟수(1회면 15자 이내).
+
+    같은 판정이 세 군데에 흩어져 있었다 — NaverClient._is_subject(수집),
+    FinBertClient.score_with_confidence(집행), 그리고 아래 shadow. 한 곳으로
+    모아 세 경로가 반드시 같은 규칙을 쓰게 한다. 규칙 자체는 그대로다.
+    """
+    if not text or not name:
+        return False
+    idx = text.find(name)
+    if idx < 0:
+        return False
+    if idx / max(len(text), 1) >= position_threshold:
+        return False
+    if text.count(name) < 2 and idx > 15:
+        return False
+    return True
+
 def calc_rsi(close_series, period=14) -> float:
     if len(close_series) < period+1: return 50.0
     delta = close_series.diff()
@@ -384,6 +402,41 @@ class FinBertClient:
                 best_text = text
         return overall, best_text, round(best_pct * 100, 1)
 
+    def confidence_by_field(self, items, name, position_threshold=0.3):
+        """shadow — 신뢰도 검사만 필드별(title OR desc)로 바로잡았을 때의 값.
+
+        집행 경로(score_with_confidence)는 title과 desc를 이어붙인 문자열
+        f"{title}. {desc[:100]}" 하나에 주체 검증을 건다. 그런데 수집 단계는
+        title·desc 각각에 걸어 하나만 통과해도 채택한다. 그래서 desc로 채택된
+        기사는 종목명이 len(title)+2 뒤에 놓여 위치 임계 30%를 구조적으로 넘고
+        전부 탈락한다 — 저장 기사 1,735건 실측에서 65.5%가 이 경로였다.
+
+        여기서는 그 검사만 필드별로 되돌린다. FinBERT에 넣는 문자열은 기존
+        연결 문자열 그대로다 — 검사 방식과 입력 텍스트를 같이 바꾸면 shadow
+        신구 차이가 어느 쪽 효과인지 귀속되지 않는다. 입력 텍스트 변경이
+        필요한지는 이 컬럼이 쌓인 뒤 따로 판단한다(field_mix가 그 근거다).
+
+        반환: (conf_fixed, raw_fixed, field_mix)
+          conf_fixed — 필드별 검사 기준 통과 비율
+          raw_fixed  — 통과분만 FinBERT로 채점한 원점수(게이트 미적용). 없으면 None
+          field_mix  — "title=4,desc=12,both=2,none=3" 형태의 채택 경로 내역
+        """
+        if not items or not name:
+            # 측정 불가(캐시에 원본 기사가 없음)와 '재보니 0'을 구분해야 나중에
+            # 집계에서 섞이지 않는다.
+            return None, None, ""
+        valid, mix = [], {"title": 0, "desc": 0, "both": 0, "none": 0}
+        for it in items:
+            t_ok = _subject_ok(it.get("title", ""), name, position_threshold)
+            d_ok = _subject_ok(it.get("desc", ""), name, position_threshold)
+            mix["both" if (t_ok and d_ok) else
+                "title" if t_ok else "desc" if d_ok else "none"] += 1
+            if t_ok or d_ok:
+                valid.append(NaverClient.item_to_text(it))
+        conf = round(len(valid) / len(items), 3)
+        raw = self.score_with_best(valid)[0] if valid else None
+        return conf, raw, ",".join(f"{k}={v}" for k, v in mix.items())
+
     def score_with_confidence(self, texts, name=None, position_threshold=0.3):
         """
         Phase A.1 — 매핑 신뢰도(confidence) 동시 반환.
@@ -404,18 +457,7 @@ class FinBertClient:
         if not texts:
             return 50.0, "", 0.0, 0.0, None
         if name:
-            valid = []
-            for t in texts:
-                if not t:
-                    continue
-                idx = t.find(name)
-                if idx < 0:
-                    continue
-                if idx / max(len(t), 1) >= position_threshold:
-                    continue
-                if t.count(name) < 2 and idx > 15:
-                    continue
-                valid.append(t)
+            valid = [t for t in texts if _subject_ok(t, name, position_threshold)]
             confidence = round(len(valid) / len(texts), 3) if texts else 0.0
             if not valid:
                 return 50.0, "", 0.0, confidence, None
@@ -534,6 +576,16 @@ def init_db():
         # V-Surge → 연속 과열 감점 교체. D점수에서 실제로 뺀 값을 남긴다.
         # 이게 없으면 나중에 감점을 걷어냈을 때의 점수를 과거 데이터로 복원할 수 없다
         # (score_d는 이미 감점이 반영된 값이라 되돌릴 수 없음).
+        # D-2 shadow — 뉴스 주체 게이트를 필드별 검사로 바로잡았을 때의 값.
+        # 집행은 news_conf 그대로 두고 여기에 병행 기록만 한다. 집행 전환 여부는
+        # 이 컬럼이 수 주 쌓인 뒤 개편 ①(s_text 랭킹 제외)과 함께 판단한다.
+        for _c in ("news_conf_fixed", "news_raw_fixed"):
+            if _c not in cols:
+                con.execute(f"ALTER TABLE scan_results ADD COLUMN {_c} REAL")
+                logger.info(f"DB 마이그레이션: {_c} 컬럼 추가 완료")
+        if "news_field_mix" not in cols:
+            con.execute("ALTER TABLE scan_results ADD COLUMN news_field_mix TEXT")
+            logger.info("DB 마이그레이션: news_field_mix 컬럼 추가 완료")
         if "overheat_pen" not in cols:
             con.execute("ALTER TABLE scan_results ADD COLUMN overheat_pen REAL")
             logger.info("DB 마이그레이션: overheat_pen 컬럼 추가 완료")
@@ -561,8 +613,8 @@ def save_scan_results(results, scan_date):
                  hype_slope,hype_rank,disparity,
                  rating_bond,rating_cp,fg_sector,fg_industry,ksic,largest_holder,
                  t_presurge,score_presurge,news_conf,news_raw,d_flow,score_flow,
-                 overheat_pen)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 overheat_pen,news_conf_fixed,news_raw_fixed,news_field_mix)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (scan_date, r["ticker"], r.get("name"), r.get("sector"),
                  r.get("cap_tier"),
                  r.get("score"), r.get("t"), None, r.get("d"),
@@ -579,7 +631,9 @@ def save_scan_results(results, scan_date):
                  r.get("t_presurge"), r.get("score_presurge"),
                  r.get("news_conf"), r.get("news_raw"),
                  r.get("d_flow"), r.get("score_flow"),
-                 r.get("overheat_pen")))
+                 r.get("overheat_pen"),
+                 r.get("news_conf_fixed"), r.get("news_raw_fixed"),
+                 r.get("news_field_mix")))
 
 def save_engine_b_history(tickers, precomputed, scan_date):
     with _conn() as con:
@@ -1184,18 +1238,7 @@ class NaverClient:
           - 위치 검증: 종목명이 첫 N% 안에 등장 (기본 30%)
           - 횟수 검증: 1회만 등장 시 매우 앞쪽(15자 이내)이어야 통과
         """
-        if not text or not name:
-            return False
-        idx = text.find(name)
-        if idx < 0:
-            return False
-        text_len = len(text)
-        if idx / max(text_len, 1) >= position_threshold:
-            return False
-        count = text.count(name)
-        if count < 2 and idx > 15:
-            return False
-        return True
+        return _subject_ok(text, name, position_threshold)
 
     def _is_relevant(self, text: str, company: str) -> bool:
         """
@@ -1687,7 +1730,9 @@ def collect_texts_with_cache(pool_b, naver, dart, news_cnt, dart_days,
         f"수집 완료: 뉴스 {sum(len(v) for v in news_texts.values())}건 | "
         f"공시 {sum(len(v) for v in dart_texts.values())}건"
     )
-    return news_texts, dart_texts
+    # news_items(title·desc 원본)는 뉴스 게이트 shadow 측정에 쓴다. 캐시에 이미
+    # 있는 값이라 추가 조회 비용은 없다.
+    return news_texts, dart_texts, news_items
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3038,7 +3083,7 @@ def run_step3(pool_b,precomputed,cfg,date):
         )
 
     # A2: 일자별 incremental 캐시 — 같은 날 재실행 시 외부 API 0건 (Phase A)
-    news_texts, dart_texts = collect_texts_with_cache(
+    news_texts, dart_texts, news_items = collect_texts_with_cache(
         pool_b, naver, dart, news_cnt, dart_days, date,
         workers=scfg.get("text_workers", 6), news_max_age=news_max_age,
     )
@@ -3048,11 +3093,14 @@ def run_step3(pool_b,precomputed,cfg,date):
     # Phase A.1 — 매핑 신뢰도 동시 산출 (외부 보고서 6건 사례 대응)
     # v3 hotfix: news_texts 가 일별 캐시라 어제 종목이 남아있을 수 있음 → pool_b 가드
     news_data = {}
+    news_fixed = {}
     for t, texts in news_texts.items():
         if t not in pool_b:
             continue
         nm = pool_b[t].get("name", t)
         news_data[t] = finbert.score_with_confidence(texts, name=nm)
+        # shadow — 검사만 필드별로 바로잡은 값. 집행에는 쓰지 않는다(D-2).
+        news_fixed[t] = finbert.confidence_by_field(news_items.get(t, []), nm)
     dart_scores = {}
     dart_best_titles = {}
     for ticker, texts in dart_texts.items():
@@ -3068,6 +3116,8 @@ def run_step3(pool_b,precomputed,cfg,date):
 
     results=[]
     skipped_low_confidence = 0
+    skipped_fixed = 0
+    measured_fixed = 0
     for ticker,meta in pool_b.items():
         t_score=_calc_t(meta)
         t_presurge=_calc_t_presurge(meta)   # Task 4: shadow 기술점수 병행 계산
@@ -3075,10 +3125,16 @@ def run_step3(pool_b,precomputed,cfg,date):
             ticker, (50.0,"",0.0,0.0,None))
         d_sc=dart_scores.get(ticker,50.0)
         # Phase A.1 (C1): 신뢰도 < 0.5 면 뉴스 감성 폐기 (중립 50 처리)
+        n_conf_fix, n_raw_fix, n_field_mix = news_fixed.get(ticker, (None, None, ""))
+        # 집행은 구값(n_conf) 그대로 — shadow 는 기록만 한다.
         news_skipped = n_conf < 0.5
         news_eff = 50.0 if news_skipped else n_sc
         if news_skipped:
             skipped_low_confidence += 1
+        if n_conf_fix is not None:
+            measured_fixed += 1
+            if n_conf_fix < 0.5:
+                skipped_fixed += 1
         # s_text: 표시·DB용 결합 감성 (0~100 스케일 유지 위해 news_w/dart_w 사용)
         s_text = round(news_eff*news_w + d_sc*dart_w, 1)
         # P1-4: S_text의 최종점수 기여 — split_text=False면 기존식(s_text×w_text)과 동일
@@ -3102,6 +3158,8 @@ def run_step3(pool_b,precomputed,cfg,date):
             "t":t_score,"t_presurge":t_presurge,"score_presurge":score_presurge,
             "s_text":s_text,"news_score":n_sc,"dart_score":d_sc,"d":d_score,
             "news_conf":n_conf,"news_raw":n_raw,
+            "news_conf_fixed":n_conf_fix,"news_raw_fixed":n_raw_fix,
+            "news_field_mix":n_field_mix,
             "d_flow":d_flow,"score_flow":score_flow,
             "source":meta.get("source","?"),"n_accel":n_accel,"v_surge":v_surge,
             "overheat_pen":overheat_pen,
@@ -3127,6 +3185,11 @@ def run_step3(pool_b,precomputed,cfg,date):
         r["grade"]="집중" if r["score"]>=hi else "주시" if r["score"]>=mi else "참고"
     if skipped_low_confidence:
         logger.info(f"Phase A.1: 매핑 신뢰도 < 0.5 → 감성 점수 폐기 {skipped_low_confidence}건")
+    if measured_fixed:
+        # D-2 shadow — 집행에는 반영하지 않는다. 같은 종목을 필드별 검사로
+        # 다시 재면 몇 건이 걸리는지만 기록한다.
+        logger.info(f"[shadow] 필드별 검사 기준 폐기 {skipped_fixed}/{measured_fixed}종목 "
+                    f"(집행 {skipped_low_confidence}건 — 변동 없음)")
     logger.info(f"스코어링: {len(results)}개 | 집중:{sum(1 for r in results if r['grade']=='집중')} | FinBERT:{finbert.mode}")
     save_scan_results(results,date)
     CACHE_DIR.mkdir(parents=True,exist_ok=True)
