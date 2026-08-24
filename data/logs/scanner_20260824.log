@@ -376,3 +376,12 @@
 2026-08-24 10:32:01,413 [INFO] track_outcomes — 대상 10344건 | 갱신 필요 6701건 | 완료 스킵 3746건
 2026-08-24 10:32:01,414 [INFO] track_outcomes —   가격 조회 고유 종목 1640개 (기존 963 + 대조군 추가 677)
 2026-08-24 11:03:09,291 [INFO] track_outcomes — outcomes 적재: 신규 136건 | 갱신(신규+보완) 1331건
+2026-08-24 21:29:23,383 [INFO] track_outcomes — outcomes 컬럼 추가: mfe5
+2026-08-24 21:29:23,383 [INFO] track_outcomes — outcomes 컬럼 추가: mfe10
+2026-08-24 21:29:23,384 [INFO] track_outcomes — outcomes 컬럼 추가: mfe20
+2026-08-24 21:29:23,384 [INFO] track_outcomes — outcomes 컬럼 추가: mae10
+2026-08-24 21:29:23,408 [INFO] track_outcomes — pool_history 대조군 2866건 추적 대상 포함
+2026-08-24 21:29:23,423 [INFO] track_outcomes — 고아 행 103건 복원 (targets에서 탈락한 미완 키)
+2026-08-24 21:29:23,423 [INFO] track_outcomes — 대상 10344건 | 갱신 필요 10447건 | 완료 스킵 0건
+2026-08-24 21:29:23,424 [INFO] track_outcomes —   가격 조회 고유 종목 1740개 (기존 1159 + 대조군 추가 581)
+2026-08-24 21:32:44,940 [INFO] track_outcomes — outcomes 적재: 신규 0건 | 갱신(신규+보완) 7209건
