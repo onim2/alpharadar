@@ -123,6 +123,14 @@ DEFAULT_CONFIG = {
         "min_turnover_ratio":  0.01,
         "min_turnover_amount": 2_000_000_000,
     },
+    # D-5 shadow — config.yaml의 overheat 절과 같이 고칠 것.
+    # load_config()는 병합하지 않고 YAML을 통째로 반환한다.
+    "overheat": {
+        "prev_day_spike_gate": {
+            "enabled": False, "prev_min": 15.0, "cur_max": -8.0,
+            "mode": "exclude", "penalty": 8.0,
+        },
+    },
     "scoring": {
         "w_tech": 0.30, "w_text": 0.40, "w_cross": 0.30,
         "w1": 0.30, "w2": 0.40, "w3": 0.30,
@@ -497,6 +505,7 @@ def init_db():
                 fg_industry TEXT, ksic TEXT, largest_holder TEXT,
                 t_presurge REAL, score_presurge REAL,
                 overheat_pen REAL,
+                prev_change_pct REAL, prev_spike_flag INTEGER,
                 created_at TEXT DEFAULT (datetime('now','localtime'))
             );
             CREATE TABLE IF NOT EXISTS engine_b_history (
@@ -592,6 +601,15 @@ def init_db():
         if "overheat_pen" not in cols:
             con.execute("ALTER TABLE scan_results ADD COLUMN overheat_pen REAL")
             logger.info("DB 마이그레이션: overheat_pen 컬럼 추가 완료")
+        # D-5 shadow — 전일 급등 → 당일 급락 진입. flag만으로는 나중에 '왜
+        # 걸렸나/안 걸렸나'를 되짚을 수 없어 prev_change_pct를 같이 남긴다.
+        # 임계를 바꿔 재판정하려면 원값이 있어야 한다.
+        if "prev_change_pct" not in cols:
+            con.execute("ALTER TABLE scan_results ADD COLUMN prev_change_pct REAL")
+            logger.info("DB 마이그레이션: prev_change_pct 컬럼 추가 완료")
+        if "prev_spike_flag" not in cols:
+            con.execute("ALTER TABLE scan_results ADD COLUMN prev_spike_flag INTEGER")
+            logger.info("DB 마이그레이션: prev_spike_flag 컬럼 추가 완료")
 
 @contextmanager
 def _conn():
@@ -605,6 +623,27 @@ def _conn():
     finally:
         con.close()
 
+def prev_spike_flag(cfg, prev_chg, cur_chg):
+    """D-5 shadow — 전일 급등 뒤 당일 급락으로 지표가 리셋된 진입인가.
+
+    과열 게이트·감점은 전부 당일 스냅샷만 본다. 전일 +26% → 당일 -18%는 2일
+    합산 +3%의 무난한 종목으로 읽힌다. 검정 결과 이런 진입은 같은 날 다른
+    통과 종목보다 fwd5가 4.14%p 열세였다(33일자 중 25일자, 부호검정 p=0.0046,
+    부트스트랩 95% CI [-7.08,-0.81]) — docs/D5_prev_spike_check_20260826.md.
+
+    **열세는 조합에서만 나온다.** 갈래를 가르면 '당일 급락만'은 -0.45,
+    '전일 급등만'은 -2.54로 둘 다 신뢰구간이 0을 넘는다. 그래서 어느 한 항만
+    보는 게이트로 바꾸지 말 것 — 근거 없는 종목까지 함께 걸린다.
+
+    지금은 shadow다. 반환값은 기록만 되고 배제·감점에 쓰이지 않는다.
+    집행 전환은 1주 관찰 뒤 2026-09-02에 판정한다.
+    """
+    g = (cfg.get("overheat", {}) or {}).get("prev_day_spike_gate", {}) or {}
+    if prev_chg is None or cur_chg is None:
+        return 0
+    return int(prev_chg >= g.get("prev_min", 15.0) and cur_chg <= g.get("cur_max", -8.0))
+
+
 def save_scan_results(results, scan_date):
     with _conn() as con:
         for r in results:
@@ -616,8 +655,9 @@ def save_scan_results(results, scan_date):
                  hype_slope,hype_rank,disparity,
                  rating_bond,rating_cp,fg_sector,fg_industry,ksic,largest_holder,
                  t_presurge,score_presurge,news_conf,news_raw,d_flow,score_flow,
-                 overheat_pen,news_conf_fixed,news_raw_fixed,news_field_mix)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 overheat_pen,news_conf_fixed,news_raw_fixed,news_field_mix,
+                 prev_change_pct,prev_spike_flag)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (scan_date, r["ticker"], r.get("name"), r.get("sector"),
                  r.get("cap_tier"),
                  r.get("score"), r.get("t"), None, r.get("d"),
@@ -636,7 +676,8 @@ def save_scan_results(results, scan_date):
                  r.get("d_flow"), r.get("score_flow"),
                  r.get("overheat_pen"),
                  r.get("news_conf_fixed"), r.get("news_raw_fixed"),
-                 r.get("news_field_mix")))
+                 r.get("news_field_mix"),
+                 r.get("prev_change_pct"), r.get("prev_spike_flag", 0)))
 
 def save_engine_b_history(tickers, precomputed, scan_date):
     with _conn() as con:
@@ -1893,6 +1934,11 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
         rsi    = calc_rsi(close_s)
         bb_pos = calc_bb_position(close_s)
         change_pct = float(df["Change"].iloc[-1]*100) if "Change" in df.columns else 0.0
+        # D-5 shadow — 관측 바 '직전' 거래일 등락률. 같은 바 수열에서 뽑으므로
+        # 아침 런(장 시작 전, 관측 바가 전일)과 저녁 런(관측 바가 당일) 모두
+        # 룩어헤드 없이 맞는다. scan_date 축으로 이어붙이면 하루가 어긋난다.
+        prev_change_pct = (float(df["Change"].iloc[-2]*100)
+                           if "Change" in df.columns and len(df) >= 2 else 0.0)
         # Task 3: 과열 배제용 피처 (누적수익률·신고가 근접도)
         w52_high = float(close_s.max())
         ret_5d  = (current/float(close_s.iloc[-6])-1)  if len(close_s) >= 6  else 0.0
@@ -1916,6 +1962,7 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
             "retail_buy_days":retail_days,"retail_buy_total":0,
             "inst_net":inst_net,"foreign_net":foreign_net,
             "rsi":rsi,"bb_pos":bb_pos,"change_pct":change_pct,
+            "prev_change_pct":prev_change_pct,
             "ret_5d":ret_5d,"ret_20d":ret_20d,"w52_proximity":w52_proximity,
             "w52_high":w52_high,"res_top":resistance_top(hist_df.iloc[-60:]),
             "corp_code":"","hype_latest":0.0,"hype_7d_ago":0.0,
@@ -3179,6 +3226,10 @@ def run_step3(pool_b,precomputed,cfg,date):
             "current_price":meta.get("current_price",0),"inst_net":meta.get("inst_net",0),"foreign_net":meta.get("foreign_net",0),
             "rsi":meta.get("rsi",50.0),"bb_pos":meta.get("bb_pos",50.0),
             "change_pct":meta.get("change_pct",0.0),
+            # D-5 shadow — 기록만 한다. 집행 경로는 건드리지 않는다.
+            "prev_change_pct":meta.get("prev_change_pct",0.0),
+            "prev_spike_flag":prev_spike_flag(cfg, meta.get("prev_change_pct"),
+                                              meta.get("change_pct")),
             "hype_slope":meta.get("hype_slope",0),"hype_rank":meta.get("hype_rank",9999),
             "disparity":meta.get("disparity",0),
         })
@@ -3186,6 +3237,18 @@ def run_step3(pool_b,precomputed,cfg,date):
     hi=cfg["grade"]["high_interest"]; mi=cfg["grade"]["interest"]
     for r in results:
         r["grade"]="집중" if r["score"]>=hi else "주시" if r["score"]>=mi else "참고"
+    # D-5 shadow — 걸린 건수만 남긴다. 배제도 감점도 하지 않는다.
+    _spk = [r for r in results if r.get("prev_spike_flag")]
+    if _spk:
+        _g = (cfg.get("overheat", {}) or {}).get("prev_day_spike_gate", {}) or {}
+        logger.info(
+            f"[shadow] 전일급등→당일급락 {len(_spk)}/{len(results)}종목 "
+            f"(전일>=+{_g.get('prev_min',15.0):g}% & 당일<={_g.get('cur_max',-8.0):g}%, "
+            f"집행 {'ON' if _g.get('enabled') else 'OFF'}): "
+            + ", ".join(f"{r.get('name') or r['ticker']}"
+                        f"({r.get('prev_change_pct',0):+.1f}→{r.get('change_pct',0):+.1f})"
+                        for r in _spk[:5])
+            + (" …" if len(_spk) > 5 else ""))
     if skipped_low_confidence:
         logger.info(f"Phase A.1: 매핑 신뢰도 < 0.5 → 감성 점수 폐기 {skipped_low_confidence}건")
     if measured_fixed:
