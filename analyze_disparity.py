@@ -31,7 +31,14 @@ ap.add_argument("--min-dates", type=int, default=3,
                 help="판정에 필요한 최소 유효 일자 (기본 3). 이 미만이면 '—'")
 ap.add_argument("--thin", type=int, default=5,
                 help="이 미만이면 얇은 표본으로 보고 '*'를 붙인다 (기본 5)")
+ap.add_argument("--exclude-dates", default="20260817,20260818",
+                help="표본에서 뺄 scan_date 쉼표 목록. 기본값은 광복절 대체휴장으로 "
+                     "진입 바가 겹치는 8/17·8/18이다 — 합쳐서 1일자로 세는 게 아니라 "
+                     "둘 다 뺀다(사용자 확정 2026-08-26). 안 빼려면 --exclude-dates ''")
+ap.add_argument("--asof", default="20260826",
+                help="성숙 판정 기준일 YYYYMMDD. 이 날 종가까지 도래한 fwd5만 성숙으로 센다")
 a = ap.parse_args()
+EXCL = {x.strip() for x in a.exclude_dates.split(",") if x.strip()}
 con = sqlite3.connect(a.db)
 
 rsi_cond = "AND p.rsi <= 70" if a.rsi_gate else ""
@@ -41,6 +48,8 @@ rows = con.execute(f"""
       ON p.scan_date=o.scan_date AND p.ticker=o.ticker AND p.reason='disp_upper'
     WHERE o.origin='f:disp_upper' AND p.disparity IS NOT NULL {rsi_cond}
 """).fetchall()
+n_raw = len(rows)
+rows = [r for r in rows if r[0] not in EXCL]
 
 # 기준선: 같은 날 같은 티어의 통과군(scan)
 base = {}
@@ -49,6 +58,7 @@ for d, tier, f1, f5 in con.execute("""
     FROM scan_results s JOIN outcomes o
       ON o.scan_date=s.scan_date AND o.ticker=s.ticker AND o.origin='scan'
 """):
+    if d in EXCL: continue
     base.setdefault((d, tier), []).append((f1, f5))
 
 def band_of(tier, disp):
@@ -80,7 +90,11 @@ def spread(per_date, tier, hi_idx):
     return out
 
 print(f"이격도 상한 완화 시뮬 — 티어맞춤 기준선  (RSI게이트 {'ON' if a.rsi_gate else 'OFF'})")
-print(f"현재 상한: large {T0['large']} / mid {T0['mid']} / small {T0['small']}\n")
+print(f"현재 상한: large {T0['large']} / mid {T0['mid']} / small {T0['small']}")
+if EXCL:
+    print(f"제외 일자: {', '.join(sorted(EXCL))} "
+          f"({n_raw - len(rows)}건 제외, 진입 바 겹침)")
+print()
 print(f"{'티어':<7}{'초과대역':<14}{'표본':>5}"
       f"{'fwd1일자':>9}{'스프레드':>10}{'승률':>7}"
       f"{'fwd5일자':>9}{'스프레드':>10}{'승률':>7}{'부호':>7}")
@@ -112,7 +126,7 @@ print(f"            양쪽 다 유효 일자 {a.min_dates} 이상인 대역만 �
 print("            한쪽이라도 음수면 올리지 않는다 (과거 되돌림의 원인).")
 print("\n[주의] 2026-08-17은 휴장이다. scan_date 8/17과 8/18은 진입 바가 같아서")
 print("       (둘 다 8/18 종가) fwd 값이 완전히 동일하다 — 독립 관측 2개가 아니라")
-print("       1개다. 아래 성숙 일정표가 '중복'으로 표시한다.")
+print("       1개다. 기본값으로 둘 다 --exclude-dates 처리한다.")
 mature5 = sum(1 for r in rows if r[4] is not None)
 print(f"\n표본 현황: f:disp_upper {len(rows)}건 중 fwd5 성숙 {mature5}건 "
       f"({len({r[0] for r in rows if r[4] is not None})}일자)")
@@ -138,7 +152,7 @@ if _bars:
     print("=" * 62)
     print(f"{'scan_date':<12}{'진입 바':<12}{'fwd5 도래':<12}{'상태':<10}")
     print("-" * 62)
-    _today = _dt.date(2026, 8, 25)
+    _today = _dt.date(int(a.asof[:4]), int(a.asof[4:6]), int(a.asof[6:]))
     _entry_seen, _eff = {}, 0
     for s in _scans:
         sd = _dt.date(int(s[:4]), int(s[4:6]), int(s[6:]))
@@ -150,9 +164,11 @@ if _bars:
         m = _bars[i + 5]
         dup = e in _entry_seen
         _entry_seen.setdefault(e, s)
-        if not dup and m <= _today: _eff += 1
-        state = f"중복({_entry_seen[e]}와 동일 바)" if dup else \
-                ("성숙" if m <= _today else f"D-{(m - _today).days}")
+        excl = s in EXCL
+        if not dup and not excl and m <= _today: _eff += 1
+        state = "제외(진입 바 겹침)" if excl else \
+                (f"중복({_entry_seen[e]}와 동일 바)" if dup else
+                 ("성숙" if m <= _today else f"D-{(m - _today).days}"))
         print(f"{s:<12}{str(e):<12}{str(m):<12}{state:<10}")
     print("-" * 62)
     print(f"오늘({_today}) 종가 기준 독립 유효 일자: {_eff}개")
