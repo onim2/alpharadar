@@ -50,6 +50,7 @@ logger = logging.getLogger("afterhours")
 DB_PATH     = Path("data/scores_history.db")
 TOKEN_FILE  = Path(".kis_token")          # 알파래더와 같은 파일·같은 포맷을 쓴다
 SECTOR_CACHE = Path("data/cache/sector_map_v1.pkl")
+UNIV_CACHE  = Path("data/cache/universe_k200_kq150.json")   # 유니버스 폴백(커밋 대상)
 ROWS_JSON   = Path("afterhours_rows.json")   # 푸시 충돌 시 재삽입용(리포 밖 취급)
 KST         = timezone(timedelta(hours=9))
 SESSION     = (15 * 60 + 40, 20 * 60)        # NXT 애프터마켓 15:40~20:00 KST
@@ -280,6 +281,59 @@ def load_names() -> dict:
     return names
 
 
+def _write_univ_cache(codes: list[str], source: str) -> None:
+    """마지막으로 성공한 유니버스를 파일로 남긴다. 다음 런이 조회에 실패해도
+    같은 구성으로 돌 수 있어야 시계열 비교가 깨지지 않는다."""
+    try:
+        UNIV_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        UNIV_CACHE.write_text(json.dumps({
+            "generated": datetime.now(KST).strftime("%Y-%m-%d %H:%M KST"),
+            "source": source, "count": len(codes), "codes": codes,
+        }, ensure_ascii=False, indent=1))
+    except Exception as e:
+        logger.warning(f"유니버스 캐시 기록 실패({e}) — 무시하고 진행")
+
+
+def _read_univ_cache() -> list[str]:
+    if not UNIV_CACHE.exists():
+        return []
+    try:
+        d = json.loads(UNIV_CACHE.read_text())
+        codes = [str(c).zfill(6) for c in d.get("codes", [])]
+        if codes:
+            logger.info(f"유니버스 캐시 {len(codes)}종목 사용 "
+                        f"(생성 {d.get('generated','?')}, 출처 {d.get('source','?')})")
+        return codes
+    except Exception as e:
+        logger.warning(f"유니버스 캐시 읽기 실패({e})")
+        return []
+
+
+def rebuild_univ_cache() -> list[str]:
+    """FDR 상장목록에서 코스피 시총 상위 200 + 코스닥 상위 150으로 캐시를 만든다.
+
+    지수 구성종목과 완전히 같지는 않다 — K200/KQ150은 시총 외에 유동비율·
+    업종 배분·정기변경 주기가 걸린다. 애프터마켓 상승 종목 관찰이 목적이라
+    이 정도 근사로 충분하고, 워크플로가 죽는 것을 막는 게 우선이다.
+    정식 소스 교체(KIS 지수구성종목 조회 또는 KRX 정보데이터시스템 CSV)는
+    이월 과제다.
+    """
+    import FinanceDataReader as fdr
+    df = fdr.StockListing("KRX")
+    # 보통주만 남긴다. 우선주는 코드 끝자리가 0이 아니고, 스팩은 애프터마켓
+    # 관찰 대상이 아니다.
+    df = df[df["Code"].astype(str).str.endswith("0")]
+    df = df[~df["Name"].astype(str).str.contains("스팩", na=False)]
+    df = df[df["Marcap"].notna()]
+    kp = df[df["Market"] == "KOSPI"].nlargest(200, "Marcap")
+    kq = df[df["Market"].isin(["KOSDAQ", "KOSDAQ GLOBAL"])].nlargest(150, "Marcap")
+    codes = sorted({str(c).zfill(6) for c in list(kp["Code"]) + list(kq["Code"])})
+    logger.info(f"FDR 시총 근사 유니버스 생성: 코스피 {len(kp)} + 코스닥 {len(kq)} "
+                f"= {len(codes)}종목")
+    _write_univ_cache(codes, "fdr_marcap_top(kospi200+kosdaq150)")
+    return codes
+
+
 def load_universe(path: str | None) -> list[str]:
     if path:
         return [l.strip().zfill(6) for l in Path(path).read_text().splitlines() if l.strip()]
@@ -289,12 +343,20 @@ def load_universe(path: str | None) -> list[str]:
         codes = (stock.get_index_portfolio_deposit_file("1028", today)      # KOSPI200
                  + stock.get_index_portfolio_deposit_file("2203", today))   # KOSDAQ150
         if codes:
-            return sorted({c.zfill(6) for c in codes})
+            codes = sorted({c.zfill(6) for c in codes})
+            _write_univ_cache(codes, "pykrx_index_portfolio")
+            return codes
         raise RuntimeError("빈 목록")
     except Exception as e:
         # 유니버스 구성이 날마다 달라지면 시계열 비교가 깨진다. pykrx가 흔들리면
-        # 직전 런이 본 종목을 그대로 재사용해 구성을 고정한다.
-        logger.warning(f"pykrx 유니버스 조회 실패({e}) — 직전 런 유니버스 재사용 시도")
+        # 마지막 성공분 → 직전 런 순으로 같은 구성을 재사용한다.
+        # 2026-08-26 현재 pykrx는 KRX 응답 스키마 변경으로 죽어 있어 이 경로가
+        # 상시 경로다.
+        logger.warning(f"pykrx 유니버스 조회 실패({e}) — 캐시 폴백")
+        cached = _read_univ_cache()
+        if cached:
+            return cached
+        logger.warning("유니버스 캐시 없음 — 직전 런 유니버스 재사용 시도")
         if DB_PATH.exists():
             con = sqlite3.connect(DB_PATH)
             try:
@@ -308,7 +370,8 @@ def load_universe(path: str | None) -> list[str]:
                 pass
             finally:
                 con.close()
-        logger.error("유니버스를 구성하지 못했다 — 중단")
+        logger.error("유니버스를 구성하지 못했다 — 중단. "
+                     "`--rebuild-universe` 로 캐시를 만들어 두면 이 경로가 열린다")
         return []
 
 
@@ -392,9 +455,17 @@ def main():
     ap.add_argument("--csv",   action="store_true", help="CSV로도 저장")
     ap.add_argument("--replay", help="저장된 rows.json을 DB에 재삽입하고 종료")
     ap.add_argument("--force", action="store_true", help="애프터마켓 창 밖에서도 실행")
+    ap.add_argument("--rebuild-universe", action="store_true",
+                    help="FDR 시총 상위(코스피 200 + 코스닥 150)로 유니버스 캐시를 "
+                         "다시 만들고 종료. pykrx가 죽어 있을 때의 부트스트랩이다")
     args = ap.parse_args()
 
     scan_date = args.date or datetime.now().strftime("%Y%m%d")
+
+    if args.rebuild_universe:
+        codes = rebuild_univ_cache()
+        logger.info(f"유니버스 캐시 기록 완료: {UNIV_CACHE} ({len(codes)}종목)")
+        return
 
     if args.replay:
         blob = json.loads(Path(args.replay).read_text())

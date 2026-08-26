@@ -72,9 +72,11 @@ jobs:
         run: |
           git config user.email "actions@github.com"
           git config user.name  "alpharadar-bot"
-          git add data/scores_history.db 2>/dev/null || true
+          # 유니버스 캐시도 같이 올린다. pykrx가 되살아나면 그 결과가
+          # '마지막 성공분'으로 남아야 다음 런의 폴백이 최신이 된다.
+          git add data/scores_history.db data/cache/universe_k200_kq150.json 2>/dev/null || true
           if git diff --staged --quiet; then
-            echo "적재된 행 없음 (창 밖이거나 포착 0건) — 커밋 생략"
+            echo "적재된 행 없음(창 밖이거나 포착 0건) · 유니버스 변동 없음 — 커밋 생략"
             exit 0
           fi
           git commit -m "auto: afterhours $(date -u +%F\ %H:%M\ UTC) [skip ci]"
