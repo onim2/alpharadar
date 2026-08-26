@@ -109,13 +109,16 @@ DEFAULT_CONFIG = {
         "large_threshold": 5_000_000_000_000,
         "mid_threshold":     500_000_000_000,
     },
+    # config.yaml이 없을 때만 쓰인다 — load_config()는 병합하지 않고 YAML을
+    # 통째로 반환한다. 그래서 여기 값이 낡으면 config.yaml을 지운 순간 조용히
+    # 옛 기준으로 돌아간다. config.yaml의 filter 절과 같이 고칠 것.
     "filter": {
-        "max_disparity_large": 115,
-        "max_disparity_mid":   120,
-        "max_disparity_small": 130,
+        "max_disparity_large": 110,
+        "max_disparity_mid":   115,
+        "max_disparity_small": 120,
         "min_disparity": 93,
         "require_ma_trend": True,
-        "max_rsi": 80,
+        "max_rsi": 70,
         "min_sector_peers": 2,
         "min_turnover_ratio":  0.01,
         "min_turnover_amount": 2_000_000_000,

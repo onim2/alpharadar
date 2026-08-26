@@ -51,18 +51,18 @@ cap_tier:
 # ── Step 2: 하드 필터 ─────────────────────────────────
 filter:
   # ① 이격도 상한 — 단기 과열 제거 (추격매수 금지)
-  max_disparity_large: 110         # 대형주: MA20 대비 15% 이상이면 과열
-  max_disparity_mid:   115         # 중형주: MA20 대비 20% 이상이면 과열
-  max_disparity_small: 120         # 소형주: MA20 대비 30% 이상이면 과열
+  max_disparity_large: 110         # 대형주: MA20 대비 +10% 이상이면 과열
+  max_disparity_mid:   115         # 중형주: MA20 대비 +15% 이상이면 과열
+  max_disparity_small: 120         # 소형주: MA20 대비 +20% 이상이면 과열
 
   # ② 이격도 하한 — MA20 아래 하락 추세 제거
-  min_disparity: 93                # MA20 대비 93% 미만 = MA20 아래 = 하락 추세
+  min_disparity: 93                # MA20 대비 -7%(93%) 미만 = 하락 추세
 
   # ③ MA 방향성 — 단기 이평이 장기 이평 위에 있어야 상승 추세 인정
   require_ma_trend: true           # MA20 > MA120 조건
 
   # ④ RSI 과매수 상한 — 단기 극과열 제거
-  max_rsi: 70                      # RSI 80 초과 시 제거
+  max_rsi: 70                      # RSI 70 초과 시 제거
 
   # ⑤ 거래대금 최소 기준 — 두 조건 모두 충족해야 통과
   min_turnover_ratio: 0.01         # 일 거래대금 / 시총 >= 1%
