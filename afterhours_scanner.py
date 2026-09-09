@@ -56,6 +56,7 @@ KST         = timezone(timedelta(hours=9))
 SESSION     = (15 * 60 + 40, 20 * 60)        # NXT 애프터마켓 15:40~20:00 KST
 AFTER_START = "154000"                       # 분봉 필터용 HHMMSS
 AFTER_END   = "200000"
+CRON_KST    = 19 * 60                        # 가장 이른 크론 발사 시각(10:00 UTC)
 
 
 def _kst_now() -> datetime:
@@ -66,6 +67,17 @@ def session_minutes(now: datetime | None = None) -> int:
     """애프터마켓 개시(15:40 KST) 이후 경과 분. 개시 전이면 음수."""
     now = now or _kst_now()
     return now.hour * 60 + now.minute - SESSION[0]
+
+
+def _is_scheduled() -> bool:
+    """크론이 부른 실행인가. 사람이 손으로 돌린 것과 갈라야 한다.
+
+    개시(15:40) 전 실행의 의미가 둘로 갈리는데 시계만 봐서는 구분이 안 된다.
+    사람이 아침에 시험 삼아 돌린 것이면 잡을 게 없을 뿐 잃은 것도 없다.
+    크론이 그 시각에 도착했다면 겨냥한 세션은 '어제'고 그건 유실이다.
+    workflow_dispatch 는 schedule 이 아니므로 --force 없이도 조용히 넘어간다.
+    """
+    return os.getenv("GITHUB_EVENT_NAME", "").strip() == "schedule"
 
 
 # ── KIS ───────────────────────────────────────────────────────────────────────
@@ -309,6 +321,41 @@ def _read_univ_cache() -> list[str]:
         return []
 
 
+def _krx_listing():
+    """전체 시장 상장목록. fdr.StockListing이 죽어도 받아낸다.
+
+    fdr은 KRX에 최종거래일을 물은 뒤 FinanceData의 GitHub CSV 캐시에서 그
+    날짜 파일을 읽는데, 2026-09-08부터 그 캐시 갱신이 멈춰 404가 났다.
+    여기가 유니버스 캐시를 되살리는 유일한 수단이므로 같이 죽으면 안 된다.
+    alpharadar.py에도 같은 폴백이 있지만 이 스크립트는 의도적으로 독립
+    실행이라 무겁게 임포트하지 않고 필요한 만큼만 되풀이한다.
+    """
+    import FinanceDataReader as fdr
+    try:
+        df = fdr.StockListing("KRX")
+        if df is not None and len(df):
+            return df
+    except Exception as e:
+        logger.warning(f"FDR 상장목록 실패({e}) — CSV 캐시로 폴백")
+
+    import pandas as pd
+    url = ("https://raw.githubusercontent.com/FinanceData/fdr_krx_data_cache/"
+           "refs/heads/master/data/listing/krx/{d}.csv")
+    d0 = _kst_now()
+    for back in range(11):
+        day = (d0 - timedelta(days=back)).strftime("%Y-%m-%d")
+        try:
+            df = pd.read_csv(url.format(d=day), index_col=0,
+                             dtype={"Code": str, "Dept": str,
+                                    "ChangeCode": str, "MarketId": str})
+        except Exception:
+            continue
+        if len(df):
+            logger.warning(f"상장목록 CSV 캐시 폴백: {day} 자 {len(df)}개")
+            return df
+    return None
+
+
 def rebuild_univ_cache() -> list[str]:
     """FDR 상장목록에서 코스피 시총 상위 200 + 코스닥 상위 150으로 캐시를 만든다.
 
@@ -318,8 +365,9 @@ def rebuild_univ_cache() -> list[str]:
     정식 소스 교체(KIS 지수구성종목 조회 또는 KRX 정보데이터시스템 CSV)는
     이월 과제다.
     """
-    import FinanceDataReader as fdr
-    df = fdr.StockListing("KRX")
+    df = _krx_listing()
+    if df is None:
+        raise RuntimeError("상장목록을 어느 경로로도 받지 못했다 — 캐시 재생성 불가")
     # 보통주만 남긴다. 우선주는 코드 끝자리가 0이 아니고, 스팩은 애프터마켓
     # 관찰 대상이 아니다.
     df = df[df["Code"].astype(str).str.endswith("0")]
@@ -442,6 +490,27 @@ def save(rows: list[dict], universe: list[str], scan_date: str) -> int:
     return len(rows)
 
 
+def _session_captured(scan_date: str) -> bool:
+    """그 세션 스캔이 이미 끝났는가.
+
+    save()는 포착 0건이어도 afterhours_universe를 남긴다 — 그래서 이 테이블이
+    '스캔이 돌았다'는 신호이고, afterhours_history는 아니다(진짜 0건인 날과
+    구분이 안 된다). 크론을 여러 개 두면 늦게 도착한 뒷차가 앞차의 성공을
+    유실로 오인해 빨간불을 켜는데, 그것을 막는 것이 이 함수의 용도다.
+    """
+    try:
+        con = sqlite3.connect(DB_PATH)
+        try:
+            n = con.execute(
+                "SELECT COUNT(*) FROM afterhours_universe WHERE scan_date=?",
+                (scan_date,)).fetchone()[0]
+        finally:
+            con.close()
+        return bool(n)
+    except Exception:
+        return False
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(description="NXT 애프터마켓 상승 종목 관찰 로깅")
@@ -478,9 +547,45 @@ def main():
     # 큐 지연(daily.yml 실측 중앙 56~117분, 최대 204분)이 문제가 되지 않는다 —
     # 늦게 도착할수록 완전해진다. 막아야 하는 건 개시 전(15:40 이전) 실행뿐이다.
     # session_min 이 260 미만이면 구간이 덜 찬 스냅샷이라는 뜻이다.
+    #
+    # ── 자정 넘김 ────────────────────────────────────────────────────────
+    # '늦게 도착할수록 완전해진다'는 자정까지만 참이다. 날짜가 넘어가면 겨냥한
+    # 세션은 어제가 되는데, 분봉 조회는 FHKST03010200(주식'당일'분봉)이라
+    # 날짜 파라미터가 없다 — 어제 15:40~20:00 은 다시 못 뽑는다. 영구 유실이다.
+    #
+    # 2026-08-27 실측: 크론 11:30 UTC(20:30 KST)가 GitHub 쪽에서 9시간 34분
+    # 늦게 21:04 UTC = KST 08-28 06:04 에 발사됐다(createdAt == startedAt이라
+    # 러너 대기가 아니라 이벤트 발사가 늦은 것이다). 그때 이 가드가 '개시 전'으로
+    # 읽고 return 0 으로 조용히 끝냈고, 뒤 커밋 스텝이 "적재된 행 없음"을 찍은 뒤
+    # exit 0 해서 워크플로가 success 로 남았다. 하루치가 사라졌는데 아무 표시도
+    # 없었다 — 8/26 적재분을 세다가 8/27이 통째로 비어 있어서 알았다.
+    #
+    # 그래서 개시 전을 두 갈래로 가른다.
+    #   · 사람이 돌린 것(로컬·workflow_dispatch) → 잃은 게 없다. 지금처럼 조용히 종료.
+    #   · 크론이 부른 것 → 날짜가 넘어간 것이므로 유실이다. exit 1 로 빨갛게 세운다.
+    # 되살릴 수단이 없으니 가드가 할 수 있는 방어는 '눈에 띄게 실패하는 것'이다.
     smin = session_minutes()
     if not args.force and not (0 <= smin <= 24 * 60 - SESSION[0]):
-        logger.warning(f"애프터마켓 개시 전 (KST {_kst_now():%H:%M}, 개시까지 {-smin}분) — "
+        now = _kst_now()
+        if _is_scheduled():
+            lost_dt = now - timedelta(days=1)
+            lost = lost_dt.strftime("%Y-%m-%d")
+            late = (now.hour * 60 + now.minute) + 24 * 60 - CRON_KST
+            # 크론을 여러 개 두는 이상, 자정을 넘겨 도착한 뒷차가 앞차의 성공을
+            # 덮어쓸 수는 없어도 빨간불을 켤 수는 있다. 그건 소음이다.
+            # 앞차가 이미 그 세션을 적재했으면 잃은 것이 없으므로 조용히 나간다.
+            if _session_captured(lost_dt.strftime("%Y%m%d")):
+                logger.info(
+                    f"크론이 자정을 넘겨 도착했으나 (KST {now:%m-%d %H:%M}) "
+                    f"{lost} 세션은 앞선 크론이 이미 적재했다 — 유실 없음, 종료")
+                return
+            logger.error(
+                f"크론이 자정을 넘겨 도착했다 (KST {now:%m-%d %H:%M}, 첫 크론 "
+                f"{CRON_KST // 60:02d}:{CRON_KST % 60:02d} 기준 {late // 60}시간 "
+                f"{late % 60}분 지연) — {lost} 애프터마켓 세션은 당일분봉만 "
+                f"조회되므로 복구 불가다. 유실로 기록하고 실패 처리한다")
+            sys.exit(1)
+        logger.warning(f"애프터마켓 개시 전 (KST {now:%H:%M}, 개시까지 {-smin}분) — "
                        f"적재 없이 종료. --force 로 무시할 수 있다")
         return
 

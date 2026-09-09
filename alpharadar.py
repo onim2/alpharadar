@@ -548,6 +548,15 @@ def init_db():
                 collected_at TEXT DEFAULT (datetime('now','localtime')),
                 PRIMARY KEY (scan_date, ticker, title)
             );
+            -- 종목목록 스냅샷. FDR의 상장목록 소스가 죽으면 유니버스가 0이 되고
+            -- 스캔이 통째로 중단된다(2026-09-08~09 3연속 실패). 마지막으로 성공한
+            -- 목록을 여기 남겨 최후 폴백으로 쓴다. 이 DB는 매 런 커밋되므로
+            -- CI 러너가 새로 떠도 살아남는다 — data/cache는 그렇지 않다.
+            CREATE TABLE IF NOT EXISTS universe_listing (
+                market TEXT, snap_date TEXT, payload TEXT,
+                saved_at TEXT DEFAULT (datetime('now','localtime')),
+                PRIMARY KEY (market)
+            );
             CREATE INDEX IF NOT EXISTS idx_dart_ticker_date
                 ON dart_filings(ticker, scan_date DESC);
             CREATE INDEX IF NOT EXISTS idx_scan_date_ticker
@@ -1736,7 +1745,11 @@ def collect_texts_with_cache(pool_b, naver, dart, news_cnt, dart_days,
         logger.info(f"텍스트 캐시 전체 적중: {len(pool_b)}종목 (외부 API 0건)")
         _persist_articles({t: news_items[t] for t in pool_b if t in news_items}, "캐시")
         _persist_filings({t: dart_items[t] for t in pool_b if t in dart_items}, "캐시")
-        return news_texts, dart_texts
+        # news_items를 빠뜨리면 호출부(3-튜플 언팩)가 ValueError로 죽는다.
+        # 이 경로는 같은 기준일 두 번째 런에서만 밟히는데 — 저녁 런이 캐시를
+        # 데워두면 아침 런이 반드시 여기로 온다 — 그래서 9/1·9/7 아침이
+        # 통째로 날아갔다. 캐시 적중은 정상 경로지 예외 경로가 아니다.
+        return news_texts, dart_texts, news_items
 
     logger.info(
         f"텍스트 신규 수집: {len(missing)}종목 "
@@ -2379,6 +2392,118 @@ def _load_master_universe_meta() -> dict:
         return {}
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 종목목록 소스 이중화
+# ══════════════════════════════════════════════════════════════════════════════
+# fdr.StockListing은 KRX에 최종거래일(max_work_dt)을 물은 뒤, FinanceData가
+# 운영하는 GitHub CSV 캐시에서 그 날짜 파일을 읽는다. 두 축이 다 흔들린다 —
+#   · 2026-09-02 저녁: KRX 쪽(bldAttendant)이 죽어 ValueError
+#   · 2026-09-08~09: CSV 캐시 갱신이 09-07에서 멈춰 그 뒤 날짜가 전부 404
+# 유니버스가 비면 스캔을 중단하므로(아래 sys.exit) 소스 장애가 곧 하루 유실이다.
+# 통제할 수 없는 외부 소스 하나에 파이프라인 전체를 걸어두지 않는다.
+#
+# 3단으로 받는다:
+#   1) fdr.StockListing — 정상 경로
+#   2) CSV 캐시를 날짜 되짚어 직접 읽기 — KRX 조회를 건너뛰므로 KRX가 죽어도
+#      동작하고, 오늘 파일이 아직 없으면 어제·그제로 물러선다
+#   3) DB 스냅샷 — 마지막으로 성공한 목록. DB는 매 런 커밋되므로 CI 러너가
+#      새로 떠도 살아남는다(data/cache는 그렇지 않다)
+# 상장목록은 하루 이틀 묵어도 거의 같다. 빠지는 건 신규상장뿐인데 그건 어차피
+# min_listed_days에 걸려 탈락한다 — 스캔을 통째로 접는 것보다 훨씬 싸다.
+_LISTING_CSV_URL = ("https://raw.githubusercontent.com/FinanceData/fdr_krx_data_cache/"
+                    "refs/heads/master/data/listing/krx/{d}.csv")
+_LISTING_MKT_ID = {"KOSPI": "STK", "KOSDAQ": "KSQ", "KONEX": "KNX"}
+_LISTING_STR_COLS = {"Code": str, "Dept": str, "ChangeCode": str, "MarketId": str}
+_LISTING_MAX_BACK_DAYS = 10          # 이보다 묵은 목록은 신뢰하지 않는다
+_LISTING_CSV_MEMO: dict = {}         # 날짜별 1회만 받는다(KOSPI·KOSDAQ이 같은 파일)
+
+
+def _listing_csv_for(day: str):
+    """CSV 캐시에서 하루치 전체 시장 목록을 받는다. 없으면 None."""
+    if day not in _LISTING_CSV_MEMO:
+        try:
+            _LISTING_CSV_MEMO[day] = pd.read_csv(
+                _LISTING_CSV_URL.format(d=day), index_col=0, dtype=_LISTING_STR_COLS)
+        except Exception:
+            _LISTING_CSV_MEMO[day] = None
+    return _LISTING_CSV_MEMO[day]
+
+
+def _listing_from_csv_cache(mkt, end_date, back_days=_LISTING_MAX_BACK_DAYS):
+    """CSV 캐시를 end_date부터 하루씩 되짚으며 최초로 잡히는 날을 쓴다.
+
+    (목록, 그 목록의 실제 기준일)을 돌려준다. 스냅샷에 남길 날짜는 받아온
+    날이 아니라 데이터가 만들어진 날이어야 한다 — 나중에 스냅샷이 얼마나
+    묵었는지 세는 것이 이 값이라, 오늘 날짜로 적어두면 영영 새것처럼 보인다.
+    """
+    if mkt not in _LISTING_MKT_ID:
+        return None, None
+    d0 = datetime.strptime(end_date, "%Y%m%d")
+    for back in range(back_days + 1):
+        day = (d0 - timedelta(days=back)).strftime("%Y-%m-%d")
+        df = _listing_csv_for(day)
+        if df is None:
+            continue
+        df = df[df["MarketId"] == _LISTING_MKT_ID[mkt]].reset_index(drop=True)
+        if df.empty:
+            continue
+        logger.warning(f"목록 CSV 캐시 폴백 ({mkt}): {day} 자 {len(df)}개")
+        return df, day.replace("-", "")
+    return None, None
+
+
+def _save_listing_snapshot(mkt, df, snap_date):
+    """성공한 목록을 DB에 남긴다. 시장당 최신 1건만 유지한다."""
+    try:
+        with _conn() as con:
+            con.execute(
+                "INSERT OR REPLACE INTO universe_listing(market, snap_date, payload) "
+                "VALUES (?,?,?)",
+                (mkt, snap_date, df.to_json(orient="records", force_ascii=False)))
+    except Exception as e:
+        logger.warning(f"목록 스냅샷 저장 실패 ({mkt}): {e}")
+
+
+def _listing_from_snapshot(mkt):
+    """최후 폴백 — DB에 남은 마지막 성공 목록."""
+    try:
+        with _conn() as con:
+            row = con.execute(
+                "SELECT snap_date, payload FROM universe_listing WHERE market=?",
+                (mkt,)).fetchone()
+        if not row:
+            return None
+        df = pd.read_json(io.StringIO(row["payload"]), dtype=_LISTING_STR_COLS)
+        if df.empty:
+            return None
+        # to_json이 "000660"을 문자열로 쓰긴 하지만, 소스가 바뀌어 숫자로 들어온
+        # 스냅샷을 물려받아도 코드가 6자리를 잃지 않게 한 번 더 세운다.
+        df["Code"] = df["Code"].astype(str).str.zfill(6)
+        logger.warning(f"목록 DB 스냅샷 폴백 ({mkt}): {row['snap_date']} 자 {len(df)}개")
+        return df
+    except Exception as e:
+        logger.warning(f"목록 스냅샷 조회 실패 ({mkt}): {e}")
+        return None
+
+
+def _stock_listing(mkt, end_date, fdr):
+    """1)정상 → 2)CSV 캐시 → 3)DB 스냅샷. 셋 다 실패하면 None."""
+    try:
+        df = fdr.StockListing(mkt)
+        if df is not None and len(df):
+            _save_listing_snapshot(mkt, df, end_date)
+            return df
+        logger.warning(f"목록 조회 결과 없음 ({mkt}) — 폴백")
+    except Exception as e:
+        logger.warning(f"목록 조회 실패 ({mkt}): {e} — 폴백")
+
+    df, day = _listing_from_csv_cache(mkt, end_date)
+    if df is not None:
+        _save_listing_snapshot(mkt, df, day)
+        return df
+    return _listing_from_snapshot(mkt)
+
+
 def run_step0(date,cfg,market="ALL",limit=None):
     dart_sector_map = _load_dart_sector_map()
     import FinanceDataReader as fdr
@@ -2393,7 +2518,10 @@ def run_step0(date,cfg,market="ALL",limit=None):
     frames=[]
     for mkt in markets:
         try:
-            df=fdr.StockListing(mkt)
+            df=_stock_listing(mkt,end_date,fdr)
+            if df is None or not len(df):
+                logger.warning(f"목록 확보 실패 ({mkt}) — 정상·CSV캐시·스냅샷 모두 실패")
+                continue
             logger.debug(f"{mkt} StockListing 컬럼: {list(df.columns)}")
             cols={}
             for c in df.columns:
@@ -2414,7 +2542,7 @@ def run_step0(date,cfg,market="ALL",limit=None):
                 elif any(x in cl for x in ("marcap","시가총액","mktcap","market_cap")):
                                                                     cols[c]="market_cap"
             df=df.rename(columns=cols); df["market"]=mkt; frames.append(df)
-        except Exception as e: logger.warning(f"목록 조회 실패 ({mkt}): {e}")
+        except Exception as e: logger.warning(f"목록 처리 실패 ({mkt}): {e}")
 
     if not frames: return {}
     stock_df=pd.concat(frames,ignore_index=True)
