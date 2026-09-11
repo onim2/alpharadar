@@ -158,8 +158,10 @@ jobs:
           echo "::error::5회 재시도 후에도 푸시 실패"
           exit 1
 
-      - name: Upload logs on failure
-        if: failure()
+      # 로그는 DB와 같은 커밋에 묶여 있어 커밋이 실패하면 같이 사라진다.
+      # 성공·실패 무관하게 매 런 아티팩트로 남겨 사후 추적을 보장한다.
+      - name: Upload logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: scanner-logs-${{ github.run_id }}

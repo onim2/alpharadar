@@ -38,10 +38,18 @@ on:
         type: choice
         options: ['true', 'false']
 
-# daily 런과 별도 그룹이다. 겹쳐도 서로 취소하지 않는다 —
-# DB 충돌은 아래 push 재시도에서 --replay 로 흡수한다.
+# daily 런과 같은 그룹이다. 둘 다 data/scores_history.db(바이너리)를 푸시하는데,
+# 별도 그룹이던 동안 저녁 daily 도착(11:40~14:00 UTC)과 afterhours 커밋
+# (14:00 UTC 전후)이 정면으로 겹쳤다. afterhours 는 --replay 로 살아남지만
+# daily 는 rebase 실패 시 결과를 버린다 — 2026-09-09·09-10 저녁 런이
+# 그렇게 사라졌다(발송은 됐고 DB·로그만 유실).
+#
+# 한 큐에 세워 경합을 원천 제거한다. 취소하지 않으니 afterhours 가 daily 뒤로
+# 30~40분 밀릴 수 있고, 그건 허용한다 — 분봉 유효 창이 24:00 KST(15:00 UTC)
+# 까지라 아직 여유가 있다. 아래 push 재시도의 --replay 는 그대로 둔다
+# (PR 머지 등 다른 원인으로 원격이 움직이는 경우가 남는다).
 concurrency:
-  group: alpharadar-afterhours
+  group: alpharadar-daily
   cancel-in-progress: false
 
 permissions:
