@@ -91,6 +91,30 @@ KST = timezone(timedelta(hours=9))
 def today_kst() -> str:
     """스캔 날짜 라벨(YYYYMMDD). 실행 환경의 TZ와 무관하게 KST 기준."""
     return datetime.now(KST).strftime("%Y%m%d")
+
+
+def run_type_kst(now=None) -> str:
+    """하루 두 런을 가르는 라벨 — KST 정오 이전 시작이면 'am', 이후면 'pm'.
+
+    scan_date 만으로는 아침 런과 저녁 런이 구분되지 않는다. sent_history 는
+    PK가 (ticker, send_date)라 두 발송이 아예 한 행으로 접혔고, scan_results 는
+    created_at 으로 눈대중할 수는 있어도 질의로 가르기 어려웠다. 런 구분은
+    여기 한 곳에서만 정한다.
+
+    경계를 정오에 두는 근거: 아침 크론 21:10 UTC(06:10 KST), 저녁 크론
+    09:40 UTC(18:40 KST)에 Actions 큐 지연(아침 중앙 56분, 저녁 중앙 117분)이
+    붙어도 정오를 넘나들지 않는다.
+
+    한계 — 저녁 런이 5시간 넘게 밀려 KST 자정을 넘기면 'am'으로 찍힌다
+    (실측: 2026-09-07 저녁 런이 00:23 KST 도착). 다만 그런 런은 scan_date 도
+    다음 날로 밀리므로 그 날짜에서는 실제로 첫 런이 맞다.
+
+    ALPHARADAR_RUN_TYPE 로 강제할 수 있다 — dry-run 재현과 소급 적재용.
+    """
+    forced = os.getenv("ALPHARADAR_RUN_TYPE", "").strip().lower()
+    if forced in ("am", "pm"):
+        return forced
+    return "am" if (now or datetime.now(KST)).hour < 12 else "pm"
 LOG_DIR   = Path("data/logs")
 
 DEFAULT_CONFIG = {
@@ -506,15 +530,19 @@ def init_db():
                 t_presurge REAL, score_presurge REAL,
                 overheat_pen REAL,
                 prev_change_pct REAL, prev_spike_flag INTEGER,
+                run_type TEXT DEFAULT 'am',
                 created_at TEXT DEFAULT (datetime('now','localtime'))
             );
             CREATE TABLE IF NOT EXISTS engine_b_history (
                 scan_date TEXT, ticker TEXT, hype_slope REAL,
                 PRIMARY KEY (scan_date, ticker)
             );
+            -- PK에 run_type 이 있어야 아침·저녁 발송이 갈린다. 없던 시절의 DB는
+            -- _migrate_sent_history() 가 테이블을 갈아끼워 맞춘다.
             CREATE TABLE IF NOT EXISTS sent_history (
                 ticker TEXT, send_date TEXT, grade TEXT, score REAL,
-                PRIMARY KEY (ticker, send_date)
+                run_type TEXT NOT NULL DEFAULT 'am',
+                PRIMARY KEY (ticker, send_date, run_type)
             );
             CREATE TABLE IF NOT EXISTS gated_tickers (
                 scan_date TEXT, ticker TEXT, reason TEXT,
@@ -568,7 +596,24 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_sent_ticker_date
                 ON sent_history(ticker, send_date);
         """)
+        # 하루 두 런을 가르는 라벨. scan_results 는 PK가 surrogate id 라 두 런이
+        # 이미 공존하지만, 어느 쪽이 저녁 런인지 질의로 가르려면 컬럼이 필요하다.
         cols = [r[1] for r in con.execute("PRAGMA table_info(scan_results)").fetchall()]
+        if "run_type" not in cols:
+            con.execute("ALTER TABLE scan_results ADD COLUMN run_type TEXT DEFAULT 'am'")
+            # ADD COLUMN 은 기존 행을 전부 DEFAULT 로 채운다. 그대로 두면 과거
+            # 저녁 런까지 'am'이 되어 컬럼이 제 일을 못 한다. created_at 은 러너
+            # (UTC)가 찍은 값이라 +9h가 KST이고, run_type_kst() 와 같은 정오
+            # 기준을 그대로 적용하면 된다 — 이 컬럼의 정의 자체가 '정오 이전
+            # 시작이냐'이므로 소급 적용은 추정이 아니라 정의대로 채우는 것이다.
+            n = con.execute(
+                "UPDATE scan_results SET run_type = "
+                "  CASE WHEN CAST(strftime('%H', datetime(created_at,'+9 hours')) AS INT) < 12 "
+                "       THEN 'am' ELSE 'pm' END "
+                "WHERE created_at IS NOT NULL").rowcount
+            logger.info(f"DB 마이그레이션: scan_results.run_type 컬럼 추가 완료 (기존 {n}행 소급 판정)")
+            cols.append("run_type")
+        _migrate_sent_history(con)
         if "cap_tier" not in cols:
             con.execute("ALTER TABLE scan_results ADD COLUMN cap_tier TEXT")
             logger.info("DB 마이그레이션: cap_tier 컬럼 추가 완료")
@@ -620,6 +665,44 @@ def init_db():
             con.execute("ALTER TABLE scan_results ADD COLUMN prev_spike_flag INTEGER")
             logger.info("DB 마이그레이션: prev_spike_flag 컬럼 추가 완료")
 
+def _migrate_sent_history(con):
+    """sent_history PK에 run_type 을 넣는다 — (ticker, send_date) → (ticker, send_date, run_type).
+
+    왜: 하루 두 런이 같은 send_date 를 써서 아침 발송과 저녁 발송이 한 행으로
+    접혔다. mark_sent 가 강등을 막아 '강한 쪽만' 남겼지만, 실제로 두 번 나간
+    알림은 통계에서 한 번으로 세어졌다(실측 20260910: 아침 13 + 저녁 20인데
+    기록은 24행 — 9건이 접혔고 그중 7건은 저녁 값으로 덮여 아침 기록이 사라졌다).
+
+    SQLite는 PK를 바꿀 수 없어 새 테이블을 만들어 갈아끼운다. 기존 행은 어느
+    런이었는지 복원할 수 없으므로 전부 'am'으로 둔다 — 접힌 행이 아침이든
+    저녁이든 '그 날 최소 한 번은 나갔다'는 사실은 그대로 보존된다.
+    """
+    cols = [r[1] for r in con.execute("PRAGMA table_info(sent_history)").fetchall()]
+    if "run_type" in cols:
+        return
+    before = con.execute("SELECT COUNT(*) FROM sent_history").fetchone()[0]
+    # executescript 는 암묵적으로 먼저 COMMIT 해서 DROP/RENAME 이 트랜잭션 밖으로
+    # 나간다. 도중에 죽으면 발송 이력이 통째로 날아갈 수 있으므로 한 트랜잭션
+    # 안에서 한 문장씩 돈다 — 실패하면 _conn() 의 rollback 이 전부 되돌린다.
+    con.execute("""
+        CREATE TABLE sent_history_new (
+            ticker TEXT, send_date TEXT, grade TEXT, score REAL,
+            run_type TEXT NOT NULL DEFAULT 'am',
+            PRIMARY KEY (ticker, send_date, run_type)
+        )""")
+    con.execute("""
+        INSERT INTO sent_history_new (ticker, send_date, grade, score, run_type)
+            SELECT ticker, send_date, grade, score, 'am' FROM sent_history""")
+    con.execute("DROP TABLE sent_history")
+    con.execute("ALTER TABLE sent_history_new RENAME TO sent_history")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_sent_ticker_date "
+                "ON sent_history(ticker, send_date)")
+    after = con.execute("SELECT COUNT(*) FROM sent_history").fetchone()[0]
+    if after != before:
+        raise RuntimeError(f"sent_history 마이그레이션에서 행이 유실됐다: {before} → {after}")
+    logger.info(f"DB 마이그레이션: sent_history PK에 run_type 추가 완료 ({after}행 보존)")
+
+
 @contextmanager
 def _conn():
     con = sqlite3.connect(DB_PATH); con.row_factory = sqlite3.Row
@@ -653,7 +736,9 @@ def prev_spike_flag(cfg, prev_chg, cur_chg):
     return int(prev_chg >= g.get("prev_min", 15.0) and cur_chg <= g.get("cur_max", -8.0))
 
 
-def save_scan_results(results, scan_date):
+def save_scan_results(results, scan_date, run_type=None):
+    if run_type is None:
+        run_type = run_type_kst()
     with _conn() as con:
         for r in results:
             con.execute("""INSERT OR REPLACE INTO scan_results
@@ -665,8 +750,8 @@ def save_scan_results(results, scan_date):
                  rating_bond,rating_cp,fg_sector,fg_industry,ksic,largest_holder,
                  t_presurge,score_presurge,news_conf,news_raw,d_flow,score_flow,
                  overheat_pen,news_conf_fixed,news_raw_fixed,news_field_mix,
-                 prev_change_pct,prev_spike_flag)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 prev_change_pct,prev_spike_flag,run_type)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (scan_date, r["ticker"], r.get("name"), r.get("sector"),
                  r.get("cap_tier"),
                  r.get("score"), r.get("t"), None, r.get("d"),
@@ -686,7 +771,8 @@ def save_scan_results(results, scan_date):
                  r.get("overheat_pen"),
                  r.get("news_conf_fixed"), r.get("news_raw_fixed"),
                  r.get("news_field_mix"),
-                 r.get("prev_change_pct"), r.get("prev_spike_flag", 0)))
+                 r.get("prev_change_pct"), r.get("prev_spike_flag", 0),
+                 run_type))
 
 def save_engine_b_history(tickers, precomputed, scan_date):
     with _conn() as con:
@@ -824,10 +910,21 @@ def get_engine_b_history(ticker, scan_date=None, window_days=3):
     return [r["scan_date"] for r in rows]
 
 def was_sent_today(ticker, scan_date):
+    """그날 그 종목이 발송됐으면 등급, 아니면 None.
+
+    run_type 은 조건에 넣지 않는다 — 아침이든 저녁이든 '오늘 이미 나갔나'를
+    묻는 함수다. 다만 PK가 넓어져 하루에 두 행이 있을 수 있으니, 예전에
+    mark_sent 가 한 행에 남기던 것과 같은 기준(강한 등급 우선, 같으면 높은 점수)
+    으로 한 행을 고른다.
+    """
     with _conn() as con:
-        row = con.execute("SELECT grade FROM sent_history WHERE ticker=? AND send_date=?",
-                          (ticker,scan_date)).fetchone()
-    return row["grade"] if row else None
+        rows = con.execute(
+            "SELECT grade, score FROM sent_history WHERE ticker=? AND send_date=?",
+            (ticker, scan_date)).fetchall()
+    if not rows:
+        return None
+    best = max(rows, key=lambda r: (_GRADE_RANK.get(r["grade"], -1), r["score"] or 0))
+    return best["grade"]
 
 def get_watch_history(tickers, scan_date):
     """종목별 누적 관찰 이력 — {ticker: (누적등장, 최초이후경과, 직전공백)}.
@@ -873,25 +970,28 @@ def get_watch_history(tickers, scan_date):
 
 _GRADE_RANK = {"참고": 0, "주시": 1, "집중": 2}
 
-def mark_sent(ticker, scan_date, grade, score):
+def mark_sent(ticker, scan_date, grade, score, run_type=None):
     """그날 그 종목이 발송된 사실을 남긴다. 등급은 강등되지 않는다.
 
-    PK가 (ticker, send_date)인데 하루 두 런이 같은 날짜를 쓴다. 예전에는
-    INSERT OR REPLACE라 나중 런이 앞 런을 통째로 갈아쳤다. 아침에 집중으로 상세
-    카드가 나간 종목이 저녁 런에서 참고로 떨어지면 기록이 참고로 바뀌어, 실제로
-    받은 알림이 통계에서 사라졌다 — 실측으로 집중 5건·주시 26건이 그렇게 묻혔다
-    (라온시큐어 집중 78.4 → 참고 64.9 등). 기록된 집중 17/주시 64는 실제
-    집중 22/주시 90보다 적다.
+    PK는 (ticker, send_date, run_type)이다. 예전에는 run_type 이 없어 하루 두
+    런이 한 행으로 접혔다. INSERT OR REPLACE 이던 시절에는 나중 런이 앞 런을
+    통째로 갈아쳐서, 아침에 집중으로 상세 카드가 나간 종목이 저녁에 참고로
+    떨어지면 기록이 참고로 바뀌고 실제로 받은 알림이 통계에서 사라졌다 —
+    집중 5건·주시 26건이 그렇게 묻혔다(라온시큐어 집중 78.4 → 참고 64.9 등).
+    강등 금지를 넣어 덮어쓰기는 막았지만, 그래도 두 발송이 한 행이라 20260910
+    아침 13 + 저녁 20이 24행으로 접혔다. run_type 을 PK에 넣어 갈랐다.
 
-    그래서 이미 더 높은 등급으로 기록돼 있으면 덮어쓰지 않는다. 같은 등급이면
-    점수가 높은 쪽을 남겨 어느 런의 발송인지 되짚을 수 있게 한다.
-    한계: 한 종목이 하루에 두 등급으로 두 번 발송되면 강한 쪽만 남는다.
-    두 발송을 모두 남기려면 PK에 런 구분이 들어가야 한다(별도 과제).
+    강등 금지·같은 등급이면 높은 점수 유지는 그대로 두되, 이제 같은
+    (ticker, send_date, run_type) 안에서만 적용된다. 한 런이 같은 종목을 두 번
+    보내는 일은 없으므로 사실상 그 런의 첫 기록이 남는다.
     """
+    if run_type is None:
+        run_type = run_type_kst()
     with _conn() as con:
         row = con.execute(
-            "SELECT grade, score FROM sent_history WHERE ticker=? AND send_date=?",
-            (ticker, scan_date)).fetchone()
+            "SELECT grade, score FROM sent_history "
+            "WHERE ticker=? AND send_date=? AND run_type=?",
+            (ticker, scan_date, run_type)).fetchone()
         if row is not None:
             old_rank = _GRADE_RANK.get(row["grade"], -1)
             new_rank = _GRADE_RANK.get(grade, -1)
@@ -899,8 +999,10 @@ def mark_sent(ticker, scan_date, grade, score):
                 return
             if new_rank == old_rank and (row["score"] or 0) >= (score or 0):
                 return
-        con.execute("INSERT OR REPLACE INTO sent_history VALUES (?,?,?,?)",
-                    (ticker,scan_date,grade,score))
+        con.execute(
+            "INSERT OR REPLACE INTO sent_history "
+            "(ticker, send_date, grade, score, run_type) VALUES (?,?,?,?,?)",
+            (ticker, scan_date, grade, score, run_type))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # API 클라이언트
@@ -3398,7 +3500,7 @@ def _esc(text: str) -> str:
 
 GRADE_RANK={"집중":2,"주시":1,"참고":0}
 
-def run_step4(results,cfg,date=None,dry_run=False):
+def run_step4(results,cfg,date=None,dry_run=False,run_type=None):
     # 발송 날짜는 스캔이 쓴 날짜와 같아야 한다. 예전에는 여기서 today_kst()를 따로
     # 계산해, 런이 KST 자정을 넘기면 save_scan_results가 쓴 scan_date와 하루 어긋났다.
     # 실측: 발송 점수가 그날 스캔에 존재하지 않는 기록 128건, 그중 51건은 정확히
@@ -3406,6 +3508,7 @@ def run_step4(results,cfg,date=None,dry_run=False):
     # 크론을 앞당겨 최근에는 안 보이지만 구조는 그대로였다.
     scan_date = date or today_kst()
     today = scan_date
+    run_type = run_type or run_type_kst()
     tg=TelegramClient()
     min_score=cfg.get("grade",{}).get("min_display_score",0)
     # 필터 전 개수를 따로 잡는다. 예전에는 results를 필터 결과로 덮어쓴 뒤 그걸로
@@ -3587,7 +3690,7 @@ def run_step4(results,cfg,date=None,dry_run=False):
         for r in to_send:
             group = "list"
             if kind_ok.get(group, False):
-                mark_sent(r["ticker"], scan_date, r["grade"], r["score"])
+                mark_sent(r["ticker"], scan_date, r["grade"], r["score"], run_type)
                 sent_count += 1
             else:
                 skipped_count += 1
@@ -3629,11 +3732,17 @@ def main():
     parser.add_argument("--market",  type=str,   default="ALL", choices=["KOSPI","KOSDAQ","ALL"])
     parser.add_argument("--limit",   type=int,   default=None)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--run-type", choices=["am","pm"], default=None,
+                        help="런 구분 강제 (기본: KST 정오 기준 자동). dry-run 재현용")
     parser.add_argument("--mock",    action="store_true")
     parser.add_argument("--setup-dart", action="store_true")
     args=parser.parse_args()
 
     date_str=args.date or today_kst()
+    # 런 구분은 여기서 한 번만 정하고 프로세스 내내 고정한다. 매번 now()로
+    # 다시 재면 정오를 걸친 런에서 save_scan_results 와 mark_sent 가 갈릴 수 있다.
+    run_type = args.run_type or run_type_kst()
+    os.environ["ALPHARADAR_RUN_TYPE"] = run_type
     setup_logging(date_str); init_db()
 
     if args.setup_dart: setup_dart(); return
@@ -3645,7 +3754,7 @@ def main():
 
     start=time.time()
     logger.info("="*60)
-    logger.info(f"AlphaRadar v3.3.1  |  기준일: {date_str}")
+    logger.info(f"AlphaRadar v3.3.1  |  기준일: {date_str}  |  런: {run_type}")
     logger.info(f"S = T×{cfg['scoring'].get('w_tech',cfg['scoring'].get('w1',0.35))} + S_text×{cfg['scoring'].get('w_text',cfg['scoring'].get('w2',0.30))} + D×{cfg['scoring'].get('w_cross',cfg['scoring'].get('w3',0.35))}")
     logger.info("="*60)
 
@@ -3712,7 +3821,7 @@ def main():
 
     if args.step in (None,4):
         logger.info("▶ Step 4: 발송")
-        run_step4(results,cfg,date=date_str,dry_run=args.dry_run)
+        run_step4(results,cfg,date=date_str,dry_run=args.dry_run,run_type=run_type)
 
     logger.info(f"완료  |  소요: {time.time()-start:.1f}초")
 
