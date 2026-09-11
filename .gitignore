@@ -85,6 +85,8 @@ data/logs/*.gz
 
 # 로컬 실행 산출물 — 러너에서 재생성되거나 로컬 전용
 data/logs.zip
+# 복구 스크립트가 남기는 DB 백업 — 로컬 안전장치라 저장소에 올리지 않는다
+data/backup/
 data/*.LOCAL*.log
 data/cache/forward_returns.pkl
 data/cache/price_cache_wr.pkl
