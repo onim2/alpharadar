@@ -929,7 +929,13 @@ def was_sent_today(ticker, scan_date):
 def get_watch_history(tickers, scan_date):
     """종목별 누적 관찰 이력 — {ticker: (누적등장, 최초이후경과, 직전공백)}.
 
-    등급을 대신할 지표다. 실측(3,024건/469종목/64일, D+1 시가 진입 후 10일 내
+    ※ 아래 수치는 전부 pooled 이고 일자내로는 재현되지 않는다(2026-09-11 재검증,
+    docs/watch_history_check_20260911.md). watch_n 이 달력 시간과 얽혀 있어 pooled
+    비교가 국면 비교로 오염된다. 일자내로는 fwd1·fwd5·fwd10 무차이고, '공백0' 은
+    이 함수의 gap(최솟값 1)과 정의가 다르다. 카드 표식·정렬 근거에서 뺐다 —
+    숫자만 카드에 싣는다. 인용할 때는 이 두 가지를 같이 적을 것.
+
+    등급을 대신할 지표로 도입했었다. 실측(3,024건/469종목/64일, D+1 시가 진입 후 10일 내
     구간 최고가)에서 점수보다 훨씬 강했다.
 
       누적 등장 Spearman +0.187 (20일 +0.152)   vs   종합점수 -0.068
@@ -3500,6 +3506,17 @@ def _esc(text: str) -> str:
 
 GRADE_RANK={"집중":2,"주시":1,"참고":0}
 
+def entry_candidate(r):
+    """9/11 백테스트 진입 후보 규칙 — 이격 92~103 · 순매수 3일+ · RSI ≤ 45.
+
+    카드 정렬 1순위로만 쓴다. 발송 여부·점수·게이트에는 관여하지 않는다.
+    순매수일은 net_buy_days(최근 5거래일 중 기관+외인 순매수 일수)다 — 연속
+    일수가 아니다. 결측(None·기본값 이격 0)은 충족하지 않는다."""
+    rsi = r.get("rsi")
+    return (92 <= (r.get("disparity") or 0) <= 103
+            and (r.get("net_buy_days") or 0) >= 3
+            and rsi is not None and rsi <= 45)
+
 def run_step4(results,cfg,date=None,dry_run=False,run_type=None):
     # 발송 날짜는 스캔이 쓴 날짜와 같아야 한다. 예전에는 여기서 today_kst()를 따로
     # 계산해, 런이 KST 자정을 넘기면 save_scan_results가 쓴 scan_date와 하루 어긋났다.
@@ -3518,13 +3535,16 @@ def run_step4(results,cfg,date=None,dry_run=False,run_type=None):
     to_send = list(results)
     # 등급으로 나누지 않는다. 점수는 성과 순위를 만들지 못했고(일자내 IC -0.068,
     # 70점 이상 구간이 평균 최고상승 6.80으로 꼴찌), 🔴집중이라는 표시는 읽는 쪽에서
-    # 매수 신호로 받아들여진다. 대신 누적 관찰 이력을 붙여 보낸다(IC +0.187).
+    # 매수 신호로 받아들여진다. 관찰 이력은 숫자로만 붙인다 — 한때 근거로 삼은
+    # IC +0.187 은 pooled 착시였다(일자내 무차, get_watch_history 주석 참조).
     watch = get_watch_history([r["ticker"] for r in to_send], scan_date)
     for r in to_send:
         n, since, gap = watch.get(r["ticker"], (0, 0, None))
         r["watch_n"], r["watch_since"], r["watch_gap"] = n, since, gap
-    # 누적 관찰이 많은 순 → 같으면 공백이 큰 순(쉬었다 나온 쪽이 나았다)
-    to_send.sort(key=lambda r: (r["watch_n"], r["watch_gap"] or 0), reverse=True)
+        r["entry_ok"] = entry_candidate(r)
+    # 진입 후보 규칙 충족 → 총점 순. 관찰 횟수는 동점 정렬에만 쓴다.
+    # 예전 (watch_n, watch_gap) 정렬은 일자내 IC 가 단타 0 · 장기 음(−)이었다.
+    to_send.sort(key=lambda r: (r["entry_ok"], r["score"], r["watch_n"]), reverse=True)
 
     def phase_tag(r):
         """물밑 점수와 총점의 격차 = 기술축 관점 불일치. 감성·수급은 두 점수가 같으므로
@@ -3619,18 +3639,16 @@ def run_step4(results,cfg,date=None,dry_run=False,run_type=None):
     now=datetime.now(KST).strftime("%Y-%m-%d %H:%M")
 
     def watch_tag(r):
-        """관찰 이력 한 줄. 강조 구간은 실측 근거가 있는 곳만 표시한다."""
+        """관찰 이력 한 줄. 숫자만 싣는다 — 데이터이지 주장이 아니다.
+        ⟨주목⟩⟨적기⟩⟨눌림후⟩ 표식은 뺐다. 일자내로 재면 fwd1·fwd5·fwd10 전부 무차였고
+        ⟨눌림후⟩ 는 fwd20 부호가 표시 방향과 반대였다(docs/watch_history_check_20260911.md)."""
         n, since, gap = r.get("watch_n",0), r.get("watch_since",0), r.get("watch_gap")
         if n == 0:
-            return "신규"                      # 첫 등장은 중앙값 -0.14 — 기대할 것이 없다
+            return "신규"
         s = f"{n+1}회째 · {since}일 관찰"
         if gap is not None and gap >= 2:
             s += f" · {gap}일 만에 재등장"
-        mark = []
-        if 3 <= n <= 9:   mark.append("주목")   # 누적 4~10회 = 성과 최상 구간
-        if 8 <= since <= 14: mark.append("적기") # 최초 등장 후 8~14일 = +10% 54.0%
-        if gap is not None and 4 <= gap <= 7: mark.append("눌림후")  # 공백 4~7일 = 평균 15.71
-        return s + ("  ⟨" + "·".join(mark) + "⟩" if mark else "")
+        return s
 
     msg_items = []
     msg_items.append(("header",
@@ -3638,8 +3656,12 @@ def run_step4(results,cfg,date=None,dry_run=False,run_type=None):
         f"탐지 {detected}종목 → 발송 {len(to_send)}종목  (기준 {min_score}점 이상)\n"
         f"<i>매수 신호 아님. 차트·수급 확인 후 판단하세요.</i>"))
     if to_send:
-        # 정렬이 점수순이 아니라는 걸 밝혀둔다. 번호만 보면 1번이 최고점으로 읽힌다.
-        lines = ["<b>관찰 종목</b>  <i>— 누적 관찰 순 (점수순 아님)</i>",
+        # 정렬 기준을 밝혀둔다. 규칙 충족 종목이 앞에 오면 번호가 점수순으로 읽히지
+        # 않는데, 몇 번까지가 충족분인지 적어두지 않으면 순서를 오해한다.
+        n_entry = sum(1 for r in to_send if r["entry_ok"])
+        order = (f"진입 후보 규칙 충족 {n_entry}종목 먼저 → 총점순" if n_entry
+                 else "총점순 (진입 후보 규칙 충족 없음)")
+        lines = [f"<b>관찰 종목</b>  <i>— {order}</i>",
                  "━━━━━━━━━━━━━━━━━━━━"]
         # 등급을 없애면서 상세 블록까지 같이 떨어져 나갔었다. 상세는 등급에 딸린 것이
         # 아니라 종목 판단에 필요한 정보였으므로, 옛 집중/주시가 받던 fmt() 블록을
@@ -3647,7 +3669,7 @@ def run_step4(results,cfg,date=None,dry_run=False,run_type=None):
         for i, r in enumerate(to_send, 1):
             lines.append(fmt(i, r) + f"\n   👁 {watch_tag(r)}")
         lines.append("\n━━━━━━━━━━━━━━━━━━━━")
-        lines.append("⟨주목⟩ 누적 4~10회 · ⟨적기⟩ 최초 후 8~14일 · ⟨눌림후⟩ 4~7일 공백")
+        lines.append("진입 후보 규칙: 이격 92~103 · 순매수 5일 중 3일+ · RSI ≤ 45")
         lines.append("⟨물밑⟩ 아직 안 튀어나온 구조 · ⟨돌출⟩ 이미 움직인 구조  (검증 중)")
         lines.append("차트·수급·관찰 이력 전체는 대시보드에서")
         msg_items.append(("list", "\n".join(lines)))
@@ -3700,9 +3722,9 @@ def run_step4(results,cfg,date=None,dry_run=False,run_type=None):
                 f"(다음 실행 시 재발송 대상)"
             )
         logger.info(f"DB 기록: {sent_count}개 / 전체 to_send {len(to_send)}개")
-    _w4 = sum(1 for r in to_send if 3 <= r.get("watch_n", 0) <= 9)
+    _entry = sum(1 for r in to_send if r.get("entry_ok"))
     _new = sum(1 for r in to_send if r.get("watch_n", 0) == 0)
-    logger.info(f"발송: {len(to_send)}종목 | 누적 4~10회 {_w4} | 신규 {_new}")
+    logger.info(f"발송: {len(to_send)}종목 | 진입 후보 {_entry} | 신규 {_new}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DART 법인코드 초기화
