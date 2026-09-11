@@ -117,14 +117,14 @@ NotImplementedError: (<StringDtype(storage='python', na_value=nan)>, array(['Clo
 * 가중치 그리드 서치 결과는 채택하지 않는다(walk-forward 기각).
 * 종합점수의 일자내 역상관은 **방향은 일관되나 유의성 미확정**이다. 가중치
   재배분으로 다룰 문제가 아니고, 점수 구성 자체의 과제다. 표본을 더 쌓아
-  (특히 겹침 없는 일자) 재판정할 것 — `--dedup-bars` 기준으로 본다.
+  (특히 겹침 없는 일자) 재판정할 것 — 겹침 제외 기준으로 본다(스크립트 기본값).
 * `S_text` 단독이 유일하게 부호가 +라는 점은 기록해 둔다. 다만 뉴스 기반이라
   lookahead 의심이 남아 있고 유의하지 않으므로, 이것만으로 비중을 올리지 말 것.
 
 ## 재현
 
 ```bash
-python analyze_wtext.py                 # 전수 기준
-python analyze_wtext.py --dedup-bars    # 진입 바 겹침 제외 (판정은 이쪽 기준)
+python analyze_wtext.py                    # 진입 바 겹침 제외 (기본 · 판정 기준)
+python analyze_wtext.py --no-dedup-bars    # 전수 기준
 python backtest.py --grid-search --walk-forward --grid-horizon 5
 ```

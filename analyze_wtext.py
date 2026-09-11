@@ -20,7 +20,8 @@
 한계
  * 휴장이 끼면 두 scan_date 가 같은 진입 바를 써서 fwd 값이 동일해진다
    (8/17·8/18 실측). 그대로 세면 독립 단면 수가 부풀어 부호검정이 후해진다.
-   --dedup-bars 로 뒤 일자를 표본에서 뺄 수 있다. 기본은 끈다(전수 기준).
+   뒤 일자를 표본에서 뺀다(기본). 전수로 보려면 --no-dedup-bars — 판정은
+   제외 기준으로 할 것. IC 계열에서는 이 차이로 유의성이 뒤집힌다.
  * score_t 가 NULL 인 행이 있어 T 축만 단면 수가 적다. 축별 표에 같이 찍는다.
  * s_text 는 뉴스 기반이라 lookahead 의심이 남는다. 그래서 정형만(T+D)을
    따로 찍는다 — 이쪽이 같은 방향이면 해석이 안전하다.
@@ -46,8 +47,8 @@ ap.add_argument("--proposed", type=float, default=0.20, help="제안 w_text")
 ap.add_argument("--sweep", nargs="+", type=float,
                 default=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0])
 ap.add_argument("--boot", type=int, default=10000, help="부트스트랩 반복 (기본 10000)")
-ap.add_argument("--dedup-bars", action="store_true",
-                help="휴장으로 진입 바가 겹친 뒤 일자를 표본에서 뺀다")
+ap.add_argument("--dedup-bars", action=argparse.BooleanOptionalAction, default=True,
+                help="휴장으로 진입 바가 겹친 뒤 일자를 표본에서 뺀다 (기본 켜짐)")
 ap.add_argument("--seed", type=int, default=0)
 a = ap.parse_args()
 
@@ -94,9 +95,9 @@ if collided:
     print(f"진입 바 겹침 일자 {len(collided)}개: {', '.join(collided)}")
     if a.dedup_bars:
         d = d[~d["scan_date"].isin(collided)]
-        print("  → --dedup-bars: 표본에서 제외")
+        print("  → 제외 (기본). 전수로 보려면 --no-dedup-bars")
     else:
-        print("  → 전수 기준으로 둔다(--dedup-bars 로 제외 가능). 부호검정은 그만큼 후하다.")
+        print("  → --no-dedup-bars: 전수 유지. 부호검정이 그만큼 후하다.")
 
 sz = d.groupby("cs").size()
 keep = sz[sz >= a.min_cs].index
