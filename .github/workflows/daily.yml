@@ -120,6 +120,18 @@ jobs:
           echo "forward outcomes 추적 실행"
           python track_outcomes.py
 
+      # stockcard 수급 적재 — DB 커밋 '앞'이어야 이번 런의 행이 실린다.
+      # 대상은 그날 스캔된 종목 + data/watchlist.txt 로 20~30종목이고,
+      # 종목당 KIS 1콜이라 실측 2초 수준이다(22종목 기준). 실패해도 넘어간다.
+      - name: Collect stockcard investor flow
+        if: success()
+        continue-on-error: true
+        env:
+          KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KIS_IS_REAL:    ${{ secrets.KIS_IS_REAL }}
+        run: python stockcard.py --step flow
+
       - name: Commit DB & DART master cache
         if: always()
         run: |
@@ -130,6 +142,7 @@ jobs:
           git add data/cache/dart_sector_map_v2.pkl   2>/dev/null || true
           git add data/cache/dart_corp_codes.pkl      2>/dev/null || true
           git add data/logs/scanner_*.log             2>/dev/null || true
+          git add data/logs/stockcard_*.log           2>/dev/null || true
           if git diff --staged --quiet; then
             echo "커밋할 변경사항 없음"
             exit 0
@@ -157,6 +170,32 @@ jobs:
           done
           echo "::error::5회 재시도 후에도 푸시 실패"
           exit 1
+
+      # 차트는 DB 커밋 '뒤'에 그린다. PNG는 DB에 들어가지 않으므로 커밋을 기다릴
+      # 이유가 없고, 여기서 넘어져도 스캔 결과가 이미 저장된 뒤라 잃는 것이 없다.
+      #
+      # ubuntu 러너에는 한글 폰트가 없어 종목명이 □□□ 로 나온다. 로컬(macOS)에서는
+      # 드러나지 않는 경로라 폰트를 명시적으로 깔고, matplotlib 폰트 캐시를 지워
+      # 새로 깐 폰트를 인식시킨다. 폰트가 없으면 코드만으로 그리는 폴백이 있으므로
+      # 설치가 실패해도 차트 자체는 나온다.
+      - name: Render stockcard charts
+        if: always()
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq fonts-nanum
+          rm -rf ~/.cache/matplotlib
+          python stockcard.py --step chart
+
+      # PNG는 git에 커밋하지 않는다 — OHLC에서 언제든 재생성 가능하고, git은 지운
+      # 파일도 히스토리에 영구 보관한다(8/24 원칙). retention 30일은 요구사항 그대로다.
+      - name: Upload stockcard charts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stockcard-charts-${{ github.run_id }}
+          path: data/charts/
+          retention-days: 30
+          if-no-files-found: ignore
 
       # 로그는 DB와 같은 커밋에 묶여 있어 커밋이 실패하면 같이 사라진다.
       # 성공·실패 무관하게 매 런 아티팩트로 남겨 사후 추적을 보장한다.

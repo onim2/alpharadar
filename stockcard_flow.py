@@ -168,12 +168,13 @@ def main(argv=None):
         tickers = [str(t).zfill(6) for t in args.ticker]
         sc.logger().info(f"대상: 지정 {len(tickers)}종목")
     else:
+        # run_type 으로 좁히지 않는 이유는 resolve_targets docstring 참고.
         tickers, origin = sc.resolve_targets(
-            scan_date, run_type, scfg.get("watchlist_path"))
+            scan_date, None, scfg.get("watchlist_path"))
         sc.logger().info(
             f"대상 {origin['total']}종목 "
             f"(스캔 {origin['scan']} + watchlist 전용 {origin['watchlist_only']}) "
-            f"| {scan_date} {run_type}")
+            f"| {scan_date} 라벨={run_type}")
 
     if not tickers:
         sc.logger().warning("대상 종목이 없다 — 적재 생략")

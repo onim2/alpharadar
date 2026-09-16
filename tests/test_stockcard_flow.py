@@ -163,6 +163,30 @@ def test_watchlist_파일이_없으면_빈_목록(tmp_path):
     assert sc.load_watchlist(tmp_path / "없음.txt") == []
 
 
+def test_대상은_런을_가리지_않는다(db, tmp_path):
+    """자정을 넘긴 저녁 런은 'am'으로 찍힌다(실측 9/7 00:23 도착).
+    거기서 런을 좁혀 잡으면 대상이 0종목이 되고 카드가 조용히 사라진다."""
+    with ar._conn() as con:
+        con.execute("CREATE TABLE scan_results "
+                    "(scan_date TEXT, ticker TEXT, run_type TEXT)")
+        con.executemany("INSERT INTO scan_results VALUES (?,?,?)", [
+            ("20260916", "000660", "am"),
+            ("20260916", "005930", "pm"),
+            ("20260915", "035720", "am"),   # 다른 날 — 들어오면 안 된다
+        ])
+
+    w = tmp_path / "w.txt"
+    w.write_text("115440\n", encoding="utf-8")
+
+    tickers, origin = sc.resolve_targets("20260916", None, w)
+    assert tickers == ["000660", "005930", "115440"]
+    assert origin["scan"] == 2 and origin["watchlist_only"] == 1
+
+    # 런을 지정하면 좁아진다는 것도 확인해 둔다(호출부가 쓰지 않을 뿐 기능은 남긴다)
+    only_am, _ = sc.resolve_targets("20260916", "am", w)
+    assert only_am == ["000660", "115440"]
+
+
 def test_저장소_watchlist에_우리넷이_있다():
     """첫 검증 표본이 풀 밖 종목이라 watchlist 없이는 카드가 나오지 않는다."""
     assert "115440" in sc.load_watchlist("data/watchlist.txt")

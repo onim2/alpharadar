@@ -132,6 +132,12 @@ def resolve_targets(scan_date: str, run_type: str | None = None,
                     watchlist_path=None) -> tuple[list[str], dict]:
     """카드 대상 = 스캔 통과 종목 ∪ watchlist.
 
+    run_type 기본값이 None(그날 전체)인 것은 의도다. 런 구분은 KST 정오로 재는데,
+    저녁 런이 5시간 넘게 밀려 자정을 넘기면 'am'으로 찍힌다(실측: 9/7 00:23 도착).
+    여기서 런을 좁혀 잡으면 그런 날 대상이 0종목이 되고, 카드가 조용히 사라진다.
+    같은 날 스캔된 종목은 어느 런이든 카드 대상이므로 좁힐 이유가 없다.
+    행에 남기는 run_type 라벨은 별개다 — 그건 '누가 마지막으로 썼나'를 뜻한다.
+
     반환: (정렬된 종목 목록, 출처 요약). 출처는 로그·보고용이다.
     """
     scanned = scan_targets(scan_date, run_type)
