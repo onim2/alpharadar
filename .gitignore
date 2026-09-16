@@ -91,6 +91,12 @@ data/*.LOCAL*.log
 data/cache/forward_returns.pkl
 data/cache/price_cache_wr.pkl
 
+# stockcard — 재현 가능한 산출물은 커밋하지 않는다(8/24 원칙).
+# 차트 PNG는 OHLC에서 언제든 다시 그릴 수 있고, Actions artifact(30일)로 남긴다.
+# DART 원본 공시 ZIP은 rcept_no 단위 멱등 캐시라 저장소에 실을 이유가 없다.
+data/charts/
+data/cache/dart_doc/
+
 # afterhours 재적재용 임시 산출물 (Actions 내부에서만 쓴다)
 afterhours_rows.json
 afterhours_*.csv
