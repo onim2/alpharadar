@@ -90,6 +90,9 @@ data/backup/
 data/*.LOCAL*.log
 data/cache/forward_returns.pkl
 data/cache/price_cache_wr.pkl
+# 등락률 캐시 — scripts/build_px_cache.py 가 FDR 에서 언제든 다시 만든다.
+# 메타(생성일·조회범위)를 캐시 안에 넣어 두므로 어느 시점 것인지 파일만 봐도 안다.
+data/cache/px_*.pkl
 
 # stockcard — 재현 가능한 산출물은 커밋하지 않는다(8/24 원칙).
 # 차트 PNG는 OHLC에서 언제든 다시 그릴 수 있고, Actions artifact(30일)로 남긴다.

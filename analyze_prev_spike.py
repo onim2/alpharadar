@@ -20,8 +20,35 @@
 한계: 관측 바를 등락률 일치로 역추적하므로, 같은 값이 이틀 연속 나오면
 가장 늦은 바를 택한다. 일치 실패 행은 --report-unmatched로 볼 수 있다.
 """
-import sqlite3, argparse, pickle, statistics as st
+import sqlite3, argparse, pickle, random, statistics as st
+from math import comb
 from pathlib import Path
+
+
+def sign_p(neg: int, n: int) -> float:
+    """일자 스프레드 부호의 양측 이항검정. 0인 일자는 표본에서 뺀다(관례).
+
+    '몇 건의 큰 손실이 평균을 끈 것인지, 방향이 꾸준한 것인지'를 가르는 자다.
+    평균차만 보면 이상치 하나에 끌려간다.
+    """
+    if n == 0:
+        return float("nan")
+    k = max(neg, n - neg)
+    tail = sum(comb(n, j) for j in range(k, n + 1)) / (2 ** n)
+    return min(1.0, 2 * tail)
+
+
+def boot_ci(xs, iters: int, seed: int, lo_q=0.025, hi_q=0.975):
+    """일자 단위 부트스트랩 신뢰구간.
+
+    일자를 리샘플한다 — 종목을 리샘플하면 같은 날 여러 종목이 함께 움직인
+    것을 독립 표본으로 세어 구간이 실제보다 좁아진다.
+    """
+    if len(xs) < 2:
+        return (float("nan"), float("nan"))
+    rnd = random.Random(seed)
+    means = sorted(st.mean(rnd.choices(xs, k=len(xs))) for _ in range(iters))
+    return means[int(lo_q * iters)], means[min(int(hi_q * iters), iters - 1)]
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--db", default="data/scores_history.db")
@@ -37,6 +64,9 @@ ap.add_argument("--arm", default="both", choices=["both", "cur_only", "prev_only
                      "/ prev_only=전일급등만(당일 급락 아님). 열세가 '당일 급락'만으로 "
                      "설명되면 prev 항을 새로 넣을 이유가 없다 — 그걸 가르는 갈래다.")
 ap.add_argument("--quiet-rows", action="store_true", help="종목별 명세를 찍지 않는다")
+ap.add_argument("--boot", type=int, default=4000, help="부트스트랩 반복(일자 리샘플)")
+ap.add_argument("--seed", type=int, default=20260826,
+                help="부트스트랩 시드. 고정해야 판정이 재현된다")
 a = ap.parse_args()
 
 px = pickle.loads(Path(a.px).read_bytes())
@@ -101,8 +131,8 @@ if hits and not a.quiet_rows:
 # ── 일자내 스프레드 ───────────────────────────────────────────────────
 IDX = {"fwd1": 0, "fwd5": 1, "mfe5": 2, "mae10": 3}
 print(f"\n{'지평':<8}{'유효일자':>8}{'조건군n':>8}{'평균차':>9}{'중앙차':>9}"
-      f"{'열세일자':>9}{'조건군평균':>11}{'대조군평균':>11}")
-print("-" * 74)
+      f"{'열세일자':>9}{'95% CI':>18}{'부호p':>9}{'조건군평균':>11}{'대조군평균':>11}")
+print("-" * 101)
 for name, i in IDX.items():
     dm, dmd, ns, hv, cv = [], [], 0, [], []
     for sd, (h, c) in by_date.items():
@@ -113,13 +143,22 @@ for name, i in IDX.items():
         dmd.append(st.median(hs) - st.median(cs))
         ns += len(hs); hv += hs; cv += cs
     if not dm:
-        print(f"{name:<8}{'—':>8}{'—':>8}{'—':>9}{'—':>9}{'—':>9}{'—':>11}{'—':>11}")
+        print(f"{name:<8}{'—':>8}{'—':>8}{'—':>9}{'—':>9}{'—':>9}"
+              f"{'—':>18}{'—':>9}{'—':>11}{'—':>11}")
         continue
     worse = sum(1 for x in dm if x < 0)
+    nz = [x for x in dm if x != 0]
+    lo, hi = boot_ci(dm, a.boot, a.seed)
+    p = sign_p(sum(1 for x in nz if x < 0), len(nz))
     print(f"{name:<8}{len(dm):>8}{ns:>8}{st.mean(dm):>9.2f}{st.mean(dmd):>9.2f}"
-          f"{worse:>6}/{len(dm):<3}{st.mean(hv):>11.2f}{st.mean(cv):>11.2f}")
+          f"{worse:>6}/{len(dm):<3}{f'[{lo:.2f}, {hi:.2f}]':>18}{p:>9.4f}"
+          f"{st.mean(hv):>11.2f}{st.mean(cv):>11.2f}")
 
 print(f"\n[읽는 법] 평균차·중앙차는 (조건군 - 같은날 대조군)이다. 음수면 열세.")
 print(f"          '열세일자'는 스프레드가 음수인 일자 수 — 몇 건의 큰 손실이")
 print(f"          평균을 끄는 것인지 방향이 꾸준한 것인지를 가른다.")
 print(f"          mae10은 낙폭이라 음수차가 곧 '더 깊이 밀렸다'는 뜻이다.")
+print(f"          95% CI는 일자 리샘플 부트스트랩({a.boot}회, seed={a.seed}).")
+print(f"          종목이 아니라 일자를 리샘플한다 — 같은 날 여러 종목이 함께")
+print(f"          움직인 것을 독립 표본으로 세면 구간이 실제보다 좁아진다.")
+print(f"          부호p는 일자 스프레드 부호의 양측 이항검정(0인 일자 제외).")
