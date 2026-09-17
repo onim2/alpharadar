@@ -157,8 +157,11 @@ def main(argv=None):
     p.add_argument("--ticker", action="append", help="특정 종목만 (반복 지정 가능)")
     p.add_argument("--date", default=None, help="대상 판정 기준일 YYYYMMDD (기본: 오늘)")
     p.add_argument("--run-type", choices=["am", "pm"], default=None)
+    p.add_argument("--db", default=None,
+                   help="쓸 DB 경로. 없으면 실전 DB에 쓰지 않는다")
     args = p.parse_args(argv)
 
+    sc.logger().info(f"DB: {sc.resolve_db(args.db)}")
     cfg = sc.load_config()
     scfg = sc.sc_config(cfg)
     scan_date = (args.date or ar.today_kst()).replace("-", "")

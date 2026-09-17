@@ -167,7 +167,13 @@ def main(argv=None):
     p.add_argument("--ticker", action="append")
     p.add_argument("--date", default=None)
     p.add_argument("--run-type", choices=["am", "pm"], default=None)
+    # 차트는 DB에 쓰지 않는다(종목명을 읽기만 한다). 그래서 실전 DB 가드를
+    # 걸지 않되, 사본으로 돌리고 싶을 때를 위해 경로는 받아둔다.
+    p.add_argument("--db", default=None, help="종목명을 읽을 DB 경로 (읽기 전용)")
     args = p.parse_args(argv)
+
+    if args.db:
+        ar.DB_PATH = Path(args.db)
 
     scfg = sc.sc_config()
     ccfg = scfg.get("chart", {}) or {}

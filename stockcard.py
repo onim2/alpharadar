@@ -50,7 +50,13 @@ def main(argv=None) -> int:
     p.add_argument("--date", default=None, help="기준일 YYYYMMDD 또는 YYYY-MM-DD")
     p.add_argument("--run-type", choices=["am", "pm"], default=None,
                    help="런 구분 강제 (기본: KST 정오 기준 자동)")
+    p.add_argument("--db", default=None,
+                   help="쓸 DB 경로. 없으면 실전 DB에 쓰지 않는다 "
+                        "(Actions 는 STOCKCARD_ALLOW_LIVE_DB=1 로 허용)")
     args = p.parse_args(argv)
+
+    db = sc.resolve_db(args.db)
+    sc.logger().info(f"DB: {db}")
 
     cfg = sc.load_config()
     scfg = sc.sc_config(cfg)

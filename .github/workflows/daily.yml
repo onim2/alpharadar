@@ -130,6 +130,10 @@ jobs:
           KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY }}
           KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
           KIS_IS_REAL:    ${{ secrets.KIS_IS_REAL }}
+          # 실전 DB 쓰기는 여기서만 허용한다. 로컬 CLI 는 --db 로 사본을 받아야
+          # 하고, 지정하지 않으면 아무것도 하지 않고 종료한다 — 로컬 실행이
+          # 추적 중인 DB에 테이블을 만들어 브랜치 diff 로 새는 것을 막는다.
+          STOCKCARD_ALLOW_LIVE_DB: '1'
         run: python stockcard.py --step flow
 
       - name: Commit DB & DART master cache
@@ -181,6 +185,10 @@ jobs:
       - name: Render stockcard charts
         if: always()
         continue-on-error: true
+        env:
+          # 차트는 DB에 쓰지 않지만 종목명을 읽는다. 같은 진입점(stockcard.py)을
+          # 쓰므로 가드 통과용으로 함께 준다.
+          STOCKCARD_ALLOW_LIVE_DB: '1'
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq fonts-nanum
           rm -rf ~/.cache/matplotlib

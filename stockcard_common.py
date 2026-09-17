@@ -8,6 +8,7 @@
 """
 
 import logging
+import os
 import re
 import sys
 from datetime import datetime
@@ -59,6 +60,42 @@ def logger() -> logging.Logger:
 def now_kst() -> str:
     """수집 시각(as_of). 초 단위 ISO, KST 고정."""
     return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ── DB 경로 안전장치 ─────────────────────────────────────────────────────────
+
+LIVE_DB = Path("data/scores_history.db")
+ENV_ALLOW_LIVE = "STOCKCARD_ALLOW_LIVE_DB"
+
+
+class LiveDBRefused(SystemExit):
+    """실전 DB 쓰기를 막았을 때. SystemExit 을 상속해 CLI에서 바로 종료된다."""
+
+
+def resolve_db(explicit=None) -> Path:
+    """쓸 DB 경로를 정하고 alpharadar.DB_PATH 에 박는다.
+
+    실전 DB(data/scores_history.db)는 git 이 추적하고 Actions 가 매 런 커밋한다.
+    로컬에서 무심코 CLI 를 돌리면 그 파일에 테이블이 생기고, 그게 브랜치 diff 로
+    새어 나간다 — 2026-09-16 에 실제로 그랬다. 그래서 기본값을 '거부'로 둔다.
+
+      --db PATH                  명시한 경로에 쓴다 (사본·임시 DB)
+      STOCKCARD_ALLOW_LIVE_DB=1  실전 DB 허용 — Actions 스텝에서만 설정한다
+      둘 다 없으면                아무것도 하지 않고 종료
+    """
+    if explicit:
+        p = Path(explicit)
+    elif os.getenv(ENV_ALLOW_LIVE, "").strip().lower() in ("1", "true", "yes", "y"):
+        p = LIVE_DB
+    else:
+        raise LiveDBRefused(
+            f"실전 DB({LIVE_DB})에 쓰지 않는다. 다음 중 하나를 지정할 것:\n"
+            f"  --db <경로>                   사본이나 임시 DB에 쓴다\n"
+            f"                                 (예: cp {LIVE_DB} /tmp/t.db && --db /tmp/t.db)\n"
+            f"  {ENV_ALLOW_LIVE}=1   실전 DB 허용 — Actions 에서만 쓴다"
+        )
+    ar.DB_PATH = p
+    return p
 
 
 def load_config() -> dict:

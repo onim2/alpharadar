@@ -163,6 +163,29 @@ def test_watchlist_파일이_없으면_빈_목록(tmp_path):
     assert sc.load_watchlist(tmp_path / "없음.txt") == []
 
 
+def test_db경로를_지정하지_않으면_실전DB에_쓰지_않는다(monkeypatch):
+    """2026-09-16 에 로컬 CLI 가 추적 중인 DB에 빈 테이블을 만들었다.
+    브랜치 diff 로 새어 나가는 경로라 기본값을 '거부'로 둔다."""
+    monkeypatch.delenv(sc.ENV_ALLOW_LIVE, raising=False)
+    before = ar.DB_PATH
+    with pytest.raises(SystemExit) as e:
+        sc.resolve_db(None)
+    assert str(sc.LIVE_DB) in str(e.value)
+    assert ar.DB_PATH == before, "거부했는데 경로가 바뀌었다"
+
+
+def test_db경로를_명시하면_그곳에_쓴다(tmp_path, monkeypatch):
+    monkeypatch.delenv(sc.ENV_ALLOW_LIVE, raising=False)
+    p = tmp_path / "copy.db"
+    assert sc.resolve_db(p) == p and ar.DB_PATH == p
+
+
+def test_환경변수로만_실전DB가_열린다(monkeypatch):
+    """Actions 스텝에서만 설정한다."""
+    monkeypatch.setenv(sc.ENV_ALLOW_LIVE, "1")
+    assert sc.resolve_db(None) == sc.LIVE_DB
+
+
 def test_대상은_런을_가리지_않는다(db, tmp_path):
     """자정을 넘긴 저녁 런은 'am'으로 찍힌다(실측 9/7 00:23 도착).
     거기서 런을 좁혀 잡으면 대상이 0종목이 되고 카드가 조용히 사라진다."""
