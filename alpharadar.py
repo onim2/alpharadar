@@ -2857,6 +2857,11 @@ def run_step1(precomputed,cfg,date=None):
             "net_buy_total":p.get("net_buy_total",0),"retail_buy_days":p.get("retail_buy_days",0),
             "inst_net":p.get("inst_net",0),"foreign_net":p.get("foreign_net",0),
             "current_price":p.get("current_price",0),"change_pct":p.get("change_pct",0.0),
+            # D-5 shadow. 이 dict는 명시 화이트리스트라 여기 없는 키는 POOL_B
+            # ({**meta})를 거쳐 run_step3까지 영영 오지 않는다. 그래서 8/26 이후
+            # 400행의 prev_change_pct가 전부 0으로 찍혔고 prev_spike_flag도 0이었다
+            # — 값은 _precompute_ticker(2055)에서 제대로 계산되고 있었다.
+            "prev_change_pct":p.get("prev_change_pct",0.0),
             "rsi":p.get("rsi",50.0),"bb_pos":p.get("bb_pos",50.0),
             "hype_slope":p.get("hype_slope",0),"hype_rank":p.get("hype_rank",9999),
         }
