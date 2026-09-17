@@ -220,16 +220,30 @@ CREATE TABLE IF NOT EXISTS investor_flow (
 CREATE INDEX IF NOT EXISTS idx_investor_flow_ticker_date
     ON investor_flow (ticker, date);
 
--- 날짜 단위 값(투자자와 무관한 4컬럼). investor_flow 세 행에 같은 값을 세 번
--- 싣지 않으려고 분리했다.
+-- 날짜 단위 값. investor_flow 세 행에 같은 값을 세 번 싣지 않으려고 분리했다.
+--
+-- 가격이 두 개인 것은 실제로 두 개이기 때문이다. 2026-09-14부터 KIS stck_clpr 과
+-- FDR Close 가 갈린다(9/11 이전은 완전 일치). KIS 계열은 자기 prdy_vrss 와 닫혀
+-- 있어 — 전일 stck_clpr 차분 = prdy_vrss 가 두 종목 6일 전부 성립 — 정규장 종가가
+-- 아니라 시간외를 반영한 '익일 기준가'다.
+--
+--   close_krx   정규장 종가 (FDR). **정본.** 파이프라인의 등락률·RSI·이격도·MA가
+--               전부 이 계열에서 나오므로 지표와 비교 가능한 값은 이쪽뿐이다.
+--   base_price  익일 기준가 (KIS). 다음 날 등락률의 분모가 되는 값.
+--   base_chg    KIS prdy_vrss — '기준가 대비'다. FDR 종가 대비 등락률과 다른 숫자이니
+--               scan_results.change_pct 와 같은 줄에 놓고 비교하지 말 것.
+--
+-- 둘의 차이(base_price - close_krx)가 곧 시간외에서 움직인 폭이다. 카드에서는
+-- 두 줄로 병기하고, 차이 자체를 시간외 수급 신호로 읽는다.
 CREATE TABLE IF NOT EXISTS investor_flow_daily (
-    ticker   TEXT NOT NULL,
-    date     TEXT NOT NULL,
-    close    INTEGER,             -- stck_clpr
-    chg      INTEGER,             -- prdy_vrss
-    sign     TEXT,                -- prdy_vrss_sign
-    as_of    TEXT NOT NULL,
-    run_type TEXT,
+    ticker     TEXT NOT NULL,
+    date       TEXT NOT NULL,
+    close_krx  INTEGER,           -- 정규장 종가 (FDR) — 정본
+    base_price INTEGER,           -- 익일 기준가 (KIS stck_clpr, 시간외 반영)
+    base_chg   INTEGER,           -- KIS prdy_vrss — 기준가 대비
+    base_sign  TEXT,              -- KIS prdy_vrss_sign
+    as_of      TEXT NOT NULL,
+    run_type   TEXT,
     PRIMARY KEY (ticker, date)
 );
 """

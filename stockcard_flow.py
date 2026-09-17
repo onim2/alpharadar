@@ -43,10 +43,12 @@ WHERE excluded.as_of > investor_flow.as_of
 """
 
 _UPSERT_DAILY = """
-INSERT INTO investor_flow_daily (ticker, date, close, chg, sign, as_of, run_type)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+INSERT INTO investor_flow_daily
+    (ticker, date, close_krx, base_price, base_chg, base_sign, as_of, run_type)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(ticker, date) DO UPDATE SET
-    close = excluded.close, chg = excluded.chg, sign = excluded.sign,
+    close_krx = excluded.close_krx, base_price = excluded.base_price,
+    base_chg = excluded.base_chg, base_sign = excluded.base_sign,
     as_of = excluded.as_of, run_type = excluded.run_type
 WHERE excluded.as_of > investor_flow_daily.as_of
 """
@@ -66,7 +68,34 @@ def fetch_investor_rows(ticker: str) -> list[dict]:
     return rows if isinstance(rows, list) else []
 
 
-def unpivot(ticker: str, raw: dict, as_of: str, run_type: str | None):
+def fdr_closes(ticker: str, dates) -> dict:
+    """정규장 종가(FDR) — 정본.
+
+    KIS stck_clpr 은 2026-09-14부터 시간외를 반영한 '익일 기준가'라 값이 다르다.
+    파이프라인의 등락률·RSI·이격도·MA 가 전부 FDR 계열에서 나오므로, 카드에서
+    지표와 나란히 놓을 수 있는 가격은 이쪽뿐이다.
+
+    실패하면 빈 dict — close_krx 가 null 로 남을 뿐 수급 적재는 계속된다.
+    """
+    if not dates:
+        return {}
+    try:
+        import FinanceDataReader as fdr
+
+        lo, hi = min(dates), max(dates)
+        df = fdr.DataReader(str(ticker).zfill(6),
+                            f"{lo[:4]}-{lo[4:6]}-{lo[6:]}",
+                            f"{hi[:4]}-{hi[4:6]}-{hi[6:]}")
+        if df is None or not len(df) or "Close" not in df.columns:
+            return {}
+        return {d.strftime("%Y%m%d"): int(v) for d, v in df["Close"].items()}
+    except Exception as e:
+        sc.logger().warning(f"FDR 종가 조회 실패 ({ticker}): {type(e).__name__}: {e}")
+        return {}
+
+
+def unpivot(ticker: str, raw: dict, as_of: str, run_type: str | None,
+            close_krx=None):
     """원시 1행(wide) → 투자자 3행(long) + 날짜행 1건.
 
     6개 값이 전부 결측인 투자자는 행을 만들지 않는다. 미집계 구간을 null 행으로
@@ -86,8 +115,9 @@ def unpivot(ticker: str, raw: dict, as_of: str, run_type: str | None):
 
     sign = str(raw.get("prdy_vrss_sign") or "").strip() or None
     daily = (ticker, date,
-             sc.to_int_or_none(raw.get("stck_clpr")),
-             sc.to_int_or_none(raw.get("prdy_vrss")),
+             close_krx,                                  # 정규장 종가 (FDR, 정본)
+             sc.to_int_or_none(raw.get("stck_clpr")),    # 익일 기준가 (KIS)
+             sc.to_int_or_none(raw.get("prdy_vrss")),    # 기준가 대비
              sign, as_of, run_type)
     return flow, daily
 
@@ -132,8 +162,17 @@ def collect(tickers, run_type=None, as_of=None, max_rows=30) -> dict:
                     "SELECT date, investor, as_of FROM investor_flow WHERE ticker = ?",
                     (ticker,))
             }
-            for raw in raws[:max_rows]:
-                flow, daily = unpivot(ticker, raw, as_of, run_type)
+            window = raws[:max_rows]
+            # 정규장 종가는 FDR 에서 따로 받는다. KIS 계열과 다른 숫자이고,
+            # 지표와 비교 가능한 쪽은 FDR 이다(2026-09-14 이후 두 계열이 갈린다).
+            closes = fdr_closes(
+                ticker, [str(r.get("stck_bsop_date", "")).strip()
+                         for r in window if r.get("stck_bsop_date")])
+
+            for raw in window:
+                flow, daily = unpivot(
+                    ticker, raw, as_of, run_type,
+                    closes.get(str(raw.get("stck_bsop_date", "")).strip()))
                 for row in flow:
                     # 통계는 투자자 행 기준으로만 센다. 날짜행은 같은 규칙으로
                     # 움직이므로 따로 세면 숫자가 두 배로 보인다.

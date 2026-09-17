@@ -10,10 +10,13 @@ import stockcard_common as sc
 import stockcard_flow as flow
 
 
-# 실제 응답 1행 — 22컬럼 전부
+# 실제 응답 1행 — 22컬럼 전부.
+# stck_clpr 9,670 은 FDR 정규장 종가 9,660 과 다르다. 9/16 밤에는 KIS 도 9,660 을
+# 주다가 9/17 에 9,670 으로 바뀌었다 — 시간외를 반영한 '익일 기준가'이기 때문이고,
+# 값이 사후에 움직인다는 사실 자체가 as_of·upsert 설계의 근거다.
 RAW_115440 = {
-    "stck_bsop_date": "20260916", "stck_clpr": "9660",
-    "prdy_vrss": "950", "prdy_vrss_sign": "2",
+    "stck_bsop_date": "20260916", "stck_clpr": "9670",
+    "prdy_vrss": "960", "prdy_vrss_sign": "2",
     "prsn_ntby_qty": "-2610", "frgn_ntby_qty": "3760", "orgn_ntby_qty": "-14",
     "prsn_ntby_tr_pbmn": "109", "frgn_ntby_tr_pbmn": "-98", "orgn_ntby_tr_pbmn": "0",
     "prsn_shnu_vol": "7255060", "frgn_shnu_vol": "1265978", "orgn_shnu_vol": "1417",
@@ -40,17 +43,35 @@ def count(table="investor_flow"):
 # ── 언피벗 ───────────────────────────────────────────────────────────────────
 
 def test_언피벗은_투자자_3행과_날짜행을_만든다():
-    rows, daily = flow.unpivot("115440", RAW_115440, "2026-09-16 21:00:00", "pm")
+    rows, daily = flow.unpivot("115440", RAW_115440, "2026-09-16 21:00:00", "pm",
+                               close_krx=9660)
     assert len(rows) == 3
     assert {r[2] for r in rows} == {"prsn", "frgn", "orgn"}
-    assert daily[:5] == ("115440", "20260916", 9660, 950, "2")
+    #                 ticker      date       close_krx base_price base_chg base_sign
+    assert daily[:6] == ("115440", "20260916", 9660,    9670,      960,     "2")
+
+
+def test_정규장_종가와_익일_기준가를_따로_싣는다():
+    """2026-09-14부터 KIS stck_clpr 은 시간외를 반영한 익일 기준가다.
+    우리넷 9/16 은 FDR 9,660 · KIS 9,670 으로 실제로 다르다."""
+    _, daily = flow.unpivot("115440", RAW_115440, "t", None, close_krx=9660)
+    close_krx, base_price = daily[2], daily[3]
+    assert close_krx == 9660, "정본은 FDR 정규장 종가"
+    assert base_price == 9670, "기준가는 KIS stck_clpr 그대로"
+    assert base_price - close_krx == 10, "차이가 곧 시간외에서 움직인 폭"
+
+
+def test_FDR_조회가_실패해도_수급은_적재된다():
+    """close_krx 만 null 이 되고 멈추지 않는다."""
+    _, daily = flow.unpivot("115440", RAW_115440, "t", None, close_krx=None)
+    assert daily[2] is None and daily[3] == 9670
 
 
 def test_언피벗은_무손실이다():
     """22컬럼 = 날짜단위 4 + 투자자 3 × 6. 원본 값이 전부 복원돼야 한다."""
     rows, daily = flow.unpivot("115440", RAW_115440, "t", None)
-    restored = {"stck_bsop_date": daily[1], "stck_clpr": str(daily[2]),
-                "prdy_vrss": str(daily[3]), "prdy_vrss_sign": daily[4]}
+    restored = {"stck_bsop_date": daily[1], "stck_clpr": str(daily[3]),
+                "prdy_vrss": str(daily[4]), "prdy_vrss_sign": daily[5]}
     for r in rows:
         pre = r[2]
         for i, f in enumerate(flow.FIELDS):
@@ -89,8 +110,10 @@ def test_날짜가_없으면_아무것도_만들지_않는다():
 
 # ── upsert ───────────────────────────────────────────────────────────────────
 
-def _run(monkeypatch, raws, as_of, run_type="pm"):
+def _run(monkeypatch, raws, as_of, run_type="pm", closes=None):
+    """네트워크를 타지 않는다 — KIS 와 FDR 을 둘 다 갈아끼운다."""
     monkeypatch.setattr(flow, "fetch_investor_rows", lambda t: raws)
+    monkeypatch.setattr(flow, "fdr_closes", lambda t, d: closes or {})
     return flow.collect(["115440"], run_type=run_type, as_of=as_of)
 
 
@@ -136,11 +159,13 @@ def test_조회_실패는_적재하지_않고_계속한다(db, monkeypatch):
 
 
 def test_날짜행도_함께_적재된다(db, monkeypatch):
-    _run(monkeypatch, [RAW_115440], "2026-09-16 18:40:00")
+    _run(monkeypatch, [RAW_115440], "2026-09-16 18:40:00",
+         closes={"20260916": 9660})
     assert count("investor_flow_daily") == 1
     with ar._conn() as con:
-        assert con.execute(
-            "SELECT close FROM investor_flow_daily").fetchone()[0] == 9660
+        row = con.execute(
+            "SELECT close_krx, base_price FROM investor_flow_daily").fetchone()
+    assert tuple(row) == (9660, 9670), "정규장 종가와 익일 기준가가 따로 실려야 한다"
 
 
 # ── watchlist ────────────────────────────────────────────────────────────────
