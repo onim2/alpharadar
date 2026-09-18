@@ -36,21 +36,18 @@
    `rmnd_rate`는 상장주식수 기준이다(실측 대조 확인).
 4. 투자자 API(`inquire-investor`)는 개인·외국인·기관 3종만 준다.
    기타법인·투신·연기금 세분화가 없어 자사주(기타법인) 매입은 판별 불가 → null로 표시한다.
-5. **2026-09-14부터 KIS `stck_clpr` 와 FDR `Close` 가 다르다.** [확인]
-   9/11 이전은 두 소스가 완전히 일치하는데 9/14·15·16·17 은 전부 어긋난다
-   (우리넷 9/16 KIS 9,670 vs FDR 9,660 · 하이닉스 9/15 KIS 169.0만 vs FDR 171.2만).
-   KIS 계열은 자기 `prdy_vrss` 와 닫혀 있다 — 전일 `stck_clpr` 차분 = `prdy_vrss` 가
-   두 종목 6일 전부 성립. 즉 KIS 는 **시간외를 반영한 '익일 기준가'** 이고,
-   그 등락률은 **기준가 대비**다. FDR 은 정규장 종가 대비다. 9/14 KRX 애프터마켓
-   시행과 날짜가 같다 [원인은 추정, 미확인].
-
-   **정본은 FDR 정규장 종가다.** 파이프라인의 등락률이 전부 FDR 계열이기 때문이다:
-   `change_pct`·`prev_change_pct`(alpharadar.py 2051·2055, `df["Change"]`) → 과열 감점 C항,
-   `prev_spike_flag`, 발송 표시까지 전부 같은 계열. 섞인 곳은 없다(전수 확인).
-   `investor_flow_daily` 는 두 가격을 따로 싣는다 —
-   `close_krx`(정규장 종가·정본) / `base_price`(익일 기준가) / `base_chg`(기준가 대비).
-   `base_chg` 를 `scan_results.change_pct` 와 같은 줄에 놓고 비교하지 말 것.
-   둘의 차이(`base_price - close_krx`)가 시간외에서 움직인 폭이고, 그 자체가 신호다.
+5. **정본 = KRX 정규장 종가 = KIS 일봉(FHKST03010100) 시장구분 `J` 의 `stck_clpr`.** [2026-09-18 결정]
+   **2026-09-14부터 FDR·pykrx `Close` 가 과거 일자에 통합가(KIS `UN`) 계열을 반환한다.**
+   KRX 애프터마켓 개설(2026-09-09 발표, 9/14 시행, 16:00~20:00 접속매매, 시간외단일가 폐지)과
+   시점 일치. FDR 소스 동작과의 인과는 추정.
+   - 9/1~9/11: FDR `Close` = J, 508종목 전부 일치.
+   - 9/14~9/17: FDR = UN 404~420종목, = J 1~6, 둘 다 아님 37~47(차 중앙 −0.08%).
+   - 당일 값: 9/18 20:50·21시대 조회는 J, 저녁 런(23:2x)이 본 값은 UN. 전환 시각 미확인.
+   - FDR `Volume` 은 9/14 이후에도 J(KRX) 거래량 — 한 행 안에서 종가는 UN, 거래량은 J.
+   - FDR `Change` = FDR `Close.pct_change()`. 그래서 `change_pct` 는 9/14 바가 UN÷J 혼합, 9/15부터 UN÷UN.
+   - KIS 는 자기 `prdy_vrss` 와 닫혀 있다(전일 `stck_clpr` 차분 = `prdy_vrss`) — J 가 일관된 계열이라는 뜻이다.
+   - `investor_flow_daily`: `close_krx` 는 FDR 에서 와서 9/14 이후 UN 계열이고, `base_price`(KIS `stck_clpr`)가 J 다.
+     칼럼 이름·주석이 실제와 반대다 — 정정 전까지 정본은 `base_price` 로 읽을 것.
 6. 당일 행은 장중에도 응답에 들어오고 값이 계속 움직인다(종가가 아니라 현재가).
    as_of 와 upsert 가 그 갱신을 받아내는 구조다 — 당일 값을 확정치로 읽지 말 것.
 
