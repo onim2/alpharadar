@@ -67,6 +67,27 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = Path("data/scores_history.db")
 HORIZONS = [1, 5, 10, 20]          # 거래일
+
+# ── 당일 바 사용 금지 (2026-09-18 핫픽스) ─────────────────────────────────────
+# 가격 조회 종료일을 KST 기준 '오늘 전날'로 자르고, 응답에 오늘 날짜 바가 섞여
+# 와도 버린다. 오늘 바는 장중이면 현재가이고 장 마감 뒤에도 소스 계열이 확정되지
+# 않았다(9/14 이후 FDR 당일 값이 J→UN 으로 바뀌는 관찰). 그런데 아래 병합은
+# '기존 non-null 값은 보존'이라, 한 번 오늘 바로 채운 지평은 영구히 고정된다.
+# 실측: 아침 런의 이 단계가 09:00 을 넘긴 날(9/2·9/15~9/18) 청산 바가 그날인
+# fwd1 이 최종 종가와 불일치 — 9/2 는 112건 전부 조회 순서상 뒤쪽 종목(222800~)
+# 이었다. 오늘 청산하는 지평은 다음 런에서 채운다(하루 늦게 채워진다).
+# 주말·휴장은 따로 분기하지 않는다 — 소스가 그날 바를 주지 않으므로 '어제까지'로
+# 자르면 곧 '직전 거래일까지'가 된다.
+def _now_kst() -> datetime:
+    """현재 KST 시각. 러너는 UTC 로 돈다. 테스트가 갈아끼울 수 있게 한 겹 둔다."""
+    return datetime.now(KST)
+
+
+def _price_cutoff(now: datetime = None) -> pd.Timestamp:
+    """사용 가능한 마지막 바의 날짜(포함) = KST 오늘의 전날."""
+    today = (now or _now_kst()).date()
+    return pd.Timestamp(today - timedelta(days=1))
+
 COL = {1: "fwd1", 5: "fwd5", 10: "fwd10", 20: "fwd20"}
 
 # ── 구간 최고/최저 (MFE/MAE) ──────────────────────────────────────────────────
@@ -180,14 +201,22 @@ def _load_existing(con):
 
 
 def _fetch_prices(tickers, start, end):
-    """{ticker: OHLC DataFrame}. MFE/MAE에 고가·저가·시가가 필요해 Close만 담지 않는다."""
+    """{ticker: OHLC DataFrame}. MFE/MAE에 고가·저가·시가가 필요해 Close만 담지 않는다.
+
+    end 는 _price_cutoff() 로 잘린다(당일 바 사용 금지). 소스가 end 를 넘는 바를
+    돌려줘도 버린다 — 이중 안전장치.
+    """
     import FinanceDataReader as fdr
+    cutoff = _price_cutoff()
+    end = min(pd.Timestamp(end), cutoff).strftime("%Y-%m-%d")
     cache = {}
     uniq = sorted(set(tickers))
     failed = []
     for tk in uniq:
         try:
             df = fdr.DataReader(tk, start, end)
+            if df is not None and not df.empty:
+                df = df[pd.to_datetime(df.index) <= cutoff]
             if df is not None and not df.empty and "Close" in df.columns:
                 cache[tk] = df
             else:
@@ -321,7 +350,8 @@ def main():
 
     dates = [t[0] for t in pending]
     lo = pd.to_datetime(min(dates), format="%Y%m%d") - timedelta(days=7)
-    hi = pd.to_datetime(max(dates), format="%Y%m%d") + timedelta(days=45)
+    hi = min(pd.to_datetime(max(dates), format="%Y%m%d") + timedelta(days=45), _price_cutoff())
+    logger.info(f"  가격 조회 종료일 {hi:%Y-%m-%d} (KST 오늘 {_now_kst():%Y-%m-%d %H:%M} — 당일 바 제외)")
     prices = _fetch_prices([t[1] for t in pending],
                            lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d"))
 
