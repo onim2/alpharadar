@@ -49,7 +49,8 @@ AlphaRadar v3.3.1 — 단일 파일 안정화 버전
 """
 
 # ── 표준 라이브러리 ────────────────────────────────────────────────────────────
-import argparse, io, logging, os, pickle, random, re, sqlite3, sys, time, threading, zipfile
+import argparse
+import atexit, io, logging, os, pickle, random, re, sqlite3, sys, time, threading, zipfile
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2010,19 +2011,55 @@ def _get_last_weekday(date):
 def _workdays_before(date,n):
     return (datetime.strptime(date,"%Y%m%d")-timedelta(days=int(n*1.5))).strftime("%Y%m%d")
 
+def _price_features(df) -> dict:
+    """_precompute_ticker 의 가격 파생 지표 — 순수 계산(조회·필터·DB 없음).
+
+    price_shadow.py(KIS J shadow)도 이 함수를 그대로 쓴다. 두 경로가 같은 식을
+    쓰도록 한 곳에 둔다. df 는 Close·Volume 필수, High·Change 는 있으면 쓴다.
+    """
+    close_s=df["Close"].astype(float); volume_s=df["Volume"].astype(float)
+    current=float(close_s.iloc[-1])
+    ma20=moving_average(close_s,20)
+    ma60=moving_average(close_s,60); ma120=moving_average(close_s,120)
+    vol_60ma=moving_average(volume_s,60); vol_20ma=moving_average(volume_s,20)
+    vol_5d=moving_average(volume_s,5)
+    rsi    = calc_rsi(close_s)
+    bb_pos = calc_bb_position(close_s)
+    change_pct = float(df["Change"].iloc[-1]*100) if "Change" in df.columns else 0.0
+    # D-5 shadow — 관측 바 '직전' 거래일 등락률. 같은 바 수열에서 뽑으므로
+    # 아침 런(장 시작 전, 관측 바가 전일)과 저녁 런(관측 바가 당일) 모두
+    # 룩어헤드 없이 맞는다. scan_date 축으로 이어붙이면 하루가 어긋난다.
+    prev_change_pct = (float(df["Change"].iloc[-2]*100)
+                       if "Change" in df.columns and len(df) >= 2 else 0.0)
+    # Task 3: 과열 배제용 피처 (누적수익률·신고가 근접도)
+    w52_high = float(close_s.max())
+    ret_5d  = (current/float(close_s.iloc[-6])-1)  if len(close_s) >= 6  else 0.0
+    ret_20d = (current/float(close_s.iloc[-21])-1) if len(close_s) >= 21 else 0.0
+    w52_proximity = (current/w52_high) if w52_high > 0 else 0.0
+    high_s = df["High"].astype(float) if "High" in df.columns else close_s
+    hist_df = pd.DataFrame({"종가": close_s, "고가": high_s, "거래량": volume_s})
+    return {
+        "current_price":current,
+        "ma20":ma20,"ma60":ma60,"ma120":ma120,"disparity":disparity(current,ma20),
+        "vol_60ma":vol_60ma,"vol_20ma":vol_20ma,"vol_5d_avg":vol_5d,
+        "vol_slope":linear_slope(volume_s.iloc[-5:].tolist()),
+        "rsi":rsi,"bb_pos":bb_pos,"change_pct":change_pct,
+        "prev_change_pct":prev_change_pct,
+        "ret_5d":ret_5d,"ret_20d":ret_20d,"w52_proximity":w52_proximity,
+        "w52_high":w52_high,"res_top":resistance_top(hist_df.iloc[-60:]),
+    }
+
+
 def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
     import FinanceDataReader as fdr
     try:
         df=fdr.DataReader(ticker,start_date,end_date)
         if df is None or len(df)<20: return None
-        close_s=df["Close"].astype(float); volume_s=df["Volume"].astype(float)
-        current=float(close_s.iloc[-1])
+        pf=_price_features(df)
+        current=pf["current_price"]
         if current<ucfg["min_price"]: return None
-        ma20=moving_average(close_s,20)
+        ma20=pf["ma20"]
         if np.isnan(ma20) or ma20==0: return None
-        ma60=moving_average(close_s,60); ma120=moving_average(close_s,120)
-        vol_60ma=moving_average(volume_s,60); vol_20ma=moving_average(volume_s,20)
-        vol_5d=moving_average(volume_s,5)
         mkt=info.get("market","KOSPI")
 
         marcap_real = int(info.get("market_cap", 0) or 0)
@@ -2046,40 +2083,19 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
         net_days,net_total,retail_days,inst_net,foreign_net=_get_investor_data(
             ticker,start_date,end_date,
             exclude_today=ucfg.get("investor_exclude_today", True))
-        rsi    = calc_rsi(close_s)
-        bb_pos = calc_bb_position(close_s)
-        change_pct = float(df["Change"].iloc[-1]*100) if "Change" in df.columns else 0.0
-        # D-5 shadow — 관측 바 '직전' 거래일 등락률. 같은 바 수열에서 뽑으므로
-        # 아침 런(장 시작 전, 관측 바가 전일)과 저녁 런(관측 바가 당일) 모두
-        # 룩어헤드 없이 맞는다. scan_date 축으로 이어붙이면 하루가 어긋난다.
-        prev_change_pct = (float(df["Change"].iloc[-2]*100)
-                           if "Change" in df.columns and len(df) >= 2 else 0.0)
-        # Task 3: 과열 배제용 피처 (누적수익률·신고가 근접도)
-        w52_high = float(close_s.max())
-        ret_5d  = (current/float(close_s.iloc[-6])-1)  if len(close_s) >= 6  else 0.0
-        ret_20d = (current/float(close_s.iloc[-21])-1) if len(close_s) >= 21 else 0.0
-        w52_proximity = (current/w52_high) if w52_high > 0 else 0.0
         sector=str(info.get("sector") or "기타").strip()
         if sector in ("nan","None",""): sector="기타"
-        high_s = df["High"].astype(float) if "High" in df.columns else close_s
-        hist_df = pd.DataFrame({"종가": close_s, "고가": high_s, "거래량": volume_s})
         return {
             "ticker":ticker,"name":info.get("name") or ticker,"sector":sector,
             # master universe 보강 메타(보조필드) — DB 영속·표시용, 스코어링 미사용
             "rating_bond":info.get("rating_bond"),"rating_cp":info.get("rating_cp"),
             "fg_sector":info.get("fg_sector"),"fg_industry":info.get("fg_industry"),
             "ksic":info.get("ksic"),"largest_holder":info.get("largest_holder"),
-            "market":mkt,"market_cap":cap,"cap_tier":cap_tier,"current_price":current,
-            "ma20":ma20,"ma60":ma60,"ma120":ma120,"disparity":disparity(current,ma20),
-            "vol_60ma":vol_60ma,"vol_20ma":vol_20ma,"vol_5d_avg":vol_5d,
-            "vol_slope":linear_slope(volume_s.iloc[-5:].tolist()),
+            "market":mkt,"market_cap":cap,"cap_tier":cap_tier,
+            **pf,
             "net_buy_days":net_days,"net_buy_total":net_total,"net_buy_list":[],
             "retail_buy_days":retail_days,"retail_buy_total":0,
             "inst_net":inst_net,"foreign_net":foreign_net,
-            "rsi":rsi,"bb_pos":bb_pos,"change_pct":change_pct,
-            "prev_change_pct":prev_change_pct,
-            "ret_5d":ret_5d,"ret_20d":ret_20d,"w52_proximity":w52_proximity,
-            "w52_high":w52_high,"res_top":resistance_top(hist_df.iloc[-60:]),
             "corp_code":"","hype_latest":0.0,"hype_7d_ago":0.0,
             "hype_slope":0.0,"hype_rank":9999,"neg_ratio":0.0,
         }
@@ -2098,6 +2114,34 @@ _KIS_RATE_LOCK   = threading.Lock()
 _KIS_FAIL_COUNT  = 0
 _KIS_DISABLED    = False
 _KIS_FAIL_LIMIT  = 3
+
+# ── KIS 호출 집계·토큰 오류 재발급 (2026-09-18) ──────────────────────────────
+# 토큰 만료는 공식 샘플상 msg_cd EGW00123(open-trading-api legacy/rest). EGW00121
+# ('유효하지 않은 token')은 공식 근거를 못 찾았다 [미확인] — 같이 토큰 오류로 본다.
+# 토큰 오류면 캐시를 무시하고 1회 재발급해 한 번만 다시 부른다(프로세스 전체 1회). 재발급은 1분 1회
+# 제한이고 발급마다 알림톡이 가므로 절대 반복하지 않는다.
+# 프로세스 종료 시 호출 수·오류 코드를 한 줄 남기고, 유량 초과·토큰 오류가 있었으면
+# 텔레그램으로 알린다(atexit — 스캔 본체 흐름을 건드리지 않는다).
+_KIS_TOKEN_ERR   = {"EGW00123", "EGW00121"}
+_KIS_RATE_ERR    = "EGW00201"
+_KIS_STATS       = {"calls": 0, "reissue": 0, "codes": {}}
+_KIS_REPORT_ON   = False
+
+
+def _kis_report():
+    st = _KIS_STATS
+    codes = ", ".join(f"{k}×{v}" for k, v in sorted(st["codes"].items())) or "없음"
+    line = f"KIS 호출 {st['calls']}회 · 토큰 재발급 {st['reissue']}회 · 오류코드 {codes}"
+    try:
+        logger.info(line)
+    except Exception:
+        print(line)
+    bad = {k: v for k, v in st["codes"].items() if k == _KIS_RATE_ERR or k in _KIS_TOKEN_ERR}
+    if bad or st["reissue"]:
+        try:
+            TelegramClient().send(f"⚠️ KIS 오류 감지 ({Path(sys.argv[0]).name})\n{line}")
+        except Exception:
+            pass
 
 def _kis_is_real() -> bool:
     raw = os.getenv("KIS_IS_REAL", "0").strip().lower()
@@ -2122,25 +2166,26 @@ def _kis_note_token_failure() -> None:
             f"KIS 토큰 연속 {_KIS_FAIL_COUNT}회 실패 → 이번 런 KIS 조회 전체 스킵"
         )
 
-def _kis_token() -> str:
+def _kis_token(force: bool = False) -> str:
+    """force=True 면 메모리·파일 캐시를 건너뛰고 발급한다(토큰 오류 뒤 1회용)."""
     global _KIS_TOKEN_CACHE, _KIS_FAIL_COUNT
     if _KIS_DISABLED:
         return ""
     now = datetime.now()
 
-    if _KIS_TOKEN_CACHE.get("token") and _KIS_TOKEN_CACHE.get("expires"):
+    if not force and _KIS_TOKEN_CACHE.get("token") and _KIS_TOKEN_CACHE.get("expires"):
         if now < _KIS_TOKEN_CACHE["expires"] - timedelta(minutes=5):
             return _KIS_TOKEN_CACHE["token"]
 
     with _KIS_TOKEN_LOCK:
         now = datetime.now()
 
-        if _KIS_TOKEN_CACHE.get("token") and _KIS_TOKEN_CACHE.get("expires"):
+        if not force and _KIS_TOKEN_CACHE.get("token") and _KIS_TOKEN_CACHE.get("expires"):
             if now < _KIS_TOKEN_CACHE["expires"] - timedelta(minutes=5):
                 return _KIS_TOKEN_CACHE["token"]
 
         token_file = Path(".kis_token")
-        if token_file.exists():
+        if not force and token_file.exists():
             try:
                 data = yaml.safe_load(token_file.read_text())
                 exp  = datetime.fromisoformat(data["expires"])
@@ -2180,8 +2225,12 @@ def _kis_token() -> str:
             _kis_note_token_failure()
             return ""
 
-def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3) -> dict:
-    global _KIS_LAST_CALL
+def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3,
+             _reauth: bool = True) -> dict:
+    global _KIS_LAST_CALL, _KIS_REPORT_ON
+    if not _KIS_REPORT_ON:
+        atexit.register(_kis_report)
+        _KIS_REPORT_ON = True
     if _KIS_DISABLED:
         return {}
     token = _kis_token()
@@ -2211,8 +2260,29 @@ def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3) -> dict:
                 f"{_kis_base_url()}{path}",
                 headers=headers, params=params, timeout=10,
             )
+            _KIS_STATS["calls"] += 1
+            # 오류 본문을 raise_for_status 전에 읽는다 — KIS 는 토큰 오류를 HTTP 오류
+            # 상태로 보내기도 해서, 먼저 raise 하면 msg_cd 를 못 본다.
+            try:
+                body = r.json()
+            except ValueError:
+                body = {}
+            code = str(body.get("msg_cd", "") or "")
+            if code and body.get("rt_cd") not in (None, "0"):
+                _KIS_STATS["codes"][code] = _KIS_STATS["codes"].get(code, 0) + 1
+            if code in _KIS_TOKEN_ERR or r.status_code in (401, 403):
+                # 재발급은 프로세스 전체에서 1회뿐이다 — 호출마다 허용하면 토큰이 계속 나쁠 때
+                # 종목 수만큼 발급을 시도한다(1분 1회 제한·발급마다 알림톡).
+                if not _reauth or _KIS_STATS["reissue"] >= 1:
+                    logger.warning(f"KIS 토큰 오류 재발급 후에도 지속 ({code or r.status_code}) — 포기")
+                    return {}
+                logger.warning(f"KIS 토큰 오류 ({code or r.status_code}) → 1회 재발급 후 재시도")
+                _KIS_STATS["reissue"] += 1
+                if not _kis_token(force=True):
+                    return {}
+                return _kis_get(path, params, tr_id, retries, _reauth=False)
             r.raise_for_status()
-            data = r.json()
+            data = body
             if data.get("rt_cd") == "1" and "EGW00201" in data.get("msg_cd", ""):
                 wait = 2 ** (attempt + 1)
                 logger.warning(f"KIS 속도 제한 → {wait}초 대기")
@@ -2878,10 +2948,13 @@ def run_step1(precomputed,cfg,date=None):
 # ══════════════════════════════════════════════════════════════════════════════
 # Step 2 — 하드 필터링
 # ══════════════════════════════════════════════════════════════════════════════
-def run_step2(pool_a, precomputed, cfg, date=None):
-    fcfg = cfg["filter"]
-    scan_date = date or today_kst()
+def _step2_decision(p, fcfg):
+    """run_step2 의 종목별 판정 — 순수 함수(DB·로그 없음). (탈락 사유 | None, 과열 세부).
 
+    사유는 기존 순서대로 처음 걸린 것 하나다: overheat → disp_upper → disp_lower →
+    ma_trend → rsi → turnover. price_shadow.py 도 이 함수를 쓴다. market_cap 이 None 이면
+    (shadow 처럼 시총을 모르는 경우) 거래대금 판정을 건너뛴다 — 실전은 항상 값이 있다.
+    """
     upper = {
         "large": fcfg.get("max_disparity_large", 110),
         "mid":   fcfg.get("max_disparity_mid",   115),
@@ -2892,13 +2965,41 @@ def run_step2(pool_a, precomputed, cfg, date=None):
     max_rsi         = fcfg.get("max_rsi",            70)
     min_turnover    = fcfg.get("min_turnover_ratio",  0.01)
     min_amount      = fcfg.get("min_turnover_amount", 2_000_000_000)
-
-    # Task 3: 과열 배제 필터 (기본 ON, config filter.exclude_overheat)
     oh_cfg   = fcfg.get("exclude_overheat", {}) or {}
-    oh_on    = oh_cfg.get("enabled", True)
-    oh_r5    = oh_cfg.get("max_ret_5d",       0.20)
-    oh_r20   = oh_cfg.get("max_ret_20d",      0.40)
-    oh_prox  = oh_cfg.get("max_w52_proximity", 0.97)
+
+    disp   = p.get("disparity", 0)
+    tier   = p.get("cap_tier", "large")
+    ma20   = p.get("ma20",  0)
+    ma120  = p.get("ma120", 0)
+    mktcap = p.get("market_cap", 0)
+
+    if oh_cfg.get("enabled", True):
+        oh_reason = []
+        if p.get("ret_5d", 0.0)        > oh_cfg.get("max_ret_5d",       0.20): oh_reason.append("ret5d")
+        if p.get("ret_20d", 0.0)       > oh_cfg.get("max_ret_20d",      0.40): oh_reason.append("ret20d")
+        if p.get("w52_proximity", 0.0) > oh_cfg.get("max_w52_proximity", 0.97): oh_reason.append("w52prox")
+        if oh_reason:
+            return "overheat", oh_reason
+    if disp >= upper[tier]:
+        return "disp_upper", []
+    if disp < min_disp:
+        return "disp_lower", []
+    if require_trend and ma20 > 0 and ma120 > 0 and ma20 <= ma120:
+        return "ma_trend", []
+    if p.get("rsi", 50) > max_rsi:
+        return "rsi", []
+    if mktcap is not None:
+        daily_amount = p.get("vol_5d_avg", 0) * p.get("current_price", 0)
+        turnover_ratio = daily_amount / mktcap if mktcap > 0 else 0
+        if turnover_ratio < min_turnover or daily_amount < min_amount:
+            return "turnover", []
+    return None, []
+
+
+def run_step2(pool_a, precomputed, cfg, date=None):
+    fcfg = cfg["filter"]
+    scan_date = date or today_kst()
+    # 임계값(이격도·MA추세·RSI·거래대금·과열 배제, config filter.*)은 _step2_decision 이 읽는다.
 
     pool_b = {}
     removed = {"overheat": [], "disp_upper": [], "disp_lower": [], "ma_trend": [], "rsi": [], "turnover": []}
@@ -2914,41 +3015,17 @@ def run_step2(pool_a, precomputed, cfg, date=None):
         ma120  = p.get("ma120", 0)
         mktcap = p.get("market_cap", 0)
 
+        # 판정은 _step2_decision 한 곳에서 한다(price_shadow 와 같은 식).
         # 과열 배제: 이미 급등(누적수익률)·고점 근접 → 물밑 목적과 반대이므로 제외 + 반사실 기록
-        if oh_on:
-            r5   = p.get("ret_5d", 0.0)
-            r20  = p.get("ret_20d", 0.0)
-            prox = p.get("w52_proximity", 0.0)
-            oh_reason = []
-            if r5   > oh_r5:   oh_reason.append("ret5d")
-            if r20  > oh_r20:  oh_reason.append("ret20d")
-            if prox > oh_prox: oh_reason.append("w52prox")
-            if oh_reason:
-                removed["overheat"].append(ticker)
-                gated_rows.append({"ticker": ticker, "reason": "overheat:" + "+".join(oh_reason),
-                                   "ret_5d": r5, "ret_20d": r20, "w52_proximity": prox})
-                continue
-
-        if disp >= upper[tier]:
-            removed["disp_upper"].append(ticker)
+        reason, oh_reason = _step2_decision({**p, "market_cap": mktcap}, fcfg)
+        if reason == "overheat":
+            removed["overheat"].append(ticker)
+            gated_rows.append({"ticker": ticker, "reason": "overheat:" + "+".join(oh_reason),
+                               "ret_5d": p.get("ret_5d", 0.0), "ret_20d": p.get("ret_20d", 0.0),
+                               "w52_proximity": p.get("w52_proximity", 0.0)})
             continue
-
-        if disp < min_disp:
-            removed["disp_lower"].append(ticker)
-            continue
-
-        if require_trend and ma20 > 0 and ma120 > 0 and ma20 <= ma120:
-            removed["ma_trend"].append(ticker)
-            continue
-
-        if rsi > max_rsi:
-            removed["rsi"].append(ticker)
-            continue
-
-        daily_amount = p.get("vol_5d_avg", 0) * p.get("current_price", 0)
-        turnover_ratio = daily_amount / mktcap if mktcap > 0 else 0
-        if turnover_ratio < min_turnover or daily_amount < min_amount:
-            removed["turnover"].append(ticker)
+        if reason:
+            removed[reason].append(ticker)
             continue
 
         pool_b[ticker] = {

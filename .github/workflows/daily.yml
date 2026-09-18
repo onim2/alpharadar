@@ -175,6 +175,50 @@ jobs:
           echo "::error::5회 재시도 후에도 푸시 실패"
           exit 1
 
+      # KIS J(정본) 기준 가격 지표 shadow — 발송·DB 커밋이 끝난 '뒤'에 돈다.
+      # 실패·지연이 스캔 결과와 발송에 영향을 줄 수 없게 순서를 뒤에 두고,
+      # 실패해도 넘어간다(continue-on-error). 폴백·예외는 스크립트가 텔레그램으로 알린다.
+      # 토큰은 앞 단계가 남긴 .kis_token 을 재사용한다(발급마다 알림톡이 간다).
+      - name: Price shadow (KIS J)
+        if: success()
+        continue-on-error: true
+        timeout-minutes: 8
+        env:
+          KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KIS_IS_REAL:    ${{ secrets.KIS_IS_REAL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          PRICE_SHADOW_ALLOW_LIVE_DB: '1'
+        run: python price_shadow.py
+
+      # shadow 행은 위 커밋 뒤에 생기므로 따로 커밋한다. 방식은 위와 같다(rebase 재시도,
+      # DB 충돌이면 조용히 고르지 않고 중단). 실패해도 스캔 결과는 이미 푸시돼 있다.
+      - name: Commit price shadow
+        if: success()
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          git add data/scores_history.db          2>/dev/null || true
+          git add data/logs/price_shadow_*.log    2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "커밋할 shadow 변경 없음"
+            exit 0
+          fi
+          git commit -m "auto: price shadow $(date -u +%F\ %H:%M\ UTC) [skip ci]"
+          for i in 1 2 3 4 5; do
+            if git push; then echo "푸시 성공 (시도 $i)"; exit 0; fi
+            echo "푸시 거부됨 — 재시도 ($i/5)"
+            if ! git pull --rebase origin main; then
+              git rebase --abort || true
+              echo "::error::rebase 실패(DB 충돌 추정) — shadow 행은 이번 런에서 버린다"
+              exit 1
+            fi
+            sleep $((i * 5))
+          done
+          echo "::error::5회 재시도 후에도 푸시 실패"
+          exit 1
+
       # 차트는 DB 커밋 '뒤'에 그린다. PNG는 DB에 들어가지 않으므로 커밋을 기다릴
       # 이유가 없고, 여기서 넘어져도 스캔 결과가 이미 저장된 뒤라 잃는 것이 없다.
       #
