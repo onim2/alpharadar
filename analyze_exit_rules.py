@@ -22,7 +22,7 @@ DB = sys.argv[1] if len(sys.argv) > 1 else str(DB_DEFAULT)
 con = sqlite3.connect(DB)
 
 def load(cols, where):
-    q = f"SELECT scan_date, origin, {cols} FROM outcomes WHERE {where}"
+    q = f"SELECT scan_date, origin, {cols} FROM outcomes_clean WHERE {where}"
     rows = {}
     for r in con.execute(q):
         rows.setdefault((r[0], r[1]), []).append(r[2:])

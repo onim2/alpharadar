@@ -61,7 +61,7 @@ d = pd.read_sql_query(f"""
            s.score_t, s.s_text, s.score_d, s.score_total,
            {', '.join('o.' + c for c in RET_ALL)}
     FROM scan_results s
-    JOIN outcomes o
+    JOIN outcomes_clean o
       ON o.scan_date = s.scan_date AND o.ticker = s.ticker AND o.origin = ?
     WHERE s.scan_date >= ?
 """, con, params=(a.origin, a.from_date))

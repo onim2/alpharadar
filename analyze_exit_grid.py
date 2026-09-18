@@ -28,7 +28,7 @@ SL = [5, 7, 10, 15]
 
 rows = {}
 for d, o, f, mf, ma in con.execute(
-        "SELECT scan_date,origin,fwd10,mfe10,mae10 FROM outcomes "
+        "SELECT scan_date,origin,fwd10,mfe10,mae10 FROM outcomes_clean "
         "WHERE fwd10 IS NOT NULL AND mfe10 IS NOT NULL AND mae10 IS NOT NULL "
         "AND origin IN ('scan','gated')"):
     rows.setdefault((d, o), []).append((f, mf, ma))
@@ -115,7 +115,7 @@ hz = {}
 for h, (fc, mc) in H.items():
     r = {}
     for d, o, f, m in con.execute(
-            f"SELECT scan_date,origin,{fc},{mc} FROM outcomes "
+            f"SELECT scan_date,origin,{fc},{mc} FROM outcomes_clean "
             f"WHERE {fc} IS NOT NULL AND {mc} IS NOT NULL AND origin IN ('scan','gated')"):
         r.setdefault((d, o), []).append((f, m))
     hz[h] = r

@@ -44,7 +44,7 @@ con = sqlite3.connect(a.db)
 rsi_cond = "AND p.rsi <= 70" if a.rsi_gate else ""
 rows = con.execute(f"""
     SELECT o.scan_date, p.cap_tier, p.disparity, o.fwd1, o.fwd5
-    FROM outcomes o JOIN pool_history p
+    FROM outcomes_clean o JOIN pool_history p
       ON p.scan_date=o.scan_date AND p.ticker=o.ticker AND p.reason='disp_upper'
     WHERE o.origin='f:disp_upper' AND p.disparity IS NOT NULL {rsi_cond}
 """).fetchall()
@@ -55,7 +55,7 @@ rows = [r for r in rows if r[0] not in EXCL]
 base = {}
 for d, tier, f1, f5 in con.execute("""
     SELECT s.scan_date, s.cap_tier, o.fwd1, o.fwd5
-    FROM scan_results s JOIN outcomes o
+    FROM scan_results s JOIN outcomes_clean o
       ON o.scan_date=s.scan_date AND o.ticker=s.ticker AND o.origin='scan'
 """):
     if d in EXCL: continue

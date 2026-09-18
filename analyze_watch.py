@@ -70,7 +70,7 @@ w = pd.DataFrame(rows, columns=["scan_date", "ticker", "watch_n", "watch_since",
 
 o = pd.read_sql_query(
     "SELECT scan_date, ticker, fwd1, fwd5, fwd10, fwd20, mfe5, mfe10 "
-    "FROM outcomes WHERE origin = ?", con, params=(a.origin,))
+    "FROM outcomes_clean WHERE origin = ?", con, params=(a.origin,))
 con.close()
 d = w.merge(o, on=["scan_date", "ticker"])
 

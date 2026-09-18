@@ -64,7 +64,7 @@ for sd, tk, chg in con.execute(
 
 out = {}
 for sd, tk, f1, f5, m5, mae in con.execute(
-        "SELECT scan_date, ticker, fwd1, fwd5, mfe5, mae10 FROM outcomes "
+        "SELECT scan_date, ticker, fwd1, fwd5, mfe5, mae10 FROM outcomes_clean "
         "WHERE origin='scan'"):
     out[(sd, tk)] = (f1, f5, m5, mae)
 
