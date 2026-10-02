@@ -147,14 +147,6 @@ DEFAULT_CONFIG = {
         "min_turnover_ratio":  0.01,
         "min_turnover_amount": 2_000_000_000,
     },
-    # D-5 shadow — config.yaml의 overheat 절과 같이 고칠 것.
-    # load_config()는 병합하지 않고 YAML을 통째로 반환한다.
-    "overheat": {
-        "prev_day_spike_gate": {
-            "enabled": False, "prev_min": 15.0, "cur_max": -8.0,
-            "mode": "exclude", "penalty": 8.0,
-        },
-    },
     "scoring": {
         "w_tech": 0.30, "w_text": 0.40, "w_cross": 0.30,
         "w1": 0.30, "w2": 0.40, "w3": 0.30,
@@ -437,41 +429,6 @@ class FinBertClient:
                 best_text = text
         return overall, best_text, round(best_pct * 100, 1)
 
-    def confidence_by_field(self, items, name, position_threshold=0.3):
-        """shadow — 신뢰도 검사만 필드별(title OR desc)로 바로잡았을 때의 값.
-
-        집행 경로(score_with_confidence)는 title과 desc를 이어붙인 문자열
-        f"{title}. {desc[:100]}" 하나에 주체 검증을 건다. 그런데 수집 단계는
-        title·desc 각각에 걸어 하나만 통과해도 채택한다. 그래서 desc로 채택된
-        기사는 종목명이 len(title)+2 뒤에 놓여 위치 임계 30%를 구조적으로 넘고
-        전부 탈락한다 — 저장 기사 1,735건 실측에서 65.5%가 이 경로였다.
-
-        여기서는 그 검사만 필드별로 되돌린다. FinBERT에 넣는 문자열은 기존
-        연결 문자열 그대로다 — 검사 방식과 입력 텍스트를 같이 바꾸면 shadow
-        신구 차이가 어느 쪽 효과인지 귀속되지 않는다. 입력 텍스트 변경이
-        필요한지는 이 컬럼이 쌓인 뒤 따로 판단한다(field_mix가 그 근거다).
-
-        반환: (conf_fixed, raw_fixed, field_mix)
-          conf_fixed — 필드별 검사 기준 통과 비율
-          raw_fixed  — 통과분만 FinBERT로 채점한 원점수(게이트 미적용). 없으면 None
-          field_mix  — "title=4,desc=12,both=2,none=3" 형태의 채택 경로 내역
-        """
-        if not items or not name:
-            # 측정 불가(캐시에 원본 기사가 없음)와 '재보니 0'을 구분해야 나중에
-            # 집계에서 섞이지 않는다.
-            return None, None, ""
-        valid, mix = [], {"title": 0, "desc": 0, "both": 0, "none": 0}
-        for it in items:
-            t_ok = _subject_ok(it.get("title", ""), name, position_threshold)
-            d_ok = _subject_ok(it.get("desc", ""), name, position_threshold)
-            mix["both" if (t_ok and d_ok) else
-                "title" if t_ok else "desc" if d_ok else "none"] += 1
-            if t_ok or d_ok:
-                valid.append(NaverClient.item_to_text(it))
-        conf = round(len(valid) / len(items), 3)
-        raw = self.score_with_best(valid)[0] if valid else None
-        return conf, raw, ",".join(f"{k}={v}" for k, v in mix.items())
-
     def score_with_confidence(self, texts, name=None, position_threshold=0.3):
         """
         Phase A.1 — 매핑 신뢰도(confidence) 동시 반환.
@@ -715,27 +672,6 @@ def _conn():
     finally:
         con.close()
 
-def prev_spike_flag(cfg, prev_chg, cur_chg):
-    """D-5 shadow — 전일 급등 뒤 당일 급락으로 지표가 리셋된 진입인가.
-
-    과열 게이트·감점은 전부 당일 스냅샷만 본다. 전일 +26% → 당일 -18%는 2일
-    합산 +3%의 무난한 종목으로 읽힌다. 검정 결과 이런 진입은 같은 날 다른
-    통과 종목보다 fwd5가 4.14%p 열세였다(33일자 중 25일자, 부호검정 p=0.0046,
-    부트스트랩 95% CI [-7.08,-0.81]) — docs/D5_prev_spike_check_20260826.md.
-
-    **열세는 조합에서만 나온다.** 갈래를 가르면 '당일 급락만'은 -0.45,
-    '전일 급등만'은 -2.54로 둘 다 신뢰구간이 0을 넘는다. 그래서 어느 한 항만
-    보는 게이트로 바꾸지 말 것 — 근거 없는 종목까지 함께 걸린다.
-
-    지금은 shadow다. 반환값은 기록만 되고 배제·감점에 쓰이지 않는다.
-    집행 전환은 1주 관찰 뒤 2026-09-02에 판정한다.
-    """
-    g = (cfg.get("overheat", {}) or {}).get("prev_day_spike_gate", {}) or {}
-    if prev_chg is None or cur_chg is None:
-        return 0
-    return int(prev_chg >= g.get("prev_min", 15.0) and cur_chg <= g.get("cur_max", -8.0))
-
-
 def save_scan_results(results, scan_date, run_type=None):
     if run_type is None:
         run_type = run_type_kst()
@@ -765,13 +701,17 @@ def save_scan_results(results, scan_date, run_type=None):
                  r.get("hype_slope"), r.get("hype_rank"), r.get("disparity"),
                  r.get("rating_bond"), r.get("rating_cp"), r.get("fg_sector"),
                  r.get("fg_industry"), r.get("ksic"), r.get("largest_holder"),
-                 r.get("t_presurge"), r.get("score_presurge"),
+                 # t_presurge·score_presurge·d_flow·score_flow·news_*_fixed·news_field_mix·
+                 # prev_change_pct·prev_spike_flag 는 shadow 실험 컬럼이다. 계산은
+                 # 2026-10-02 정리에서 걷어냈고(archive/pre-cleanup-20261002), 기존 DB
+                 # 호환을 위해 컬럼만 남겨 NULL 을 쓴다 — 0 이 아니라 '기록 안 함'이다.
+                 None, None,
                  r.get("news_conf"), r.get("news_raw"),
-                 r.get("d_flow"), r.get("score_flow"),
+                 None, None,
                  r.get("overheat_pen"),
-                 r.get("news_conf_fixed"), r.get("news_raw_fixed"),
-                 r.get("news_field_mix"),
-                 r.get("prev_change_pct"), r.get("prev_spike_flag", 0),
+                 None, None,
+                 None,
+                 None, None,
                  run_type))
 
 def save_engine_b_history(tickers, precomputed, scan_date):
@@ -909,23 +849,6 @@ def get_engine_b_history(ticker, scan_date=None, window_days=3):
             (ticker, scan_date, lower)).fetchall()
     return [r["scan_date"] for r in rows]
 
-def was_sent_today(ticker, scan_date):
-    """그날 그 종목이 발송됐으면 등급, 아니면 None.
-
-    run_type 은 조건에 넣지 않는다 — 아침이든 저녁이든 '오늘 이미 나갔나'를
-    묻는 함수다. 다만 PK가 넓어져 하루에 두 행이 있을 수 있으니, 예전에
-    mark_sent 가 한 행에 남기던 것과 같은 기준(강한 등급 우선, 같으면 높은 점수)
-    으로 한 행을 고른다.
-    """
-    with _conn() as con:
-        rows = con.execute(
-            "SELECT grade, score FROM sent_history WHERE ticker=? AND send_date=?",
-            (ticker, scan_date)).fetchall()
-    if not rows:
-        return None
-    best = max(rows, key=lambda r: (_GRADE_RANK.get(r["grade"], -1), r["score"] or 0))
-    return best["grade"]
-
 def get_watch_history(tickers, scan_date):
     """종목별 누적 관찰 이력 — {ticker: (누적등장, 최초이후경과, 직전공백)}.
 
@@ -1047,8 +970,7 @@ class DartClient:
     def get_report_items(self, corp_code, days=90):
         """공시 목록 — 제목에 접수번호·접수일자를 함께 반환.
 
-        get_report_titles()는 여기서 제목만 뽑는 래퍼다. 점수 계산에 쓰이는
-        제목 목록의 순서·중복제거 방식은 예전과 동일하게 유지한다.
+        점수 계산에 쓰이는 제목 목록의 순서·중복제거 방식은 예전과 동일하게 유지한다.
         """
         if not self.api_key or not corp_code: return []
         bgn = (datetime.now()-timedelta(days=days)).strftime("%Y%m%d")
@@ -1071,10 +993,6 @@ class DartClient:
             if it["title"] not in seen:
                 seen.add(it["title"]); unique.append(it)
         return unique
-
-    def get_report_titles(self, corp_code, days=90):
-        """기존 호출부 호환용 — 제목 문자열만 필요할 때."""
-        return [it["title"] for it in self.get_report_items(corp_code, days)]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1895,8 +1813,8 @@ def collect_texts_with_cache(pool_b, naver, dart, news_cnt, dart_days,
         f"수집 완료: 뉴스 {sum(len(v) for v in news_texts.values())}건 | "
         f"공시 {sum(len(v) for v in dart_texts.values())}건"
     )
-    # news_items(title·desc 원본)는 뉴스 게이트 shadow 측정에 쓴다. 캐시에 이미
-    # 있는 값이라 추가 조회 비용은 없다.
+    # news_items(title·desc 원본)는 뉴스 게이트 shadow(D-2) 측정용으로 돌려줬다.
+    # 측정은 2026-10-02 정리에서 걷어냈지만 호출부가 3-튜플로 언팩하므로 형태는 둔다.
     return news_texts, dart_texts, news_items
 
 
@@ -2055,11 +1973,6 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
         rsi    = calc_rsi(close_s)
         bb_pos = calc_bb_position(close_s)
         change_pct = float(df["Change"].iloc[-1]*100) if "Change" in df.columns else 0.0
-        # D-5 shadow — 관측 바 '직전' 거래일 등락률. 같은 바 수열에서 뽑으므로
-        # 아침 런(장 시작 전, 관측 바가 전일)과 저녁 런(관측 바가 당일) 모두
-        # 룩어헤드 없이 맞는다. scan_date 축으로 이어붙이면 하루가 어긋난다.
-        prev_change_pct = (float(df["Change"].iloc[-2]*100)
-                           if "Change" in df.columns and len(df) >= 2 else 0.0)
         # Task 3: 과열 배제용 피처 (누적수익률·신고가 근접도)
         w52_high = float(close_s.max())
         ret_5d  = (current/float(close_s.iloc[-6])-1)  if len(close_s) >= 6  else 0.0
@@ -2083,7 +1996,6 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
             "retail_buy_days":retail_days,"retail_buy_total":0,
             "inst_net":inst_net,"foreign_net":foreign_net,
             "rsi":rsi,"bb_pos":bb_pos,"change_pct":change_pct,
-            "prev_change_pct":prev_change_pct,
             "ret_5d":ret_5d,"ret_20d":ret_20d,"w52_proximity":w52_proximity,
             "w52_high":w52_high,"res_top":resistance_top(hist_df.iloc[-60:]),
             "corp_code":"","hype_latest":0.0,"hype_7d_ago":0.0,
@@ -3035,120 +2947,7 @@ def _calc_t(meta):
 
     return min(score, 100)
 
-def _calc_t_presurge(meta):
-    """Task 4 — shadow 기술점수(물밑 축적 가설). legacy _calc_t 무변경, 병행 계산용.
-    신고가 근접·저항 돌파 보상 없음. 중장기 구조 생존 + 눌림목/저이격/에너지 응축 보상."""
-    score = 0
-    ma20  = meta.get("ma20", 0)
-    ma60  = meta.get("ma60", 0)
-    ma120 = meta.get("ma120", 0)
-    price = meta.get("current_price", 0)
-    disp  = meta.get("disparity", 0)       # (price/ma20)*100
-    bb    = meta.get("bb_pos", 50)
-    v5    = meta.get("vol_5d_avg", 0)
-    v60   = meta.get("vol_60ma", 0)
-    w52h  = meta.get("w52_high", 0)
-
-    if ma60 > ma120 > 0:                       # 중장기 구조 생존
-        score += 20
-    if ma20 > 0 and 0.97 <= price/ma20 <= 1.05:  # MA20 밀착 눌림목
-        score += 20
-    if 93 <= disp <= 105:                       # 저이격
-        score += 15
-    if bb <= 60:                                # 볼밴 하단~중립 (에너지 응축)
-        score += 15
-    if v60 > 0 and v5/v60 <= 1.3:               # 거래량 미폭발
-        score += 15
-    if w52h > 0 and 0.75 <= price/w52h <= 0.95:  # 바닥 탈출·고점 미도달
-        score += 15
-
-    return min(score, 100)
-
-def load_overheat_reference(scan_date, ocfg):
-    """과열 감점의 분위 비교 모집단 — 최근 N일 누적 풀 분포를 DB에서 읽는다.
-
-    ref_window_days 기본값은 0이다. 즉 평상시 이 함수는 None을 돌려주고 호출부는
-    당일 풀을 쓴다. 켜지 말 것 — 아래 반박이 남아 있는 한 재검증 전용이다.
-
-    만들게 된 우려: 당일 풀이 8월 들어 4~26종목까지 줄어(시총 하한 2000억 상향
-    이후) n=21이면 순위 한 칸이 4.8%p라 knee 0.80~full 0.85 사이에 자리가 한 칸뿐,
-    n<=10이면 램프 전체가 한 칸 안 — 감점이 0 아니면 만점으로만 나온다는 것.
-
-    리플레이 반박(2026-08-24, scan_results 5,380행 / 72 스캔일 / 130런):
-      ① 이진성은 풀 축소의 결과가 아니다. 램프값이 0이나 1로만 나오는 비율은
-         캘리브레이션 구간(풀 40~236)에서 이미 95.0%였고, 8월 풀에서 94.8%,
-         20일 누적으로 바꿔도 94.6%다. 밴드에 드는 종목 비율은 모집단 크기가
-         아니라 램프 폭이 정한다 — 폭 0.05는 어느 분포에서든 5%, 0.20이면 19%,
-         0.50이면 48%다(당일 풀과 누적 풀이 동일하게 나온다). 늘어나는 건 밴드
-         '안'의 해상도뿐이고(8월 고유값 12 → 19) 그 밴드는 전체의 5%다.
-      ② IC로도 이득이 없다. 일자(런)별 Spearman 평균이 당일 풀 대비
-         fwd1 -0.0319→-0.0321 / fwd5 -0.0645→-0.0655 / fwd10 -0.0410→-0.0443 /
-         fwd20 -0.0803→-0.0815 — 4개 지평 전부 같거나 미세하게 나쁘다.
-      ③ 부작용이 있다. 누적 분포는 절대 기준이라 시장 전체가 달아오른 날 다수가
-         함께 감점된다. 런별 '감점 받은 종목 비율'의 표준편차가 15.3%p에서
-         21.2%p로 벌어져, 감점을 같은 날 동료 대비로 매긴다는 설계가 깨진다.
-         ref_demean=True로 일자평균을 빼면 16.2%p로 돌아오지만 IC 이득은
-         fwd10·fwd20에만 있고 주력 지평인 fwd1·fwd5는 당일 풀이 낫다.
-
-    남겨둔 이유: 풀이 지금보다 더 줄면(런당 한 자릿수) ①의 결론이 바뀔 수 있다.
-    그때 이 옵션으로 재측정한다. 돌려주는 값이 None이면 호출부는 당일 풀을 쓴다
-    (기본값 0 / cold start / 누적 표본 부족 / DB 장애 폴백).
-    """
-    win = int(ocfg.get("ref_window_days", 0) or 0)
-    if win <= 0:
-        return None
-    min_n  = int(ocfg.get("ref_min_n", 100))
-    demean = bool(ocfg.get("ref_demean", False))
-    try:
-        with _conn() as con:
-            dates = [r[0] for r in con.execute(
-                "SELECT DISTINCT scan_date FROM scan_results "
-                "WHERE scan_date < ? ORDER BY scan_date DESC LIMIT ?",
-                (str(scan_date), win)).fetchall()]
-            if not dates:
-                logger.info("과열 감점 모집단: 과거 스캔 없음 → 당일 풀 사용")
-                return None
-            qs = ",".join("?" * len(dates))
-            rows = con.execute(
-                f"SELECT scan_date, vol_slope, hype_slope FROM scan_results "
-                f"WHERE scan_date IN ({qs})", dates).fetchall()
-    except sqlite3.Error as e:
-        logger.warning(f"과열 감점 모집단 조회 실패 → 당일 풀 사용: {e}")
-        return None
-
-    by_date = defaultdict(lambda: {"vol": [], "hype": []})
-    for r in rows:
-        if r["vol_slope"] is not None:
-            by_date[r["scan_date"]]["vol"].append(float(r["vol_slope"]))
-        if r["hype_slope"] is not None:
-            by_date[r["scan_date"]]["hype"].append(float(r["hype_slope"]))
-
-    ref = {"vol": [], "hype": [], "demean": demean, "n_dates": len(by_date)}
-    for key in ("vol", "hype"):
-        for _d, buckets in by_date.items():
-            vals = buckets[key]
-            if not vals:
-                continue
-            if demean:
-                # 감점의 원래 의미는 '같은 날 동료 대비'다. 누적 분포를 쓰되 각 날의
-                # 평균을 뺀 잔차끼리 비교해 그 의미를 지킨다. 근거 통계도 일자평균을
-                # 차감해 측정했으므로 이쪽이 측정과 집행의 기준을 일치시킨다.
-                c = sum(vals) / len(vals)
-                ref[key].extend(v - c for v in vals)
-            else:
-                ref[key].extend(vals)
-
-    n_min = min(len(ref["vol"]), len(ref["hype"]))
-    if n_min < min_n:
-        logger.info(f"과열 감점 모집단 부족 (vol {len(ref['vol'])} / hype {len(ref['hype'])} "
-                    f"< {min_n}) → 당일 풀 사용")
-        return None
-    logger.info(f"과열 감점 모집단: 최근 {len(by_date)}일 누적 "
-                f"vol {len(ref['vol'])}건 / hype {len(ref['hype'])}건"
-                f"{' (일자평균 차감)' if demean else ''}")
-    return ref
-
-def _overheat_penalty(meta, all_vol, all_hype, ocfg, ref=None):
+def _overheat_penalty(meta, all_vol, all_hype, ocfg):
     """과열(관심·거래량 급증) 연속 감점. 0 이상의 실수를 돌려주며 D점수에서 뺀다.
 
     기존 V-Surge(검색량 순위 20위 이내 → cross +10)를 대체한다. 교체 근거는
@@ -3205,29 +3004,19 @@ def _overheat_penalty(meta, all_vol, all_hype, ocfg, ref=None):
         if cap <= knee: return 1.0 if x >= cap else 0.0
         return max(0.0, min(1.0, (x - knee) / (cap - knee)))
 
-    def _pct(value, today_pool, key):
-        """분위의 비교 모집단을 고른다 — ref가 없으면 기존대로 당일 풀."""
-        if not ref or not ref.get(key):
-            return percentile_rank(value, today_pool)
-        if ref.get("demean"):
-            pool = [v for v in today_pool if v is not None]
-            center = (sum(pool) / len(pool)) if pool else 0.0
-            return percentile_rank(value - center, ref[key])
-        return percentile_rank(value, ref[key])
-
     knee = ocfg.get("pct_knee", 0.80)          # 분위 몇 부터 감점을 시작할지
     full = ocfg.get("pct_full", 0.85)          # 어디서 만점 감점에 도달할지
     pen  = 0.0
 
     # 거래량 기울기 — 일자 내 상위 20%에서만 유효. 좁은 램프 = 완만한 계단.
     pen += ocfg.get("w_vol", 5.0) * _ramp(
-        _pct(meta.get("vol_slope", 0), all_vol, "vol"), knee, full)
+        percentile_rank(meta.get("vol_slope", 0), all_vol), knee, full)
 
     # 검색량 기울기 — V-Surge가 이진으로 잡던 차원. 관심이 오를 때만 과열로 본다
     # (hype_slope<=0인데 순위만 높은 건 그냥 원래 관심 많은 종목이다).
     if meta.get("hype_slope", 0) > 0:
         pen += ocfg.get("w_hype", 5.0) * _ramp(
-            _pct(meta.get("hype_slope", 0), all_hype, "hype"), knee, full)
+            percentile_rank(meta.get("hype_slope", 0), all_hype), knee, full)
 
     # 당일 등락률 — 편측(상단) 램프. 여기는 진짜 완만하다(>=5% -2.96 → >=10% -4.41).
     pen += ocfg.get("w_chg", 5.0) * _ramp(
@@ -3236,7 +3025,7 @@ def _overheat_penalty(meta, all_vol, all_hype, ocfg, ref=None):
 
     return round(min(pen, ocfg.get("max_total", 15.0)), 2)
 
-def _calc_d(ticker, meta, all_vol, all_hype, top_pct, scfg, scan_date=None, ref=None):
+def _calc_d(ticker, meta, all_vol, all_hype, top_pct, scfg, scan_date=None):
     source = meta.get("source", "engine_a")
     base   = 50 if source == "both" else 30 if source == "engine_a" else 20
 
@@ -3269,7 +3058,7 @@ def _calc_d(ticker, meta, all_vol, all_hype, top_pct, scfg, scan_date=None, ref=
     ocfg = scfg.get("overheat_penalty", {}) or {}
     if ocfg.get("enabled", True):
         # 연속 과열 감점으로 교체 (근거는 _overheat_penalty docstring)
-        overheat_pen = _overheat_penalty(meta, all_vol, all_hype, ocfg, ref)
+        overheat_pen = _overheat_penalty(meta, all_vol, all_hype, ocfg)
     else:
         # 되돌리기 스위치 — 기존 V-Surge 이진 가점 그대로
         overheat_pen = 0.0
@@ -3278,61 +3067,6 @@ def _calc_d(ticker, meta, all_vol, all_hype, top_pct, scfg, scan_date=None, ref=
 
     score = min(base + strength + cross, 100) - overheat_pen
     return round(max(0.0, score), 1), n_accel, v_surge, overheat_pen
-
-def _calc_d_flow(ticker, meta, all_vol, all_hype, top_pct, scfg, scan_date=None):
-    """A-3 shadow — 수급축 재설계안. 발송·등급에 미사용, 결과 측정 전용.
-
-    실측 근거(2,757건 / 59일 / 450종목, outcomes 매칭 2,411건):
-
-      ① 구성요소의 부호가 서로 반대인데 모두 가산이라 상쇄된다.
-         순매수 일수 IC5 +0.055 · 외인 순매수 +0.067  (자금 유입 = 양)
-         거래량 기울기 -0.115 · 검색량 기울기 -0.099   (관심 급증 = 음)
-         → 합산한 D수급 종합은 +0.018로 신호가 사라진다.
-         여기서는 관심 급증을 감산으로 뒤집는다.
-
-      ② 기본점 순서가 실측 성과와 반대다.
-         현행 both 50 > engine_a 30 > engine_b 20
-         실측 engine_a -20.38% > engine_b -26.39% > both -25.27%
-         → both를 과열 신호로 보고 낮춘다.
-
-      ③ 관계가 단조가 아니라 역U자다. 중간 구간이 유의하게 낫다
-         (중간 -20.62% vs 극단 -25.12%, p<0.0001).
-         → 50에서 멀어질수록 감점해 중앙을 우대한다.
-
-    주의: 표본이 전 구간 평균 -22%인 하락장 한 국면이다. '관심 급증이 나쁘다'는
-    하락장에서 특히 강한 성질이라 상승장에서 뒤집힐 수 있다. 그래서 legacy
-    _calc_d를 그대로 두고 병행 계산만 한다.
-    """
-    source = meta.get("source", "engine_a")
-    base   = 25 if source == "both" else 40 if source == "engine_a" else 30
-
-    score = base
-
-    # 자금 유입 — 양의 IC. 가산 유지
-    nbd = meta.get("net_buy_days", 0)
-    if nbd >= 5:        score += 10
-    elif nbd >= 4:      score += 5
-    if meta.get("foreign_net", 0) > 0:
-        score += 5
-
-    # 관심 급증 — 음의 IC. 부호를 뒤집어 감산
-    if is_top_percentile(meta.get("vol_slope", 0), all_vol, top_pct):
-        score -= 10
-    if is_top_percentile(meta.get("hype_slope", 0), all_hype, top_pct):
-        score -= 10
-    if meta.get("hype_slope", 0) > 0 and meta.get("hype_rank", 9999) <= scfg.get("v_surge_rank", 20):
-        score -= 5
-
-    if meta.get("has_sector_bonus", False):
-        score += 5
-
-    score = max(0, min(score, 100))
-
-    # 역U자 — 중앙(50)에서 벗어난 만큼 감점. 최대 -12.5
-    score -= abs(score - 50) * 0.25
-
-    return round(max(0.0, min(100.0, score)), 1)
-
 
 def run_step3(pool_b,precomputed,cfg,date):
     scfg=cfg["scoring"]
@@ -3354,8 +3088,6 @@ def run_step3(pool_b,precomputed,cfg,date):
     all_vol=[m.get("vol_slope",0) for m in pool_b.values()]
     all_hype=[m.get("hype_slope",0) for m in pool_b.values()]
     top_pct=scfg.get("strength_top_pct",0.20)
-    # 과열 감점 분위의 비교 모집단. 런당 1회만 읽는다(종목마다 DB를 때리지 않는다).
-    overheat_ref = load_overheat_reference(date, scfg.get("overheat_penalty", {}) or {})
 
     min_peers = cfg.get("filter", {}).get("min_sector_peers", 2)
     sector_counts = Counter(
@@ -3379,14 +3111,11 @@ def run_step3(pool_b,precomputed,cfg,date):
     # Phase A.1 — 매핑 신뢰도 동시 산출 (외부 보고서 6건 사례 대응)
     # v3 hotfix: news_texts 가 일별 캐시라 어제 종목이 남아있을 수 있음 → pool_b 가드
     news_data = {}
-    news_fixed = {}
     for t, texts in news_texts.items():
         if t not in pool_b:
             continue
         nm = pool_b[t].get("name", t)
         news_data[t] = finbert.score_with_confidence(texts, name=nm)
-        # shadow — 검사만 필드별로 바로잡은 값. 집행에는 쓰지 않는다(D-2).
-        news_fixed[t] = finbert.confidence_by_field(news_items.get(t, []), nm)
     dart_scores = {}
     dart_best_titles = {}
     for ticker, texts in dart_texts.items():
@@ -3402,25 +3131,16 @@ def run_step3(pool_b,precomputed,cfg,date):
 
     results=[]
     skipped_low_confidence = 0
-    skipped_fixed = 0
-    measured_fixed = 0
     for ticker,meta in pool_b.items():
         t_score=_calc_t(meta)
-        t_presurge=_calc_t_presurge(meta)   # Task 4: shadow 기술점수 병행 계산
         n_sc, n_headline, n_pct, n_conf, n_raw = news_data.get(
             ticker, (50.0,"",0.0,0.0,None))
         d_sc=dart_scores.get(ticker,50.0)
         # Phase A.1 (C1): 신뢰도 < 0.5 면 뉴스 감성 폐기 (중립 50 처리)
-        n_conf_fix, n_raw_fix, n_field_mix = news_fixed.get(ticker, (None, None, ""))
-        # 집행은 구값(n_conf) 그대로 — shadow 는 기록만 한다.
         news_skipped = n_conf < 0.5
         news_eff = 50.0 if news_skipped else n_sc
         if news_skipped:
             skipped_low_confidence += 1
-        if n_conf_fix is not None:
-            measured_fixed += 1
-            if n_conf_fix < 0.5:
-                skipped_fixed += 1
         # s_text: 표시·DB용 결합 감성 (0~100 스케일 유지 위해 news_w/dart_w 사용)
         s_text = round(news_eff*news_w + d_sc*dart_w, 1)
         # P1-4: S_text의 최종점수 기여 — split_text=False면 기존식(s_text×w_text)과 동일
@@ -3428,25 +3148,17 @@ def run_step3(pool_b,precomputed,cfg,date):
             text_contrib = news_eff*w_news + d_sc*w_dart
         else:
             text_contrib = s_text * w_text
-        d_score,n_accel,v_surge,overheat_pen=_calc_d(ticker,meta,all_vol,all_hype,top_pct,scfg,date,overheat_ref)
-        d_flow=_calc_d_flow(ticker,meta,all_vol,all_hype,top_pct,scfg,date)   # A-3 shadow
+        d_score,n_accel,v_surge,overheat_pen=_calc_d(ticker,meta,all_vol,all_hype,top_pct,scfg,date)
         score=round(t_score*w_tech + text_contrib + d_score*w_cross, 2)
-        # Task 4: shadow 종합점수(발송·등급에 미사용, 결과 측정 전용)
-        score_presurge=round(t_presurge*w_tech + text_contrib + d_score*w_cross, 2)
-        # A-3 shadow 종합 — 수급축만 교체, 나머지는 동일
-        score_flow=round(t_score*w_tech + text_contrib + d_flow*w_cross, 2)
         results.append({
             "ticker":ticker,"name":meta.get("name",ticker),"sector":meta.get("sector","기타"),
             "rating_bond":meta.get("rating_bond"),"rating_cp":meta.get("rating_cp"),
             "fg_sector":meta.get("fg_sector"),"fg_industry":meta.get("fg_industry"),
             "ksic":meta.get("ksic"),"largest_holder":meta.get("largest_holder"),
             "cap_tier":meta.get("cap_tier","large"),"score":score,
-            "t":t_score,"t_presurge":t_presurge,"score_presurge":score_presurge,
+            "t":t_score,
             "s_text":s_text,"news_score":n_sc,"dart_score":d_sc,"d":d_score,
             "news_conf":n_conf,"news_raw":n_raw,
-            "news_conf_fixed":n_conf_fix,"news_raw_fixed":n_raw_fix,
-            "news_field_mix":n_field_mix,
-            "d_flow":d_flow,"score_flow":score_flow,
             "source":meta.get("source","?"),"n_accel":n_accel,"v_surge":v_surge,
             "overheat_pen":overheat_pen,
             "finbert_mode":finbert.mode,
@@ -3462,10 +3174,6 @@ def run_step3(pool_b,precomputed,cfg,date):
             "current_price":meta.get("current_price",0),"inst_net":meta.get("inst_net",0),"foreign_net":meta.get("foreign_net",0),
             "rsi":meta.get("rsi",50.0),"bb_pos":meta.get("bb_pos",50.0),
             "change_pct":meta.get("change_pct",0.0),
-            # D-5 shadow — 기록만 한다. 집행 경로는 건드리지 않는다.
-            "prev_change_pct":meta.get("prev_change_pct",0.0),
-            "prev_spike_flag":prev_spike_flag(cfg, meta.get("prev_change_pct"),
-                                              meta.get("change_pct")),
             "hype_slope":meta.get("hype_slope",0),"hype_rank":meta.get("hype_rank",9999),
             "disparity":meta.get("disparity",0),
         })
@@ -3473,25 +3181,8 @@ def run_step3(pool_b,precomputed,cfg,date):
     hi=cfg["grade"]["high_interest"]; mi=cfg["grade"]["interest"]
     for r in results:
         r["grade"]="집중" if r["score"]>=hi else "주시" if r["score"]>=mi else "참고"
-    # D-5 shadow — 걸린 건수만 남긴다. 배제도 감점도 하지 않는다.
-    _spk = [r for r in results if r.get("prev_spike_flag")]
-    if _spk:
-        _g = (cfg.get("overheat", {}) or {}).get("prev_day_spike_gate", {}) or {}
-        logger.info(
-            f"[shadow] 전일급등→당일급락 {len(_spk)}/{len(results)}종목 "
-            f"(전일>=+{_g.get('prev_min',15.0):g}% & 당일<={_g.get('cur_max',-8.0):g}%, "
-            f"집행 {'ON' if _g.get('enabled') else 'OFF'}): "
-            + ", ".join(f"{r.get('name') or r['ticker']}"
-                        f"({r.get('prev_change_pct',0):+.1f}→{r.get('change_pct',0):+.1f})"
-                        for r in _spk[:5])
-            + (" …" if len(_spk) > 5 else ""))
     if skipped_low_confidence:
         logger.info(f"Phase A.1: 매핑 신뢰도 < 0.5 → 감성 점수 폐기 {skipped_low_confidence}건")
-    if measured_fixed:
-        # D-2 shadow — 집행에는 반영하지 않는다. 같은 종목을 필드별 검사로
-        # 다시 재면 몇 건이 걸리는지만 기록한다.
-        logger.info(f"[shadow] 필드별 검사 기준 폐기 {skipped_fixed}/{measured_fixed}종목 "
-                    f"(집행 {skipped_low_confidence}건 — 변동 없음)")
     logger.info(f"스코어링: {len(results)}개 | 집중:{sum(1 for r in results if r['grade']=='집중')} | FinBERT:{finbert.mode}")
     save_scan_results(results,date)
     CACHE_DIR.mkdir(parents=True,exist_ok=True)
@@ -3503,8 +3194,6 @@ def run_step3(pool_b,precomputed,cfg,date):
 # ══════════════════════════════════════════════════════════════════════════════
 def _esc(text: str) -> str:
     return str(text).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-
-GRADE_RANK={"집중":2,"주시":1,"참고":0}
 
 def entry_candidate(r):
     """9/11 백테스트 진입 후보 규칙 — 이격 92~103 · 순매수 3일+ · RSI ≤ 45.
@@ -3545,22 +3234,6 @@ def run_step4(results,cfg,date=None,dry_run=False,run_type=None):
     # 진입 후보 규칙 충족 → 총점 순. 관찰 횟수는 동점 정렬에만 쓴다.
     # 예전 (watch_n, watch_gap) 정렬은 일자내 IC 가 단타 0 · 장기 음(−)이었다.
     to_send.sort(key=lambda r: (r["entry_ok"], r["score"], r["watch_n"]), reverse=True)
-
-    def phase_tag(r):
-        """물밑 점수와 총점의 격차 = 기술축 관점 불일치. 감성·수급은 두 점수가 같으므로
-        격차는 오직 '이미 튀어나왔나 / 아직 물밑인가'만 말한다.
-        숫자로 병기하지 않는 이유: 실측 IC가 어느 지평에서도 유의하지 않아(fwd10
-        -0.054 p=0.33) 다섯 번째 점수로 읽히면 오해만 만든다. 라벨로만 남겨
-        누적 뒤 outcomes로 검증한다.
-        기준선은 실측 분포(n=418)의 사분위 — 격차 중앙값이 0이 아니라 +6이라
-        대칭 ±5로 끊으면 절반이 물밑으로 찍힌다."""
-        ps = r.get("score_presurge")
-        if ps is None:
-            return ""
-        gap = ps - r.get("score", 0)
-        if gap >= 12:  return "  ⟨물밑⟩"
-        if gap <= -1:  return "  ⟨돌출⟩"
-        return ""
 
     def fmt(i,r):
         tier_icon={"large":"[대형]","mid":"[중형]","small":"[소형]"}.get(r.get("cap_tier","large"),"[?]")
@@ -3632,7 +3305,7 @@ def run_step4(results,cfg,date=None,dry_run=False,run_type=None):
             f"   🏦 기관 {inst_str}  |  🌏 외인 {foreign_str}  ({r['net_buy_days']}일){retail_tag}\n"
             f"   📊 BB {bb:.0f}% {bb_label}  |  RSI {rsi:.0f} {rsi_label}{vol_line}\n"
             f"   📐 이격도 {r['disparity']:.1f}%  (20일 평균 대비 현재가 위치)\n"
-            f"   🏆 <b>총점 {r['score']:.1f}</b>  기술 {r['t']:.0f}  수급 {r['d']:.0f}  감성 {r['s_text']:.0f}{cross}{phase_tag(r)}"
+            f"   🏆 <b>총점 {r['score']:.1f}</b>  기술 {r['t']:.0f}  수급 {r['d']:.0f}  감성 {r['s_text']:.0f}{cross}"
             f"{headline_line}{dart_line}"
         )
 
@@ -3670,7 +3343,6 @@ def run_step4(results,cfg,date=None,dry_run=False,run_type=None):
             lines.append(fmt(i, r) + f"\n   👁 {watch_tag(r)}")
         lines.append("\n━━━━━━━━━━━━━━━━━━━━")
         lines.append("진입 후보 규칙: 이격 92~103 · 순매수 5일 중 3일+ · RSI ≤ 45")
-        lines.append("⟨물밑⟩ 아직 안 튀어나온 구조 · ⟨돌출⟩ 이미 움직인 구조  (검증 중)")
         lines.append("차트·수급·관찰 이력 전체는 대시보드에서")
         msg_items.append(("list", "\n".join(lines)))
 
