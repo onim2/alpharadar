@@ -4,6 +4,10 @@
 것들을 여기 모은다. 발견한 시점과 근거를 같이 적어 나중에 왜 이걸 적었는지
 되짚을 수 있게 한다.
 
+2026-10-02 정리 완료, 복구 태그 archive/pre-cleanup-20261002 · archive/prev-change-shadow-20261002
+
+주의: 9/18~핫픽스 반영 전 outcomes 일부 오염. 오염 처리(재계산 또는 outcomes_clean) 전에는 analyze_exit_grid 결과를 존폐 판정에 쓰지 않는다
+
 ---
 
 ## T6 (카드 생성기)

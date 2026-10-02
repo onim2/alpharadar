@@ -1,7 +1,7 @@
 # 누적 관찰 이력 검증 — 카드 표식의 근거는 서지 않는다
 
 작성 2026-09-11. 전달문(2026-09-11) 작업 4-⑤ "관찰 횟수 상충" 재검증.
-하네스: `analyze_watch.py`. 판정: **docstring 주장 기각. 8월 말 분석도 그대로는
+하네스: `analyze_watch.py` (스크립트는 archive/pre-cleanup-20261002 태그에 보존). 판정: **docstring 주장 기각. 8월 말 분석도 그대로는
 맞지 않다. 카드 표식 세 개 모두 단타·스윙 지평에 근거가 없다.**
 
 ## 요약
@@ -156,3 +156,5 @@ docstring 의 근거 분석과 출하된 코드가 **정의를 공유하지 않�
 python analyze_watch.py --validate      # docstring pooled 재현 + 전체 검정
 python analyze_watch.py --no-dedup-bars # 전수 기준 (판정은 기본값 기준으로 할 것)
 ```
+
+(스크립트는 archive/pre-cleanup-20261002 태그에 보존)
