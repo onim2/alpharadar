@@ -172,5 +172,4 @@ GitHub Actions 무료 한도:
 cd "alpha_radar 2"
 git pull
 # data/scores_history.db 최신화됨
-# backtest.py 등으로 분석 가능
 ```

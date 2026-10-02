@@ -17,7 +17,6 @@
 ```
 your_folder/
 ├── alpharadar.py           # 메인 스캐너 (2,016줄)
-├── backtest.py             # 백테스트
 ├── config.yaml             # 설정 (가중치·필터)
 ├── requirements.txt        # Python 의존성
 ├── .env.example            # 환경변수 템플릿

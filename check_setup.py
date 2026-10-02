@@ -43,7 +43,7 @@ else:
 # ─── 2. 필수 파일 ─────────────────────────────────────────────
 print("\n[2] 필수 파일")
 required_files = ["alpharadar.py", "config.yaml", "requirements.txt"]
-optional_files = [".env", "backtest.py", ".gitignore"]
+optional_files = [".env", ".gitignore"]
 for f in required_files:
     if Path(f).exists():
         ok(f"{f}")

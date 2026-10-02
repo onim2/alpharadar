@@ -2462,7 +2462,7 @@ def _load_master_universe_meta() -> dict:
         db = "/Users/summer123/Project_2/data_store/master.db"
         if not os.path.exists(db):
             # 러너에는 master.db가 없다. 그때는 리포에 커밋된 캐시를 쓴다
-            # (export_sector_map.py가 만든다). 이게 없으면 Actions 런에서
+            # (export_sector_map.py가 만들었다. 스크립트는 archive/pre-cleanup-20261002 태그에 보존). 이게 없으면 Actions 런에서
             # FnGuide 섹터·KSIC·등급 보강이 통째로 빠지고, sector가 소속부나
             # 기타로 남아 동조화 보너스가 엉뚱하게 발화한다 — 실제로
             # scores_history.db의 fg_sector 컬럼이 100% 비어 있었다.

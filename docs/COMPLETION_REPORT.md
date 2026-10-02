@@ -85,7 +85,7 @@ gated origin: [('20260525','005930','gated',1.1706)]              PASS ✓
 브랜치: `feat/v3.3-presurge` (main 미머지, **푸시 안 함** — 샘 승인 대기).
 
 ## 스펙과 다르게 구현한 부분과 사유
-- **Task 5 진입가 정의**: WORK_ORDER "T+1/5/10/20 거래일 종가 수익률"에서 진입가를 `scan_date 당일 이후 첫 거래일 종가`로 정의(searchsorted side=left). backtest.py의 기존 forward-return 관례(side=right, 익일 진입)와 다르되, "당일 종가 진입" 해석이 08:00 발송 스캐너에 더 부합. T+h는 진입 후 h거래일.
+- **Task 5 진입가 정의**: WORK_ORDER "T+1/5/10/20 거래일 종가 수익률"에서 진입가를 `scan_date 당일 이후 첫 거래일 종가`로 정의(searchsorted side=left). backtest.py의 기존 forward-return 관례(side=right, 익일 진입)와 다르되, "당일 종가 진입" 해석이 08:00 발송 스캐너에 더 부합. T+h는 진입 후 h거래일. (스크립트는 archive/pre-cleanup-20261002 태그에 보존)
 - **Task 5 멱등 강화**: 스펙의 "신규 행 0"에 더해, 값 불변 시 재기록도 생략(갱신 0)하도록 가드 추가. 스펙 위반 아님(더 엄격).
 - 그 외 없음.
 
