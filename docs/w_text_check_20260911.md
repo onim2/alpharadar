@@ -1,7 +1,7 @@
 # w_text 재배분 검증 — 0.40 → 0.20
 
 작성 2026-09-11. 전달문(2026-09-11) 작업 4-③ 지시 수행 결과.
-하네스: `analyze_wtext.py`, `backtest.py --grid-search --walk-forward --grid-horizon 5`.
+하네스: `analyze_wtext.py`, `backtest.py --grid-search --walk-forward --grid-horizon 5` (스크립트는 archive/pre-cleanup-20261002 태그에 보존).
 판정: **기각 — 바꿀 근거가 없다. `config.yaml`은 0.40 유지.**
 
 ## 요약
@@ -128,3 +128,5 @@ python analyze_wtext.py                    # 진입 바 겹침 제외 (기본 ·
 python analyze_wtext.py --no-dedup-bars    # 전수 기준
 python backtest.py --grid-search --walk-forward --grid-horizon 5
 ```
+
+(스크립트는 archive/pre-cleanup-20261002 태그에 보존)

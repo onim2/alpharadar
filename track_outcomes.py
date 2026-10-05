@@ -27,6 +27,7 @@
 #   [Shadow 판정]  Spearman IC(score_presurge, fwd10)
 #                   > Spearman IC(score_legacy=score_total, fwd10)   (고유 종목 n>=30)
 #       → 참이면 물밑 스코어가 legacy보다 예측력 우위 → pre_surge_mode 승격 검토.
+#       (2026-10-02 종료 — presurge 계산 제거, score_presurge 는 이후 NULL)
 #   ※ 판정은 별도 분석에서 수행. 본 스크립트는 outcomes 적재만 담당.
 # ══════════════════════════════════════════════════════════════════════════════
 import argparse
