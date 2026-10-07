@@ -1934,7 +1934,9 @@ def _get_last_weekday(date):
 def _workdays_before(date,n):
     return (datetime.strptime(date,"%Y%m%d")-timedelta(days=int(n*1.5))).strftime("%Y%m%d")
 
-def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
+def _precompute_ticker(ticker, start_date, end_date, info, ucfg, cap_fallback=False):
+    """cap_fallback=True 는 run_step0 가 '이번 런 목록의 시총이 비었다'고 판정했을 때만
+    켠다. 그때만 시총을 상장주식수(Stocks) × 최근 바 종가로 계산한다."""
     import FinanceDataReader as fdr
     try:
         df=fdr.DataReader(ticker,start_date,end_date)
@@ -1949,7 +1951,21 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
         vol_5d=moving_average(volume_s,5)
         mkt=info.get("market","KOSPI")
 
-        marcap_real = int(info.get("market_cap", 0) or 0)
+        marcap = _pos_num(info.get("market_cap"))
+        cap_src = "listing"
+        if marcap is None and cap_fallback:
+            # 최근 바 종가(장중이면 현재가). 게이트·cap_tier 판정용이라 그 오차는
+            # 경계 종목에서만 결과를 바꾼다(2026-10-06 결정 ①).
+            stocks = _pos_num(info.get("Stocks"))
+            if stocks is None:
+                _precomp_count("cap_unknown")
+                return None
+            marcap = stocks * current
+            cap_src = "stocks_x_close"
+            _precomp_count("cap_computed")
+        elif marcap is None:
+            _precomp_count("cap_missing")
+        marcap_real = int(marcap or 0)
 
         # 시총을 확인할 수 없으면 통과시키지 않는다. 예전 조건은
         # `marcap_real > 0 and marcap_real < 컷` 이라, 조회에 실패한 종목이
@@ -1958,6 +1974,8 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
         # 정상 운영에서는 발동하지 않는다(실측: KOSPI 943 + KOSDAQ 1820 종목
         # 모두 시총 조회 100% 성공). 소스가 망가진 경우의 안전장치다.
         if marcap_real < ucfg.get("min_market_cap", 200_000_000_000):
+            if marcap is not None:
+                _precomp_count("cap_below")
             return None
         cap = marcap_real
 
@@ -1988,7 +2006,8 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
             "rating_bond":info.get("rating_bond"),"rating_cp":info.get("rating_cp"),
             "fg_sector":info.get("fg_sector"),"fg_industry":info.get("fg_industry"),
             "ksic":info.get("ksic"),"largest_holder":info.get("largest_holder"),
-            "market":mkt,"market_cap":cap,"cap_tier":cap_tier,"current_price":current,
+            "market":mkt,"market_cap":cap,"market_cap_src":cap_src,
+            "cap_tier":cap_tier,"current_price":current,
             "ma20":ma20,"ma60":ma60,"ma120":ma120,"disparity":disparity(current,ma20),
             "vol_60ma":vol_60ma,"vol_20ma":vol_20ma,"vol_5d_avg":vol_5d,
             "vol_slope":linear_slope(volume_s.iloc[-5:].tolist()),
@@ -2003,6 +2022,7 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg):
         }
     except Exception as e:
         logger.debug(f"_precompute_ticker 실패 ({ticker}): {e}")
+        _precomp_count("exception", f"{ticker}: {type(e).__name__}: {e}")
         return None
 
 # ── KIS API 수급 클라이언트 ───────────────────────────────────────────────────
@@ -2430,6 +2450,43 @@ def _load_master_universe_meta() -> dict:
 #      새로 떠도 살아남는다(data/cache는 그렇지 않다)
 # 상장목록은 하루 이틀 묵어도 거의 같다. 빠지는 건 신규상장뿐인데 그건 어차피
 # min_listed_days에 걸려 탈락한다 — 스캔을 통째로 접는 것보다 훨씬 싸다.
+# ── 시총 결측 대응 (2026-10-06) ───────────────────────────────────────────────
+# 10/6 아침 런(장중 10:44)에 fdr.StockListing 이 행은 2,766개를 주면서 Marcap·Close 를
+# 전부 비워 줬다(Stocks 는 정상, 같은 날 18:31 재조회는 정상). 시총 게이트가 그걸
+# int(nan) 예외로 받아 전 종목을 로그 없이 탈락시켜 유니버스 0 으로 런이 죽었고,
+# 그 깨진 목록이 DB 스냅샷(마지막 폴백)까지 덮어썼다.
+# 대응: 목록의 시총 유효율이 _CAP_VALID_MIN 미만이면 ① 스냅샷에 저장하지 않고
+# ② 그 런에서만 시총을 '상장주식수 × 최근 바 종가'로 계산한다. 정상인 날(유효율
+# 100%)에는 계산 경로를 타지 않는다 — 원래 시총이 비어 탈락하던 종목은 그대로 탈락.
+_CAP_VALID_MIN = 0.5
+_PRECOMP_STATS: Counter = Counter()   # run_step0 가 런마다 비운다
+_PRECOMP_LOCK = threading.Lock()
+_PRECOMP_ERR_SAMPLE: list = []        # 첫 예외 메시지 하나만 남긴다
+
+
+def _pos_num(v):
+    """양의 유한수면 float, 아니면 None. NaN·None·'-'·0 을 한 번에 걸러낸다."""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if np.isfinite(x) and x > 0 else None
+
+
+def _marcap_valid_ratio(df, col="Marcap"):
+    """목록에서 시총이 양수로 들어온 비율. 컬럼이 없으면 0."""
+    if df is None or not len(df) or col not in df.columns:
+        return 0.0
+    return float(pd.to_numeric(df[col], errors="coerce").fillna(0).gt(0).mean())
+
+
+def _precomp_count(key, err=None):
+    with _PRECOMP_LOCK:
+        _PRECOMP_STATS[key] += 1
+        if err is not None and not _PRECOMP_ERR_SAMPLE:
+            _PRECOMP_ERR_SAMPLE.append(err)
+
+
 _LISTING_CSV_URL = ("https://raw.githubusercontent.com/FinanceData/fdr_krx_data_cache/"
                     "refs/heads/master/data/listing/krx/{d}.csv")
 _LISTING_MKT_ID = {"KOSPI": "STK", "KOSDAQ": "KSQ", "KONEX": "KNX"}
@@ -2511,7 +2568,14 @@ def _stock_listing(mkt, end_date, fdr):
     try:
         df = fdr.StockListing(mkt)
         if df is not None and len(df):
-            _save_listing_snapshot(mkt, df, end_date)
+            ratio = _marcap_valid_ratio(df)
+            if ratio < _CAP_VALID_MIN:
+                # 목록(코드·상장주식수)은 쓸 수 있으므로 그대로 쓴다. 다만 마지막
+                # 성공 목록을 깨진 것으로 덮지 않도록 스냅샷 저장은 건너뛴다.
+                logger.warning(f"목록 시총 결측 ({mkt}): 유효 {ratio:.0%} < "
+                               f"{_CAP_VALID_MIN:.0%} — 스냅샷 저장 안 함, 시총은 계산으로 대체")
+            else:
+                _save_listing_snapshot(mkt, df, end_date)
             return df
         logger.warning(f"목록 조회 결과 없음 ({mkt}) — 폴백")
     except Exception as e:
@@ -2519,7 +2583,8 @@ def _stock_listing(mkt, end_date, fdr):
 
     df, day = _listing_from_csv_cache(mkt, end_date)
     if df is not None:
-        _save_listing_snapshot(mkt, df, day)
+        if _marcap_valid_ratio(df) >= _CAP_VALID_MIN:
+            _save_listing_snapshot(mkt, df, day)
         return df
     return _listing_from_snapshot(mkt)
 
@@ -2637,9 +2702,19 @@ def run_step0(date,cfg,market="ALL",limit=None):
     logger.info(f"전체: {len(all_tickers)}개")
     if limit: all_tickers=all_tickers[:limit]; logger.info(f"제한: {limit}개")
 
+    # 이번 런 목록의 시총 유효율. 절반도 안 차 있으면 소스가 시총을 비워 준 날이다.
+    cap_ok = sum(1 for t in all_tickers if _pos_num(ticker_info.get(t, {}).get("market_cap")))
+    cap_ratio = cap_ok / max(len(all_tickers), 1)
+    cap_fallback = bool(all_tickers) and cap_ratio < _CAP_VALID_MIN
+    if cap_fallback:
+        logger.warning(f"시총 결측 런: 목록 시총 유효 {cap_ok}/{len(all_tickers)} "
+                       f"({cap_ratio:.0%}) — 상장주식수 × 최근 바 종가로 계산한다")
+
+    with _PRECOMP_LOCK:
+        _PRECOMP_STATS.clear(); _PRECOMP_ERR_SAMPLE.clear()
     precomputed,failed={},[]
     with ThreadPoolExecutor(max_workers=10) as executor:
-        futures={executor.submit(_precompute_ticker,t,start_date,end_date,ticker_info.get(t,{}),ucfg):t for t in all_tickers}
+        futures={executor.submit(_precompute_ticker,t,start_date,end_date,ticker_info.get(t,{}),ucfg,cap_fallback):t for t in all_tickers}
         for future in tqdm(as_completed(futures),total=len(futures),desc="사전 계산",unit="종목"):
             t=futures[future]
             try:
@@ -2649,6 +2724,11 @@ def run_step0(date,cfg,market="ALL",limit=None):
                 logger.debug(f"future 결과 실패 ({t}): {e}")
                 failed.append(t)
     if failed: logger.warning(f"실패: {len(failed)}개")
+    _st = dict(_PRECOMP_STATS)
+    logger.info(f"사전 계산 탈락·대체: 시총 계산 {_st.get('cap_computed',0)} · "
+                f"계산 불가 탈락 {_st.get('cap_unknown',0)} · 시총 결측 탈락 {_st.get('cap_missing',0)} · "
+                f"시총 미달 {_st.get('cap_below',0)} · 예외 {_st.get('exception',0)}"
+                + (f" (첫 예외: {_PRECOMP_ERR_SAMPLE[0]})" if _PRECOMP_ERR_SAMPLE else ""))
     for p in precomputed.values():
         for k,v in [("hype_latest",0.0),("hype_7d_ago",0.0),("hype_slope",0.0),("hype_rank",9999),("neg_ratio",0.0)]:
             p.setdefault(k,v)
@@ -3470,8 +3550,11 @@ def main():
         # success로 끝났다. 로그를 열어보기 전에는 알 방법이 없었다.
         # 데이터 소스 장애는 통제할 수 없어도, 그것이 성공으로 보고되는 것은 막는다.
         if not precomputed:
+            _st = dict(_PRECOMP_STATS)
             logger.error("유니버스가 비었다 — 종목 목록 조회 실패로 보인다. "
-                         "위 '목록 조회 실패' 경고를 확인할 것. 스캔을 중단한다.")
+                         "위 '목록 조회 실패'·'시총 결측' 경고를 확인할 것. 스캔을 중단한다. "
+                         f"(시총 결측 탈락 {_st.get('cap_missing',0)} · 계산 불가 {_st.get('cap_unknown',0)} · "
+                         f"예외 {_st.get('exception',0)})")
             sys.exit(1)
         if args.step==0: return
     else:
