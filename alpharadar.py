@@ -1934,12 +1934,21 @@ def _get_last_weekday(date):
 def _workdays_before(date,n):
     return (datetime.strptime(date,"%Y%m%d")-timedelta(days=int(n*1.5))).strftime("%Y%m%d")
 
-def _precompute_ticker(ticker, start_date, end_date, info, ucfg, cap_fallback=False):
+def _precompute_ticker(ticker, start_date, end_date, info, ucfg, cap_fallback=False, bar_before=None):
     """cap_fallback=True 는 run_step0 가 '이번 런 목록의 시총이 비었다'고 판정했을 때만
-    켠다. 그때만 시총을 상장주식수(Stocks) × 최근 바 종가로 계산한다."""
+    켠다. 그때만 시총을 상장주식수(Stocks) × 최근 바 종가로 계산한다.
+
+    bar_before(YYYYMMDD)를 주면 그 날짜 '미만'의 바만 쓴다 — 아침 회차용(run_bar_cutoff)."""
     import FinanceDataReader as fdr
     try:
-        df=fdr.DataReader(ticker,start_date,end_date)
+        if bar_before:
+            prev = (datetime.strptime(bar_before, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+            df=fdr.DataReader(ticker,start_date,min(end_date,prev))
+            # 소스가 종료일을 무시하고 당일 바를 붙여 줘도 여기서 자른다.
+            if df is not None and len(df):
+                df=df[df.index < pd.Timestamp(datetime.strptime(bar_before, "%Y%m%d"))]
+        else:
+            df=fdr.DataReader(ticker,start_date,end_date)
         if df is None or len(df)<20: return None
         close_s=df["Close"].astype(float); volume_s=df["Volume"].astype(float)
         current=float(close_s.iloc[-1])
@@ -2589,6 +2598,19 @@ def _stock_listing(mkt, end_date, fdr):
     return _listing_from_snapshot(mkt)
 
 
+def run_bar_cutoff(date, run_type=None):
+    """시세 바 컷 — 아침(am) 회차는 회차 날짜 '미만'의 바만 쓴다. 저녁은 None(제한 없음).
+
+    아침 런의 설계 의도는 장 시작 전(06:10 KST)에 직전 거래일 종가까지로 점수를 내는 것이다.
+    수급은 이미 당일을 뺀다(investor_exclude_today). 시세는 FDR 이 주는 마지막 바를 그대로
+    써서, 크론이 밀려 장중에 돌면 당일 미완성 바가 들어갔다 — 2026-10-08 아침 런(10:07)이
+    10/8 장중 바로 등락률·RSI·BB·이격도를 계산했다(041190 등락률 −1.17%, 10/7 실제 −5.36%).
+    실행 시각과 무관하게 회차 날짜로 자른다.
+    """
+    run_type = run_type or run_type_kst()
+    return date if run_type == "am" else None
+
+
 def run_step0(date,cfg,market="ALL",limit=None):
     dart_sector_map = _load_dart_sector_map()
     import FinanceDataReader as fdr
@@ -2597,7 +2619,9 @@ def run_step0(date,cfg,market="ALL",limit=None):
     end_date=_get_last_weekday(date)
     start_date=_workdays_before(end_date,ucfg["lookback_days"])
     if end_date!=date: logger.info(f"날짜 조정: {date} → {end_date}")
-    logger.info(f"FDR 데이터 수집: {start_date} ~ {end_date}")
+    bar_before = run_bar_cutoff(date)
+    logger.info(f"FDR 데이터 수집: {start_date} ~ {end_date}"
+                + (f" (아침 회차 — 시세는 {bar_before} 미만 바만 사용)" if bar_before else ""))
 
     markets=["KOSPI","KOSDAQ"] if market=="ALL" else [market]
     frames=[]
@@ -2714,7 +2738,7 @@ def run_step0(date,cfg,market="ALL",limit=None):
         _PRECOMP_STATS.clear(); _PRECOMP_ERR_SAMPLE.clear()
     precomputed,failed={},[]
     with ThreadPoolExecutor(max_workers=10) as executor:
-        futures={executor.submit(_precompute_ticker,t,start_date,end_date,ticker_info.get(t,{}),ucfg,cap_fallback):t for t in all_tickers}
+        futures={executor.submit(_precompute_ticker,t,start_date,end_date,ticker_info.get(t,{}),ucfg,cap_fallback,bar_before):t for t in all_tickers}
         for future in tqdm(as_completed(futures),total=len(futures),desc="사전 계산",unit="종목"):
             t=futures[future]
             try:
