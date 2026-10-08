@@ -49,7 +49,7 @@ AlphaRadar v3.3.1 — 단일 파일 안정화 버전
 """
 
 # ── 표준 라이브러리 ────────────────────────────────────────────────────────────
-import argparse, io, logging, os, pickle, random, re, sqlite3, sys, time, threading, zipfile
+import argparse, io, json, logging, os, pickle, random, re, sqlite3, sys, time, threading, zipfile
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -672,7 +672,15 @@ def _conn():
     finally:
         con.close()
 
+# dry-run 은 scan_results 에 쓰지 않는다. 쓰면 같은 회차의 본 런과 행이 섞이고,
+# 회차 가드가 그 행을 '이미 돈 런'으로 읽는다. main() 이 --dry-run 일 때 켠다.
+_SCAN_RESULTS_READONLY = False
+
+
 def save_scan_results(results, scan_date, run_type=None):
+    if _SCAN_RESULTS_READONLY:
+        logger.info(f"dry-run — scan_results 기록 생략 ({len(results)}행)")
+        return
     if run_type is None:
         run_type = run_type_kst()
     with _conn() as con:
@@ -3533,8 +3541,50 @@ def latest_trading_day(asof, probe="005930"):
     return None
 
 
+_KIS_HOLIDAY_PATH  = "/uapi/domestic-stock/v1/quotations/chk-holiday"
+_KIS_HOLIDAY_TR    = "CTCA0903R"
+_HOLIDAY_CACHE     = CACHE_DIR / "kis_holiday.json"
+
+
+def market_open_kis(date):
+    """KIS 국내휴장일조회(chk-holiday)로 그날 개장 여부. True/False, 알 수 없으면 None.
+
+    경로·TR 은 KIS 공식 예제(open-trading-api chk_holiday.py)로 확인했고, 응답은 실측
+    (2026-10-08): 기준일부터 24일치 output 행, 행마다 bass_dt·opnd_yn(개장일 여부) 등.
+    20261005·20261009 → opnd_yn=N.
+    KIS 는 "단시간 다수 호출 시 서비스 영향, 1일 1회 호출"을 요청한다 — 조회한 날(KST)과
+    응답 행을 data/cache/kis_holiday.json 에 두고, 같은 날 그 날짜가 들어 있으면 재사용한다.
+    Actions 에서는 일별 캐시(actions/cache)에 실려 다음 런으로 넘어간다.
+    """
+    today = today_kst()
+    try:
+        cached = json.loads(_HOLIDAY_CACHE.read_text(encoding="utf-8"))
+        if cached.get("fetched") == today and date in cached.get("days", {}):
+            return cached["days"][date] == "Y"
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        d = _kis_get(_KIS_HOLIDAY_PATH, {"BASS_DT": date, "CTX_AREA_NK": "", "CTX_AREA_FK": ""},
+                     _KIS_HOLIDAY_TR)
+        days = {str(r.get("bass_dt") or "").strip(): str(r.get("opnd_yn") or "").strip().upper()
+                for r in (d.get("output") or [])}
+        days = {k: v for k, v in days.items() if len(k) == 8 and v in ("Y", "N")}
+    except Exception as e:
+        logger.warning(f"KIS 휴장일조회 실패 ({type(e).__name__}: {e})")
+        return None
+    if date not in days:
+        logger.warning(f"KIS 휴장일조회 응답에 {date} 가 없다 (rt_cd={d.get('rt_cd')} msg={d.get('msg1','').strip()})")
+        return None
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _HOLIDAY_CACHE.write_text(json.dumps({"fetched": today, "days": days}), encoding="utf-8")
+    except OSError:
+        pass
+    return days[date] == "Y"
+
+
 def slot_rows(scan_date, run_type):
-    """같은 (날짜, 회차) 키로 이미 기록된 행 수 — scan_results, sent_history."""
+    """같은 (날짜, 회차) 키로 이미 기록된 행 수 — (scan_results, sent_history)."""
     with _conn() as con:
         n_scan = con.execute("SELECT COUNT(*) FROM scan_results WHERE scan_date=? AND run_type=?",
                              (scan_date, run_type)).fetchone()[0]
@@ -3543,19 +3593,21 @@ def slot_rows(scan_date, run_type):
     return n_scan, n_sent
 
 
-def run_guard(date_str, run_type):
+def run_guard(date_str, run_type, dry_run=False):
     """전체 런을 시작해도 되는지. (계속 여부, 종료 코드)를 돌려준다.
 
-    휴장일 — 저녁(pm) 회차만 본다. 저녁 런은 그날 장이 끝난 뒤라, 거래일이면 그날
-    바가 반드시 있다. 회차 날짜와 최근 거래일이 다르면 그날은 장이 없었다.
-    아침(am) 회차는 장 시작 전이라 거래일에도 그날 바가 없다 — 데이터로는 판정할
-    수 없어 여기서 거르지 않는다. 날짜는 실행 시각이 아니라 회차 날짜다(자정을 넘겨
-    도착한 저녁 런의 '오늘'은 다음 날이다).
-    2026-10-05(대체공휴일) 저녁 런이 10/2 바로 재스캔·발송한 사고가 계기.
+    휴장일 — 날짜는 실행 시각이 아니라 회차 날짜다(자정을 넘겨 도착한 저녁 런의
+    '오늘'은 다음 날이다). 판정할 수 없으면 휴장으로 보지 않고 진행한다.
+      pm: 장이 끝난 뒤라 거래일이면 그날 바가 반드시 있다 — 최근 거래일과 비교.
+      am: 장 시작 전이라 그날 바가 없다 — KIS 휴장일조회(opnd_yn)로 판정.
+    2026-10-05(대체공휴일) 아침·저녁 런이 10/2 바로 재스캔·발송한 사고가 계기.
 
-    같은 회차 키 — 이미 행이 있으면 덮어쓰거나 접지 않고 중단한다.
-    10/7 저녁 런이 자정을 넘겨 '20261008 am' 으로 기록되고, 10/8 아침 런이 같은 키에
-    써서 scan_results 9종목이 두 줄, sent_history 19건이 17행으로 접혔다.
+    같은 회차 키 — 기준은 발송 기록(sent_history)이다.
+      발송 기록이 있으면 경고 후 중단(exit 1). 같은 회차를 두 번 보내지 않는다.
+      발송 기록이 없으면(발송 실패·스캔 도중 실패 뒤 재실행) 그 키의 scan_results 를
+      지우고 다시 쓴다. 10/7 저녁·10/8 아침이 '20261008 am' 에 겹쳐 쓴 사고가 계기.
+      dry-run 은 scan_results 를 쓰지 않으므로 아무것도 지우지 않고, 발송 기록이
+      있어도 막지 않는다(보내지도 쓰지도 않는다).
     """
     if run_type == "pm":
         latest = latest_trading_day(date_str)
@@ -3564,11 +3616,27 @@ def run_guard(date_str, run_type):
         elif latest != date_str:
             logger.info(f"휴장일 스킵: 오늘 {date_str}, 최근 거래일 {latest}")
             return False, 0
+    else:
+        is_open = market_open_kis(date_str)
+        if is_open is None:
+            logger.warning(f"휴장일 판정 불가(KIS 휴장일조회 실패) — 그대로 진행한다: 회차 {date_str}")
+        elif not is_open:
+            logger.info(f"휴장일 스킵: 오늘 {date_str}, KIS 개장일 아님(opnd_yn=N)")
+            return False, 0
+
+    if dry_run:
+        return True, 0
     n_scan, n_sent = slot_rows(date_str, run_type)
-    if n_scan or n_sent:
-        logger.warning(f"같은 회차 키가 이미 있다: {date_str} {run_type} "
-                       f"(scan_results {n_scan}행, sent_history {n_sent}행) — 덮어쓰지 않고 중단한다")
+    if n_sent:
+        logger.warning(f"같은 회차에 발송 기록이 이미 있다: {date_str} {run_type} "
+                       f"(sent_history {n_sent}행, scan_results {n_scan}행) — 중단한다")
         return False, 1
+    if n_scan:
+        with _conn() as con:
+            con.execute("DELETE FROM scan_results WHERE scan_date=? AND run_type=?",
+                        (date_str, run_type))
+        logger.warning(f"발송 기록 없는 회차 재실행: {date_str} {run_type} "
+                       f"scan_results {n_scan}행을 지우고 다시 쓴다")
     return True, 0
 
 
@@ -3604,8 +3672,12 @@ def main():
     if run_type_fallback:
         logger.warning(f"회차 폴백: 슬롯 미지정 — 실행 시각(KST 정오 기준)으로 run_type={run_type} 판정")
 
+    if args.dry_run:
+        global _SCAN_RESULTS_READONLY
+        _SCAN_RESULTS_READONLY = True
+
     if args.step is None and not args.mock:
-        ok, code = run_guard(date_str, run_type)
+        ok, code = run_guard(date_str, run_type, dry_run=args.dry_run)
         if not ok:
             if code: sys.exit(code)
             return
