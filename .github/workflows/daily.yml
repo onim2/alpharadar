@@ -117,6 +117,14 @@ jobs:
           pip install -r requirements.txt
           pip install 'transformers>=4.30' 'torch>=2.0' --extra-index-url https://download.pytorch.org/whl/cpu
 
+      # 강제 실패 검증은 PR 브랜치에서만. main 에서 켜면 아무것도 하지 않고 멈춘다
+      # (아래 커밋 단계도 같은 조건으로 푸시하지 않는다).
+      - name: Refuse fail_at on main
+        if: github.event.inputs.fail_at != '' && github.ref_name == 'main'
+        run: |
+          echo "::error::fail_at 검증은 main 에서 돌리지 않는다 — PR 브랜치로 dispatch 할 것"
+          exit 1
+
       - name: Run AlphaRadar
         id: run
         env:
@@ -187,7 +195,11 @@ jobs:
         if: always()
         env:
           RUN_OUTCOME: ${{ steps.run.outcome }}
+          FAIL_AT:     ${{ github.event.inputs.fail_at }}
         run: |
+          if [ -n "$FAIL_AT" ] && [ "$GITHUB_REF_NAME" = "main" ]; then
+            echo "fail_at 검증 런 — main 에는 커밋하지 않는다"; exit 0
+          fi
           git config user.email "actions@github.com"
           git config user.name  "alpharadar-bot"
           DB_FILES="data/scores_history.db data/cache/dart_sector_map.pkl data/cache/dart_sector_map_v2.pkl data/cache/dart_corp_codes.pkl"
@@ -220,7 +232,8 @@ jobs:
               exit 0
             fi
             echo "푸시 거부됨 — 원격 변경 반영 후 재시도 ($i/5)"
-            if ! git pull --rebase origin main; then
+            # 실행 중인 브랜치로 맞춘다 — PR 브랜치 검증 런이 main 을 끌어오지 않게.
+            if ! git pull --rebase origin "$GITHUB_REF_NAME"; then
               git rebase --abort || true
               echo "::error::rebase 실패(DB 충돌 추정) — 결과를 아티팩트로 남긴다"
               exit 1

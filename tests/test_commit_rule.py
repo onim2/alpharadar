@@ -61,9 +61,9 @@ def repo(tmp_path):
     return r
 
 
-def run_select(repo, tmp_path, outcome, scan_done):
+def run_select(repo, tmp_path, outcome, scan_done, **extra):
     env = {"PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "RUN_OUTCOME": outcome,
-           "RUNNER_TEMP": str(tmp_path / "runner_temp"), "HOME": str(tmp_path)}
+           "RUNNER_TEMP": str(tmp_path / "runner_temp"), "HOME": str(tmp_path), **extra}
     if scan_done:
         env["SCAN_DONE"] = "1"
     subprocess.run(["bash", "-e", "-c", _select_block()], cwd=repo, env=env, check=True, capture_output=True)
@@ -93,3 +93,60 @@ def test_commit_selection(repo, tmp_path, case, outcome, scan_done, commit_db):
         assert not (DB & staged), case
         assert not (DB & dirty), f"{case}: 버린 DB 가 작업 트리에 남으면 pull --rebase 가 막힌다"
         assert (tmp_path / "runner_temp/partial/scores_history.db").read_bytes() == b"db-partial"
+
+
+def test_fail_at_run_on_main_commits_nothing(repo, tmp_path):
+    """검증 런(fail_at)이 main 에서 돌면 로그조차 스테이징하지 않고 끝난다."""
+    staged, _ = run_select(repo, tmp_path, "failure", True, FAIL_AT="send", GITHUB_REF_NAME="main")
+    assert staged == set()
+    staged, _ = run_select(repo, tmp_path, "failure", True, FAIL_AT="send", GITHUB_REF_NAME="fix/commit-on-scan-done")
+    assert DB <= staged and LOG <= staged
+
+
+# ── main() 경로: dry-run 에서도 스캔 완료 시점에 SCAN_DONE 이 서는가 ─────────────
+
+@pytest.fixture
+def stub_pipeline(tmp_path, monkeypatch):
+    """main() 을 단계 함수만 갈아끼워 돌린다. 로그 파일·DB·외부 호출 없음."""
+    calls = []
+    monkeypatch.setattr(ar, "DB_PATH", tmp_path / "t.db")
+    monkeypatch.setattr(ar, "setup_logging", lambda *a, **k: ar.logger)
+    monkeypatch.setattr(ar, "run_guard", lambda *a, **k: (True, 0))
+    monkeypatch.setattr(ar, "run_step0", lambda *a, **k: calls.append("s0") or {"005930": {"name": "x"}})
+    monkeypatch.setattr(ar, "run_step1", lambda *a, **k: calls.append("s1") or {})
+    monkeypatch.setattr(ar, "run_step2", lambda *a, **k: calls.append("s2") or {})
+    monkeypatch.setattr(ar, "run_step3", lambda *a, **k: calls.append("s3") or [])
+    monkeypatch.setattr(ar, "run_step4", lambda *a, **k: calls.append("s4"))
+    monkeypatch.setattr(ar, "CACHE_DIR", tmp_path / "cache")
+    env = tmp_path / "github_env"
+    monkeypatch.setenv("GITHUB_ENV", str(env))
+    monkeypatch.delenv("ALPHARADAR_FAIL_AT", raising=False)
+    return calls, env
+
+
+def run_main(argv, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["alpharadar.py", *argv])
+    ar.main()
+
+
+@pytest.mark.parametrize("dry", [True, False])
+@pytest.mark.parametrize("point,scan_done,reached", [
+    ("scan_before", False, []),
+    ("scan_mid",    False, ["s0", "s1", "s2"]),
+    ("send",        True,  ["s0", "s1", "s2", "s3"]),
+    ("send_after",  True,  ["s0", "s1", "s2", "s3", "s4"]),
+])
+def test_main_marks_scan_done_at_step3(stub_pipeline, monkeypatch, dry, point, scan_done, reached):
+    calls, env = stub_pipeline
+    monkeypatch.setenv("ALPHARADAR_FAIL_AT", point)
+    with pytest.raises(RuntimeError, match=point):
+        run_main(["--run-type", "am", "--date", "20261008"] + (["--dry-run"] if dry else []), monkeypatch)
+    assert calls == reached
+    got = env.read_text() if env.exists() else ""
+    assert ("SCAN_DONE=1" in got) == scan_done, (dry, point, got)
+
+
+def test_main_success_marks_scan_done(stub_pipeline, monkeypatch):
+    calls, env = stub_pipeline
+    run_main(["--run-type", "pm", "--date", "20261008", "--dry-run"], monkeypatch)
+    assert calls == ["s0", "s1", "s2", "s3", "s4"] and "SCAN_DONE=1" in env.read_text()
