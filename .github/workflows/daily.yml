@@ -50,6 +50,12 @@ on:
         required: false
         default: ''
         type: string
+      # 커밋 규칙 검증용. 브랜치에서 dry_run 과 함께만 쓴다(run 은 그 브랜치로 푸시한다).
+      fail_at:
+        description: '[검증용] 강제 실패 지점 scan_before/scan_mid/send/send_after (빈 값 = 없음)'
+        required: false
+        default: ''
+        type: string
 
 # 동시 실행 방지 (이전 실행 진행 중이면 큐에 넣기)
 concurrency:
@@ -111,8 +117,18 @@ jobs:
           pip install -r requirements.txt
           pip install 'transformers>=4.30' 'torch>=2.0' --extra-index-url https://download.pytorch.org/whl/cpu
 
+      # 강제 실패 검증은 PR 브랜치에서만. main 에서 켜면 아무것도 하지 않고 멈춘다
+      # (아래 커밋 단계도 같은 조건으로 푸시하지 않는다).
+      - name: Refuse fail_at on main
+        if: github.event.inputs.fail_at != '' && github.ref_name == 'main'
+        run: |
+          echo "::error::fail_at 검증은 main 에서 돌리지 않는다 — PR 브랜치로 dispatch 할 것"
+          exit 1
+
       - name: Run AlphaRadar
+        id: run
         env:
+          ALPHARADAR_FAIL_AT: ${{ github.event.inputs.fail_at }}
           KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY }}
           KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
           KIS_ACCOUNT_NO: ${{ secrets.KIS_ACCOUNT_NO }}
@@ -169,15 +185,33 @@ jobs:
           if [ -n "$SLOT_TYPE" ]; then ARGS="--date $SLOT_DATE --run-type $SLOT_TYPE"; fi
           python stockcard.py --step flow $ARGS
 
+      # 커밋 규칙 — 로그는 언제나. DB·DART 캐시는 Run 단계가 성공했거나(휴장 스킵 포함),
+      # 실패했어도 스캔이 끝난 뒤(SCAN_DONE=1, 발송 중 실패)일 때만.
+      # 스캔 전·도중 실패는 대조군·엔진B 이력만 반쯤 써 둔 DB 라 버린다 — 8/28·9/1·9/8 아침
+      # 런이 그렇게 대조군만 커밋해 스캔 행 없는 키가 outcomes 추적 대상이 됐다.
+      # 버리는 DB 는 아티팩트(scores-db-*)로 남기고, 작업 트리에서 되돌려야 아래
+      # pull --rebase 가 '스테이징 안 된 변경'에 막히지 않는다.
       - name: Commit DB & DART master cache
         if: always()
+        env:
+          RUN_OUTCOME: ${{ steps.run.outcome }}
+          FAIL_AT:     ${{ github.event.inputs.fail_at }}
         run: |
+          if [ -n "$FAIL_AT" ] && [ "$GITHUB_REF_NAME" = "main" ]; then
+            echo "fail_at 검증 런 — main 에는 커밋하지 않는다"; exit 0
+          fi
           git config user.email "actions@github.com"
           git config user.name  "alpharadar-bot"
-          git add data/scores_history.db              2>/dev/null || true
-          git add data/cache/dart_sector_map.pkl      2>/dev/null || true
-          git add data/cache/dart_sector_map_v2.pkl   2>/dev/null || true
-          git add data/cache/dart_corp_codes.pkl      2>/dev/null || true
+          DB_FILES="data/scores_history.db data/cache/dart_sector_map.pkl data/cache/dart_sector_map_v2.pkl data/cache/dart_corp_codes.pkl"
+          if [ "$RUN_OUTCOME" = "success" ] || [ "$SCAN_DONE" = "1" ]; then
+            echo "DB 커밋: Run=$RUN_OUTCOME SCAN_DONE=${SCAN_DONE:-0}"
+            for f in $DB_FILES; do git add "$f" 2>/dev/null || true; done
+          else
+            echo "::warning::스캔 완료 전 실패(Run=$RUN_OUTCOME) — DB 를 커밋하지 않는다, 로그만"
+            mkdir -p "$RUNNER_TEMP/partial"
+            cp data/scores_history.db "$RUNNER_TEMP/partial/" 2>/dev/null || true
+            for f in $DB_FILES; do git checkout -- "$f" 2>/dev/null || true; done
+          fi
           git add data/logs/scanner_*.log             2>/dev/null || true
           git add data/logs/stockcard_*.log           2>/dev/null || true
           if git diff --staged --quiet; then
@@ -198,7 +232,8 @@ jobs:
               exit 0
             fi
             echo "푸시 거부됨 — 원격 변경 반영 후 재시도 ($i/5)"
-            if ! git pull --rebase origin main; then
+            # 실행 중인 브랜치로 맞춘다 — PR 브랜치 검증 런이 main 을 끌어오지 않게.
+            if ! git pull --rebase origin "$GITHUB_REF_NAME"; then
               git rebase --abort || true
               echo "::error::rebase 실패(DB 충돌 추정) — 결과를 아티팩트로 남긴다"
               exit 1
@@ -257,5 +292,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: scores-db-${{ github.run_id }}
-          path: data/scores_history.db
+          # 커밋한 DB, 그리고 스캔 완료 전 실패로 버린 DB(partial/)
+          path: |
+            data/scores_history.db
+            ${{ runner.temp }}/partial/scores_history.db
+          if-no-files-found: ignore
           retention-days: 14
