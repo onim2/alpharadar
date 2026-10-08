@@ -3573,6 +3573,32 @@ def run_guard(date_str, run_type):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 스캔 완료 표식 — 워크플로가 DB 커밋 여부를 정한다
+# ══════════════════════════════════════════════════════════════════════════════
+def mark_scan_done():
+    """스캔 결과(scan_results)가 DB 에 다 들어간 시점을 워크플로에 알린다.
+
+    daily.yml 의 커밋 단계는 Run 단계가 실패했을 때 이 표식(SCAN_DONE=1)이 있어야만
+    DB 를 커밋한다. 스캔 전·도중 실패는 대조군·엔진B 이력만 반쯤 써 둔 DB 라 커밋하지
+    않는다 — 8/28·9/1·9/8 실패한 아침 런이 그렇게 대조군만 남겨 outcomes 추적 대상이 됐다.
+    발송(step4) 중 실패는 스캔이 이미 완결이라 커밋한다. 로그는 언제나 커밋한다.
+    """
+    env = os.getenv("GITHUB_ENV")
+    if env:
+        with open(env, "a", encoding="utf-8") as f:
+            f.write("SCAN_DONE=1\n")
+    logger.info("스캔 완료 — 이후 실패해도 DB 는 커밋된다")
+
+
+def fail_at(point):
+    """검증용 강제 실패 지점. ALPHARADAR_FAIL_AT 이 그 이름일 때만 예외를 던진다.
+    지점: scan_before(가드 뒤·Step 0 전) · scan_mid(Step 2 뒤·Step 3 전) · send(Step 4 전)
+    · send_after(Step 4 뒤). 수동 실행(workflow_dispatch fail_at)으로만 켠다."""
+    if os.getenv("ALPHARADAR_FAIL_AT", "").strip() == point:
+        raise RuntimeError(f"[검증용] {point} 에서 강제 실패 (ALPHARADAR_FAIL_AT)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 진입점
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
@@ -3623,6 +3649,7 @@ def main():
 
     cache_path=CACHE_DIR/f"universe_{date_str}.pkl"
 
+    fail_at("scan_before")
     if args.step in (None,0):
         logger.info("▶ Step 0: 유니버스 필터링")
         if args.mock:
@@ -3674,9 +3701,11 @@ def main():
     else: pool_b=pool_a
 
     if args.step in (None,3):
+        fail_at("scan_mid")
         logger.info("▶ Step 3: 스코어링 (FinBERT 감성 분석)")
         results=run_step3(pool_b,precomputed,cfg,date_str)
         logger.info(f"  → {len(results)}개")
+        mark_scan_done()
         if args.step==3:
             print(f"\n{'종목':<14} {'S':>6} {'T':>5} {'ST':>6} {'D':>5} {'등급'}")
             print("-"*50)
@@ -3687,7 +3716,9 @@ def main():
 
     if args.step in (None,4):
         logger.info("▶ Step 4: 발송")
+        fail_at("send")
         run_step4(results,cfg,date=date_str,dry_run=args.dry_run,run_type=run_type)
+        fail_at("send_after")
 
     logger.info(f"완료  |  소요: {time.time()-start:.1f}초")
 
