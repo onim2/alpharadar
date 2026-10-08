@@ -102,6 +102,7 @@ jobs:
             data/cache/dart_items_*.pkl
             data/cache/dart_titles_*.pkl
             data/cache/kis_investor_*.pkl
+            data/cache/kis_holiday.json
           key: alpharadar-daily-${{ github.run_id }}
           restore-keys: alpharadar-daily-
 
