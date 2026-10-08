@@ -3497,6 +3497,82 @@ def setup_dart():
     print(f"완료: {len(corp_map)}개")
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 런 가드 — 휴장일 · 같은 회차 키
+# ══════════════════════════════════════════════════════════════════════════════
+_KIS_DAILY_PATH = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+_KIS_DAILY_TR   = "FHKST03010100"
+
+
+def latest_trading_day(asof, probe="005930"):
+    """asof(YYYYMMDD) 이하에서 시세 바가 있는 가장 최근 거래일. 알 수 없으면 None.
+
+    달력 대신 데이터로 판정한다 — 대체공휴일·임시휴장을 달력이 놓쳐도 바는 거짓말을
+    하지 않는다. 정본인 KIS 일봉(J)을 먼저 보고, 막히면 FDR 로 본다.
+    둘 다 실패하면 None — 호출 쪽은 '모름'을 휴장으로 읽지 않는다.
+    """
+    start = (datetime.strptime(asof, "%Y%m%d") - timedelta(days=14)).strftime("%Y%m%d")
+    try:
+        d = _kis_get(_KIS_DAILY_PATH, {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": probe,
+                                       "FID_INPUT_DATE_1": start, "FID_INPUT_DATE_2": asof,
+                                       "FID_PERIOD_DIV_CODE": "D", "FID_ORG_ADJ_PRC": "0"},
+                     _KIS_DAILY_TR)
+        dates = [str(r.get("stck_bsop_date") or "").strip() for r in (d.get("output2") or [])]
+        dates = [x for x in dates if len(x) == 8 and x <= asof]
+        if dates:
+            return max(dates)
+        logger.warning("최근 거래일: KIS 일봉 응답이 비었다 — FDR 로 본다")
+    except Exception as e:
+        logger.warning(f"최근 거래일: KIS 조회 실패 ({type(e).__name__}: {e}) — FDR 로 본다")
+    try:
+        import FinanceDataReader as fdr
+        df = fdr.DataReader(probe, start, asof)
+        if df is not None and len(df):
+            return df.index[-1].strftime("%Y%m%d")
+    except Exception as e:
+        logger.warning(f"최근 거래일: FDR 조회 실패 ({type(e).__name__}: {e})")
+    return None
+
+
+def slot_rows(scan_date, run_type):
+    """같은 (날짜, 회차) 키로 이미 기록된 행 수 — scan_results, sent_history."""
+    with _conn() as con:
+        n_scan = con.execute("SELECT COUNT(*) FROM scan_results WHERE scan_date=? AND run_type=?",
+                             (scan_date, run_type)).fetchone()[0]
+        n_sent = con.execute("SELECT COUNT(*) FROM sent_history WHERE send_date=? AND run_type=?",
+                             (scan_date, run_type)).fetchone()[0]
+    return n_scan, n_sent
+
+
+def run_guard(date_str, run_type):
+    """전체 런을 시작해도 되는지. (계속 여부, 종료 코드)를 돌려준다.
+
+    휴장일 — 저녁(pm) 회차만 본다. 저녁 런은 그날 장이 끝난 뒤라, 거래일이면 그날
+    바가 반드시 있다. 회차 날짜와 최근 거래일이 다르면 그날은 장이 없었다.
+    아침(am) 회차는 장 시작 전이라 거래일에도 그날 바가 없다 — 데이터로는 판정할
+    수 없어 여기서 거르지 않는다. 날짜는 실행 시각이 아니라 회차 날짜다(자정을 넘겨
+    도착한 저녁 런의 '오늘'은 다음 날이다).
+    2026-10-05(대체공휴일) 저녁 런이 10/2 바로 재스캔·발송한 사고가 계기.
+
+    같은 회차 키 — 이미 행이 있으면 덮어쓰거나 접지 않고 중단한다.
+    10/7 저녁 런이 자정을 넘겨 '20261008 am' 으로 기록되고, 10/8 아침 런이 같은 키에
+    써서 scan_results 9종목이 두 줄, sent_history 19건이 17행으로 접혔다.
+    """
+    if run_type == "pm":
+        latest = latest_trading_day(date_str)
+        if latest is None:
+            logger.warning(f"휴장일 판정 불가(시세 조회 실패) — 그대로 진행한다: 회차 {date_str}")
+        elif latest != date_str:
+            logger.info(f"휴장일 스킵: 오늘 {date_str}, 최근 거래일 {latest}")
+            return False, 0
+    n_scan, n_sent = slot_rows(date_str, run_type)
+    if n_scan or n_sent:
+        logger.warning(f"같은 회차 키가 이미 있다: {date_str} {run_type} "
+                       f"(scan_results {n_scan}행, sent_history {n_sent}행) — 덮어쓰지 않고 중단한다")
+        return False, 1
+    return True, 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 진입점
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
@@ -3515,11 +3591,24 @@ def main():
     date_str=args.date or today_kst()
     # 런 구분은 여기서 한 번만 정하고 프로세스 내내 고정한다. 매번 now()로
     # 다시 재면 정오를 걸친 런에서 save_scan_results 와 mark_sent 가 갈릴 수 있다.
+    _forced = os.getenv("ALPHARADAR_RUN_TYPE", "").strip().lower() in ("am", "pm")
+    run_type_fallback = args.run_type is None and not _forced
     run_type = args.run_type or run_type_kst()
     os.environ["ALPHARADAR_RUN_TYPE"] = run_type
     setup_logging(date_str); init_db()
 
     if args.setup_dart: setup_dart(); return
+
+    # 회차는 예약 슬롯(daily.yml → run_slot.py → --run-type/--date)으로 정한다.
+    # 지정이 없으면 예전처럼 실행 시각으로 판정하되 그 사실을 남긴다.
+    if run_type_fallback:
+        logger.warning(f"회차 폴백: 슬롯 미지정 — 실행 시각(KST 정오 기준)으로 run_type={run_type} 판정")
+
+    if args.step is None and not args.mock:
+        ok, code = run_guard(date_str, run_type)
+        if not ok:
+            if code: sys.exit(code)
+            return
 
     try: cfg=load_config(); validate_config(cfg); logger.info("config 검증 완료 ✓")
     except AssertionError as e: logger.error(f"설정 오류: {e}"); sys.exit(1)
