@@ -12,6 +12,11 @@ on:
     # 변동이 큰 쪽은 스캔 소요시간으로 8~33분까지 흔들린다(POOL_B 종목 수에
     # 따라 뉴스·공시 수집량이 달라짐). 마진은 이쪽을 흡수하기 위한 것이다.
 
+    # 회차(am/pm)는 실행 시각이 아니라 어느 크론이 쐈는지로 정한다(run_slot.py).
+    # 9월 말부터 발사 지연이 저녁 +6~9h 로 커져 저녁 런이 자정을 넘기면 다음 날
+    # 'am' 으로 기록됐다(10/7 저녁 → 20261008 am). 크론 문자열을 바꾸면
+    # run_slot.py 의 CRON_SLOT 도 같이 바꾼다.
+
     # 아침 — KST 월~금 06:10 (장 시작 2시간 50분 전)
     # 07:40 → 06:40 → 06:10 으로 두 번 당겼다. 06:40일 때 도착 중앙값이
     # 09:02로 여전히 개장(09:00) 언저리였다. 30분 더 확보해 08:30대를 노린다.
@@ -35,6 +40,16 @@ on:
         required: false
         default: ''
         type: string
+      slot:
+        description: '회차 am/pm (빈 값 = 실행 시각으로 판정, 로그에 폴백 기록)'
+        required: false
+        default: ''
+        type: string
+      slot_date:
+        description: '회차 날짜 YYYYMMDD (빈 값 = 회차 정시 기준 최근 평일)'
+        required: false
+        default: ''
+        type: string
 
 # 동시 실행 방지 (이전 실행 진행 중이면 큐에 넣기)
 concurrency:
@@ -54,6 +69,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      # 회차와 회차 날짜를 정해 SLOT_TYPE·SLOT_DATE 로 넘긴다. 스케줄 런은 어느 크론이
+      # 쐈는지(github.event.schedule), 수동 실행은 slot 입력으로. 둘 다 없으면 빈 값 —
+      # alpharadar.py 가 실행 시각으로 판정하고 '회차 폴백' 경고를 남긴다.
+      - name: Resolve run slot
+        env:
+          SLOT_INPUT:     ${{ github.event.inputs.slot }}
+          DATE_INPUT:     ${{ github.event.inputs.slot_date }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+        run: python3 run_slot.py
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
@@ -91,7 +116,9 @@ jobs:
           KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY }}
           KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
           KIS_ACCOUNT_NO: ${{ secrets.KIS_ACCOUNT_NO }}
-          KIS_IS_REAL:    ${{ secrets.KIS_IS_REAL }}
+          # 실전/모의 스위치일 뿐 비밀이 아니다. 시크릿에 '1' 을 두면 GitHub 가 로그의
+          # 숫자 1 을 전부 *** 로 가린다(8/18~). afterhours.yml 과 같은 방식으로 직접 쓴다.
+          KIS_IS_REAL:    '1'
           DART_API_KEY:   ${{ secrets.DART_API_KEY }}
           NAVER_CLIENT_ID:     ${{ secrets.NAVER_CLIENT_ID }}
           NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
@@ -109,6 +136,9 @@ jobs:
           fi
           if [ -n "${{ github.event.inputs.limit }}" ]; then
             ARGS="$ARGS --limit ${{ github.event.inputs.limit }}"
+          fi
+          if [ -n "$SLOT_TYPE" ]; then
+            ARGS="$ARGS --date $SLOT_DATE --run-type $SLOT_TYPE"
           fi
           echo "실행 인자: python alpharadar.py $ARGS"
           python alpharadar.py $ARGS
@@ -129,12 +159,15 @@ jobs:
         env:
           KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY }}
           KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-          KIS_IS_REAL:    ${{ secrets.KIS_IS_REAL }}
+          KIS_IS_REAL:    '1'
           # 실전 DB 쓰기는 여기서만 허용한다. 로컬 CLI 는 --db 로 사본을 받아야
           # 하고, 지정하지 않으면 아무것도 하지 않고 종료한다 — 로컬 실행이
           # 추적 중인 DB에 테이블을 만들어 브랜치 diff 로 새는 것을 막는다.
           STOCKCARD_ALLOW_LIVE_DB: '1'
-        run: python stockcard.py --step flow
+        run: |
+          ARGS=""
+          if [ -n "$SLOT_TYPE" ]; then ARGS="--date $SLOT_DATE --run-type $SLOT_TYPE"; fi
+          python stockcard.py --step flow $ARGS
 
       - name: Commit DB & DART master cache
         if: always()
@@ -192,7 +225,9 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq fonts-nanum
           rm -rf ~/.cache/matplotlib
-          python stockcard.py --step chart
+          ARGS=""
+          if [ -n "$SLOT_TYPE" ]; then ARGS="--date $SLOT_DATE --run-type $SLOT_TYPE"; fi
+          python stockcard.py --step chart $ARGS
 
       # PNG는 git에 커밋하지 않는다 — OHLC에서 언제든 재생성 가능하고, git은 지운
       # 파일도 히스토리에 영구 보관한다(8/24 원칙). retention 30일은 요구사항 그대로다.
