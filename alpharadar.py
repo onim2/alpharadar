@@ -1909,6 +1909,7 @@ def generate_mock_precomputed():
                 "retail_buy_days":sum(1 for v in retail_list if v>0),"retail_buy_total":0,
                 "inst_net":int(sum(v for v in net_list)*0.6),
                 "foreign_net":int(sum(v for v in net_list)*0.4),
+                "flow_missing":False,
                 "rsi":round(random.uniform(35,75),1),
                 "bb_pos":round(random.uniform(20,90),1),
                 "change_pct":round(random.uniform(-3,5),2),
@@ -2011,9 +2012,11 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg, cap_fallback=Fa
             "ma20":ma20,"ma60":ma60,"ma120":ma120,"disparity":disparity(current,ma20),
             "vol_60ma":vol_60ma,"vol_20ma":vol_20ma,"vol_5d_avg":vol_5d,
             "vol_slope":linear_slope(volume_s.iloc[-5:].tolist()),
+            # 수급 결측(None)은 그대로 둔다 — 0으로 바꾸지 않는다. flow_missing 이 그 표식이다.
             "net_buy_days":net_days,"net_buy_total":net_total,"net_buy_list":[],
             "retail_buy_days":retail_days,"retail_buy_total":0,
             "inst_net":inst_net,"foreign_net":foreign_net,
+            "flow_missing":net_days is None,
             "rsi":rsi,"bb_pos":bb_pos,"change_pct":change_pct,
             "ret_5d":ret_5d,"ret_20d":ret_20d,"w52_proximity":w52_proximity,
             "w52_high":w52_high,"res_top":resistance_top(hist_df.iloc[-60:]),
@@ -2175,7 +2178,17 @@ def _safe_int(v, default=0):
     except (ValueError, TypeError):
         return default
 
+# 수급 조회 실패 표식 — (net_days, net_total, retail_days, inst_net, foreign_net) 전부 None
+_FLOW_MISSING = (None, None, None, None, None)
+
 def _get_investor_data(ticker, start_date, end_date, exclude_today=True):
+    """최근 5거래일 (기관+외인) 순매수 일수·합계, 개인 순매수 일수, 기관 합계, 외인 합계.
+
+    조회가 안 되면 0이 아니라 None 다섯 개(_FLOW_MISSING)를 돌려준다. 예전에는 실패 4경로
+    (앱키 없음·응답 비정상·유효 행 없음·예외)가 전부 0을 돌려줘서 "순매수 0일"로 저장됐고,
+    Engine A(net_buy_days>=3)가 조회 실패 하루에 꺼졌다. 0과 결측은 다른 사실이다
+    (CLAUDE.md 데이터 원칙, 9/15 미코 표본·9/22 0/0 행 확인, 2026-10-17 수리).
+    """
     global _KIS_WARNED
     ex_today = exclude_today
     app_key = os.getenv("KIS_APP_KEY", "")
@@ -2186,7 +2199,7 @@ def _get_investor_data(ticker, start_date, end_date, exclude_today=True):
                 "  .env에 KIS_APP_KEY / KIS_APP_SECRET / KIS_IS_REAL 설정 필요"
             )
             _KIS_WARNED = True
-        return 0, 0, 0, 0, 0
+        return _FLOW_MISSING
 
     try:
         tr_id = "FHKST01010900"
@@ -2223,7 +2236,7 @@ def _get_investor_data(ticker, start_date, end_date, exclude_today=True):
         output2 = data.get("output", data.get("output2", []))
         if not isinstance(output2, list) or not output2:
             logger.debug(f"KIS 수급 빈/비정상 응답 ({ticker}): type={type(output2).__name__}")
-            return 0, 0, 0, 0, 0
+            return _FLOW_MISSING
 
         _FIELDS = ("orgn_ntby_tr_pbmn", "frgn_ntby_tr_pbmn", "prsn_ntby_tr_pbmn",
                    "orgn_ntby_qty",     "frgn_ntby_qty",     "prsn_ntby_qty")
@@ -2256,7 +2269,7 @@ def _get_investor_data(ticker, start_date, end_date, exclude_today=True):
         rows  = valid[:5]
         if not rows:
             logger.debug(f"KIS 수급 미집계 ({ticker})")
-            return 0, 0, 0, 0, 0
+            return _FLOW_MISSING
 
         use_pbmn = any(
             str(r.get("orgn_ntby_tr_pbmn", "")).strip() not in ("", "-") for r in rows
@@ -2291,7 +2304,7 @@ def _get_investor_data(ticker, start_date, end_date, exclude_today=True):
             _KIS_TB_LOGGED += 1
         else:
             logger.warning(f"_get_investor_data 실패 ({ticker}): {type(e).__name__}: {e}")
-        return 0, 0, 0, 0, 0
+        return _FLOW_MISSING
 
 def _load_dart_sector_map() -> dict:
     """
@@ -2796,14 +2809,20 @@ def run_step1(precomputed,cfg,date=None):
     surge_pct=ea_cfg.get("vol_surge_pct",0.50)
     require_pos=ea_cfg.get("require_positive_total", True)  # Task 2: 수급 부호 가드
     sign_guarded=0
+    flow_missing_n=0
     # 1차: 신호 후보 판정 (a=수급/거래량, b=관심상승+부정낮음)
     candidates=[]
     for ticker,p in precomputed.items():
         vol_base=p.get("vol_60ma",p.get("vol_20ma",1))
         vol_rising=(vol_base>0 and p.get("vol_5d_avg",0)>=vol_base*(1+surge_pct))
         # 수급 부호 가드: 일수 충족이어도 순매수 합계가 음수면 매집 아님 → inst_buy 불인정
-        days_ok=p.get("net_buy_days",0)>=ea_cfg["net_buy_min_days"]
-        inst_buy=days_ok and ((not require_pos) or p.get("net_buy_total",0) > 0)
+        # 수급 결측(None)은 통과시키지 않되 '0일 탈락'과 구분해 센다. 결측을 0으로 읽으면
+        # KIS 조회 실패 하루가 Engine A 를 끈다(2026-10-17 수리). 선택 집합은 수리 전과 같다.
+        _nbd=p.get("net_buy_days")
+        if _nbd is None:
+            flow_missing_n += 1
+        days_ok=(_nbd is not None) and _nbd>=ea_cfg["net_buy_min_days"]
+        inst_buy=days_ok and ((not require_pos) or (p.get("net_buy_total") or 0) > 0)
         if require_pos and days_ok and not inst_buy:
             sign_guarded += 1
         a=vol_rising or inst_buy
@@ -2811,6 +2830,8 @@ def run_step1(precomputed,cfg,date=None):
         if a or b:
             candidates.append((ticker, a, b, vol_rising))
     logger.info(f"수급일수충족·합계음수 제외: {sign_guarded}개")
+    # 결측 수가 수십 건이면 KIS 쪽 장애다 — 그날 Engine A 판정은 참고로만 읽을 것.
+    logger.info(f"수급 결측(KIS 조회 실패, Engine A 미판정): {flow_missing_n}개")
 
     # 버그 수정: top_n 밖의 POOL_A 후보는 neg_ratio 미조회 상태 → 부정뉴스 게이트가 무조건 통과됨.
     # 후보 중 미조회 종목만 뉴스 2차 조회해 neg_ratio 채운 뒤 게이트 적용.
@@ -2854,6 +2875,7 @@ def run_step1(precomputed,cfg,date=None):
             "vol_20ma":p.get("vol_20ma",0),"vol_rising":vol_rising,
             "net_buy_total":p.get("net_buy_total",0),"retail_buy_days":p.get("retail_buy_days",0),
             "inst_net":p.get("inst_net",0),"foreign_net":p.get("foreign_net",0),
+            "flow_missing":bool(p.get("flow_missing",False)),
             "current_price":p.get("current_price",0),"change_pct":p.get("change_pct",0.0),
             "rsi":p.get("rsi",50.0),"bb_pos":p.get("bb_pos",50.0),
             "hype_slope":p.get("hype_slope",0),"hype_rank":p.get("hype_rank",9999),
@@ -3113,7 +3135,7 @@ def _calc_d(ticker, meta, all_vol, all_hype, top_pct, scfg, scan_date=None):
     if is_top_percentile(meta.get("vol_slope", 0), all_vol, top_pct):
         strength += 10
 
-    nbd = meta.get("net_buy_days", 0)
+    nbd = meta.get("net_buy_days") or 0      # 결측(None)은 가점 없음
     if nbd >= 5:        strength += 10
     elif nbd >= 4:      strength += 5
 
@@ -3252,6 +3274,7 @@ def run_step3(pool_b,precomputed,cfg,date):
             "vol_20ma":meta.get("vol_20ma",0),"vol_rising":meta.get("vol_rising",False),
             "net_buy_total":meta.get("net_buy_total",0),"retail_buy_days":meta.get("retail_buy_days",0),
             "current_price":meta.get("current_price",0),"inst_net":meta.get("inst_net",0),"foreign_net":meta.get("foreign_net",0),
+            "flow_missing":bool(meta.get("flow_missing",False)),
             "rsi":meta.get("rsi",50.0),"bb_pos":meta.get("bb_pos",50.0),
             "change_pct":meta.get("change_pct",0.0),
             "hype_slope":meta.get("hype_slope",0),"hype_rank":meta.get("hype_rank",9999),
@@ -3274,17 +3297,6 @@ def run_step3(pool_b,precomputed,cfg,date):
 # ══════════════════════════════════════════════════════════════════════════════
 def _esc(text: str) -> str:
     return str(text).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-
-def entry_candidate(r):
-    """9/11 백테스트 진입 후보 규칙 — 이격 92~103 · 순매수 3일+ · RSI ≤ 45.
-
-    카드 정렬 1순위로만 쓴다. 발송 여부·점수·게이트에는 관여하지 않는다.
-    순매수일은 net_buy_days(최근 5거래일 중 기관+외인 순매수 일수)다 — 연속
-    일수가 아니다. 결측(None·기본값 이격 0)은 충족하지 않는다."""
-    rsi = r.get("rsi")
-    return (92 <= (r.get("disparity") or 0) <= 103
-            and (r.get("net_buy_days") or 0) >= 3
-            and rsi is not None and rsi <= 45)
 
 def run_step4(results,cfg,date=None,dry_run=False,run_type=None):
     # 발송 날짜는 스캔이 쓴 날짜와 같아야 한다. 예전에는 여기서 today_kst()를 따로
@@ -3310,10 +3322,16 @@ def run_step4(results,cfg,date=None,dry_run=False,run_type=None):
     for r in to_send:
         n, since, gap = watch.get(r["ticker"], (0, 0, None))
         r["watch_n"], r["watch_since"], r["watch_gap"] = n, since, gap
-        r["entry_ok"] = entry_candidate(r)
-    # 진입 후보 규칙 충족 → 총점 순. 관찰 횟수는 동점 정렬에만 쓴다.
+    # D점수 → 총점 → 관찰 횟수. 2026-10-17 재검정(outcomes 8/13~9/29, 일자내)에서
+    # D만 양의 IC 였고(fwd10 +0.21, 날짜·종목 최신행 기준 재계산 +0.11·양 16/30 — 약하다),
+    # 9/11 진입 후보 규칙(이격 92~103·순매수 3일+·RSI≤45)은 후보 vs 비후보 fwd10 −11.0%p
+    # (재계산 −8.3%p, 승 2/17)로 역방향이라 정렬에서 뺐다(함수도 삭제, git 이력 참조).
+    # D는 수급만의 점수가 아니다 — 소스 기본점(both 50/a 30/b 20)+거래량·관심 기울기·섹터·
+    # n_accel − 과열 감점이고, 수급 일수 가점은 최대 10점이다. 수급 결측이면 그 가점만 빠진다
+    # (D가 0이 되지 않으므로 결측 종목이 꼭 뒤로 가지는 않는다).
+    # 표시 순서만 바뀐다 — 발송 집합·점수·게이트 불변.
     # 예전 (watch_n, watch_gap) 정렬은 일자내 IC 가 단타 0 · 장기 음(−)이었다.
-    to_send.sort(key=lambda r: (r["entry_ok"], r["score"], r["watch_n"]), reverse=True)
+    to_send.sort(key=lambda r: (r.get("d") or 0, r["score"], r["watch_n"]), reverse=True)
 
     def fmt(i,r):
         tier_icon={"large":"[대형]","mid":"[중형]","small":"[소형]"}.get(r.get("cap_tier","large"),"[?]")
@@ -3331,17 +3349,23 @@ def run_step4(results,cfg,date=None,dry_run=False,run_type=None):
         _rb=str(r.get("rating_bond") or "").strip(); _rcp=str(r.get("rating_cp") or "").strip()
         rating_str=(f"  |  🏷 {_esc(_rb)}"+(f"/{_esc(_rcp)}" if _rcp else "")) if _rb else ""
 
-        inst_v    = r.get("inst_net",    0)
-        foreign_v = r.get("foreign_net", 0)
-        no_data = (inst_v == 0 and foreign_v == 0 and r.get("net_buy_days", 0) == 0)
+        # 수급 결측은 flow_missing 플래그로 판단한다. 예전의 "셋 다 0이면 정보없음" 추정은
+        # 진짜 0 과 조회 실패를 구분하지 못했다(2026-10-17).
+        no_data   = bool(r.get("flow_missing")) or r.get("net_buy_days") is None
+        inst_v    = r.get("inst_net")    or 0
+        foreign_v = r.get("foreign_net") or 0
+        nbd_v     = r.get("net_buy_days")
 
         if no_data:
-            inst_str    = "정보없음"
-            foreign_str = "정보없음"
+            inst_str    = "조회 실패"
+            foreign_str = "조회 실패"
+            nbd_str     = "결측"
         else:
             inst_str    = (f"+{inst_v:,}백만" if inst_v > 0 else f"{inst_v:,}백만" if inst_v < 0 else "0")
             foreign_str = (f"+{foreign_v:,}백만" if foreign_v > 0 else f"{foreign_v:,}백만" if foreign_v < 0 else "0")
-        retail_tag = "  ✦ 개인주도" if r.get("retail_buy_days",0)>=3 and r.get("net_buy_days",0)<3 else ""
+            nbd_str     = f"{nbd_v}일"
+        retail_tag = ("  ✦ 개인주도" if (r.get("retail_buy_days") or 0)>=3
+                      and not no_data and (nbd_v or 0)<3 else "")
 
         bb  = r.get("bb_pos",50)
         bb_label = ("상단돌파" if bb>=95 else "상단근접" if bb>=80
@@ -3382,7 +3406,7 @@ def run_step4(results,cfg,date=None,dry_run=False,run_type=None):
         return (
             f"\n\n<b>{i}. {_esc(r['name'])} ({r['ticker']})</b>\n"
             f"   {_esc(r['sector'])}  {tier_icon}{rating_str}  |  💵 {price_str}\n"
-            f"   🏦 기관 {inst_str}  |  🌏 외인 {foreign_str}  ({r['net_buy_days']}일){retail_tag}\n"
+            f"   🏦 기관 {inst_str}  |  🌏 외인 {foreign_str}  ({nbd_str}){retail_tag}\n"
             f"   📊 BB {bb:.0f}% {bb_label}  |  RSI {rsi:.0f} {rsi_label}{vol_line}\n"
             f"   📐 이격도 {r['disparity']:.1f}%  (20일 평균 대비 현재가 위치)\n"
             f"   🏆 <b>총점 {r['score']:.1f}</b>  기술 {r['t']:.0f}  수급 {r['d']:.0f}  감성 {r['s_text']:.0f}{cross}"
@@ -3409,11 +3433,8 @@ def run_step4(results,cfg,date=None,dry_run=False,run_type=None):
         f"탐지 {detected}종목 → 발송 {len(to_send)}종목  (기준 {min_score}점 이상)\n"
         f"<i>매수 신호 아님. 차트·수급 확인 후 판단하세요.</i>"))
     if to_send:
-        # 정렬 기준을 밝혀둔다. 규칙 충족 종목이 앞에 오면 번호가 점수순으로 읽히지
-        # 않는데, 몇 번까지가 충족분인지 적어두지 않으면 순서를 오해한다.
-        n_entry = sum(1 for r in to_send if r["entry_ok"])
-        order = (f"진입 후보 규칙 충족 {n_entry}종목 먼저 → 총점순" if n_entry
-                 else "총점순 (진입 후보 규칙 충족 없음)")
+        # 정렬 기준을 밝혀둔다. 번호가 총점순이 아니므로 적어두지 않으면 순서를 오해한다.
+        order = "D점수순 → 총점순"
         lines = [f"<b>관찰 종목</b>  <i>— {order}</i>",
                  "━━━━━━━━━━━━━━━━━━━━"]
         # 등급을 없애면서 상세 블록까지 같이 떨어져 나갔었다. 상세는 등급에 딸린 것이
@@ -3422,7 +3443,6 @@ def run_step4(results,cfg,date=None,dry_run=False,run_type=None):
         for i, r in enumerate(to_send, 1):
             lines.append(fmt(i, r) + f"\n   👁 {watch_tag(r)}")
         lines.append("\n━━━━━━━━━━━━━━━━━━━━")
-        lines.append("진입 후보 규칙: 이격 92~103 · 순매수 5일 중 3일+ · RSI ≤ 45")
         lines.append("차트·수급·관찰 이력 전체는 대시보드에서")
         msg_items.append(("list", "\n".join(lines)))
 
@@ -3474,9 +3494,9 @@ def run_step4(results,cfg,date=None,dry_run=False,run_type=None):
                 f"(다음 실행 시 재발송 대상)"
             )
         logger.info(f"DB 기록: {sent_count}개 / 전체 to_send {len(to_send)}개")
-    _entry = sum(1 for r in to_send if r.get("entry_ok"))
     _new = sum(1 for r in to_send if r.get("watch_n", 0) == 0)
-    logger.info(f"발송: {len(to_send)}종목 | 진입 후보 {_entry} | 신규 {_new}")
+    _miss = sum(1 for r in to_send if r.get("flow_missing"))
+    logger.info(f"발송: {len(to_send)}종목 | 신규 {_new} | 수급 결측 {_miss}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DART 법인코드 초기화
