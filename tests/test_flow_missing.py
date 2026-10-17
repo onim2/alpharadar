@@ -2,7 +2,7 @@
 
 - KIS 수급 조회가 실패하면 0 이 아니라 None 이어야 한다. 0 은 "순매수 0일"이라는
   사실이고, 조회 실패는 사실을 모른다는 뜻이다(CLAUDE.md 데이터 원칙).
-- 카드 정렬은 수급 점수(D) → 총점 → 관찰 횟수. 9/11 진입 후보 규칙은 8/13~9/29
+- 카드 정렬은 D점수 → 총점 → 관찰 횟수. 9/11 진입 후보 규칙은 8/13~9/29
   일자내 재검정에서 fwd10 −11.0%p(승 2/17)라 뺐다.
 """
 
@@ -95,7 +95,7 @@ def test_sort_is_d_then_score(tmp_db, capsys, monkeypatch):
                capsys, monkeypatch, tmp_db)
     i1, i2, i3 = out.index("(111111)"), out.index("(222222)"), out.index("(333333)")
     assert i3 < i2 < i1           # D 80 둘이 먼저(총점 60 > 55), D 20 은 마지막
-    assert "수급 점수순" in out
+    assert "D점수순" in out
     assert "진입 후보" not in out
 
 
