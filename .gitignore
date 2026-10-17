@@ -66,6 +66,7 @@ data/cache/universe_*.pkl
 data/cache/pool_a_*.pkl
 data/cache/results_*.pkl
 data/cache/kis_investor_*.pkl
+data/cache/kis_holiday.json
 
 # 임시 파일
 data/cache/*.pkl.tmp
