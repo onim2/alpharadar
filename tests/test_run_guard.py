@@ -174,3 +174,38 @@ def test_other_slot_not_affected(tmp_db, monkeypatch):
     monkeypatch.setattr(ar, "_kis_get", fake_kis(bars=BARS_AT_1005 + ("20261006", "20261007", "20261008")))
     ar.mark_sent("053300", "20261008", "참고", 50.0, "am")
     assert ar.run_guard("20261008", "pm") == (True, 0)
+
+
+# ── 휴장일조회 실패 사유 (2026-10-19 아침 런: 'rt_cd=None msg=' 로만 남았다) ──
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status_code, self._body = status, body
+    def json(self):
+        return self._body
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+            raise requests.HTTPError(f"{self.status_code}", response=self)
+
+
+@pytest.mark.parametrize("behavior, label", [
+    ("timeout", "timeout"),
+    ("http500", "HTTP 500 EGW00123"),
+    ("conn", "연결 실패"),
+])
+def test_holiday_failure_logs_reason(tmp_db, monkeypatch, caplog, behavior, label):
+    import requests
+    monkeypatch.setattr(ar, "_KIS_DISABLED", False)
+    monkeypatch.setattr(ar, "_kis_token", lambda: "tok")
+    monkeypatch.setattr(ar.time, "sleep", lambda s: None)
+    def fake_get(*a, **k):
+        if behavior == "timeout":
+            raise requests.Timeout("read timed out")
+        if behavior == "conn":
+            raise requests.ConnectionError("reset")
+        return _Resp(500, {"rt_cd": "1", "msg_cd": "EGW00123", "msg1": "기간이 만료된 token"})
+    monkeypatch.setattr(ar.requests, "get", fake_get)
+    with caplog.at_level(logging.WARNING, logger=ar.logger.name):
+        assert ar.market_open_kis("20261019") is None
+    assert f"KIS 휴장일조회 실패 — 응답 없음 ({label})" in caplog.text
