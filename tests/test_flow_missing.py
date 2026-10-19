@@ -107,3 +107,49 @@ def test_missing_flow_is_labelled_not_zero(tmp_db, capsys, monkeypatch):
     assert "조회 실패" in out and "(결측)" in out
     # 진짜 0 은 결측으로 표기되지 않는다 — 두 사실을 구분한다
     assert out.count("조회 실패") == 2 and "(0일)" in out
+
+
+# ── 결측 사유 집계 (2026-10-19) ───────────────────────────────────────────────
+
+def test_flow_fail_reasons_summarized(monkeypatch):
+    """런 끝 요약 줄의 '= 사유별 집계' — 많은 순, 'timeout 2 · rt_cd=1 EGW00201 1 · ...'."""
+    monkeypatch.setenv("KIS_APP_KEY", "k")
+    monkeypatch.setattr(ar, "_FLOW_FAIL_REASON", {})
+    monkeypatch.setattr(ar, "_KIS_TB_LOGGED", 0)
+
+    def kis_empty(reason):
+        def _get(*a, **k):
+            ar._KIS_ERR.reason = reason     # _kis_get 이 재시도 끝에 {} 를 돌려준 경우
+            return {}
+        return _get
+
+    cases = {
+        "000001": kis_empty("timeout"),
+        "000002": kis_empty("timeout"),
+        "000003": lambda *a, **k: {"rt_cd": "1", "msg_cd": "EGW00201", "output": []},
+        "000004": lambda *a, **k: {"rt_cd": "0", "output": []},
+        "000005": lambda *a, **k: {"rt_cd": "0", "output": [{"stck_bsop_date": "20260930",
+                                                             "orgn_ntby_qty": ""}]},
+    }
+    for t, fake in cases.items():
+        monkeypatch.setattr(ar, "_kis_get", fake)
+        assert ar._get_investor_data(t, "a", "b") == ar._FLOW_MISSING
+    def boom(*a, **k): raise RuntimeError("x")
+    monkeypatch.setattr(ar, "_kis_get", boom)
+    ar._get_investor_data("000006", "a", "b")
+
+    assert ar._flow_fail_summary(list(cases) + ["000006", "999999"]) == (
+        "timeout 2 · rt_cd=1 EGW00201 1 · 빈 응답 1 · 미집계(유효 행 없음) 1 · "
+        "예외 RuntimeError 1 · 사유 미상 1")
+
+
+def test_flow_success_clears_reason(monkeypatch):
+    """한 런 안에서 실패했다가 다시 성공한 종목은 사유가 남지 않는다."""
+    monkeypatch.setenv("KIS_APP_KEY", "k")
+    monkeypatch.setattr(ar, "_FLOW_FAIL_REASON", {"005930": "timeout"})
+    monkeypatch.setattr(ar, "today_kst", lambda: "20261017")
+    rows = [{"stck_bsop_date": "20261016", "orgn_ntby_qty": "1", "frgn_ntby_qty": "1",
+             "prsn_ntby_qty": "-2"}]
+    monkeypatch.setattr(ar, "_kis_get", lambda *a, **k: {"rt_cd": "0", "output": rows})
+    ar._get_investor_data("005930", "a", "b")
+    assert "005930" not in ar._FLOW_FAIL_REASON

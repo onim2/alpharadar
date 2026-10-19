@@ -2056,6 +2056,30 @@ _KIS_RATE_LOCK   = threading.Lock()
 _KIS_FAIL_COUNT  = 0
 _KIS_DISABLED    = False
 _KIS_FAIL_LIMIT  = 3
+# _kis_get 은 어떤 실패든 {} 하나로 돌려준다. 호출 쪽이 사유를 로그에 남길 수 있게
+# 마지막 실패 사유를 스레드별로 둔다(수급 조회는 스레드 풀에서 돈다).
+# 2026-10-19 아침 런의 휴장일조회 실패가 'rt_cd=None msg=' 로만 남아 원인을 몰랐다.
+_KIS_ERR = threading.local()
+
+
+def _kis_last_error() -> str:
+    """이 스레드에서 마지막 _kis_get 호출이 실패한 사유. 성공했거나 모르면 '사유 미상'."""
+    return getattr(_KIS_ERR, "reason", None) or "사유 미상"
+
+
+def _kis_err_label(e) -> str:
+    """예외를 집계용 짧은 라벨로. HTTP 오류는 상태 코드와 KIS msg_cd(본문에 있으면)."""
+    if isinstance(e, requests.Timeout):
+        return "timeout"
+    if isinstance(e, requests.HTTPError) and e.response is not None:
+        try:
+            msg_cd = (e.response.json() or {}).get("msg_cd", "")
+        except ValueError:
+            msg_cd = ""
+        return f"HTTP {e.response.status_code}" + (f" {msg_cd}" if msg_cd else "")
+    if isinstance(e, requests.ConnectionError):
+        return "연결 실패"
+    return type(e).__name__
 
 def _kis_is_real() -> bool:
     raw = os.getenv("KIS_IS_REAL", "0").strip().lower()
@@ -2140,10 +2164,13 @@ def _kis_token() -> str:
 
 def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3) -> dict:
     global _KIS_LAST_CALL
+    _KIS_ERR.reason = None
     if _KIS_DISABLED:
+        _KIS_ERR.reason = "KIS 비활성(토큰 연속 실패)"
         return {}
     token = _kis_token()
     if not token:
+        _KIS_ERR.reason = "토큰 없음"
         return {}
 
     app_key    = os.getenv("KIS_APP_KEY", "")
@@ -2174,10 +2201,12 @@ def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3) -> dict:
             if data.get("rt_cd") == "1" and "EGW00201" in data.get("msg_cd", ""):
                 wait = 2 ** (attempt + 1)
                 logger.warning(f"KIS 속도 제한 → {wait}초 대기")
+                _KIS_ERR.reason = "속도 제한(EGW00201)"
                 time.sleep(wait)
                 continue
             return data
         except Exception as e:
+            _KIS_ERR.reason = _kis_err_label(e)
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
             else:
@@ -2197,6 +2226,20 @@ def _safe_int(v, default=0):
 
 # 수급 조회 실패 표식 — (net_days, net_total, retail_days, inst_net, foreign_net) 전부 None
 _FLOW_MISSING = (None, None, None, None, None)
+# 결측 종목별 실패 사유 — 런 끝 요약('수급 결측 N = 사유별 집계')에 쓴다.
+# 같은 KIS 장애인지(휴장일조회 실패와 겹치는지) 로그로 가르려는 것이다(2026-10-19).
+_FLOW_FAIL_REASON: dict = {}
+
+
+def _flow_missing(ticker, reason):
+    _FLOW_FAIL_REASON[ticker] = reason
+    return _FLOW_MISSING
+
+
+def _flow_fail_summary(tickers) -> str:
+    """결측 종목들의 사유별 집계 — 'timeout 12 · rt_cd=1 EGW00201 5 · 빈 응답 3'."""
+    c = Counter(_FLOW_FAIL_REASON.get(t, "사유 미상") for t in tickers)
+    return " · ".join(f"{k} {v}" for k, v in c.most_common())
 
 def _get_investor_data(ticker, start_date, end_date, exclude_today=True):
     """최근 5거래일 (기관+외인) 순매수 일수·합계, 개인 순매수 일수, 기관 합계, 외인 합계.
@@ -2216,7 +2259,7 @@ def _get_investor_data(ticker, start_date, end_date, exclude_today=True):
                 "  .env에 KIS_APP_KEY / KIS_APP_SECRET / KIS_IS_REAL 설정 필요"
             )
             _KIS_WARNED = True
-        return _FLOW_MISSING
+        return _flow_missing(ticker, "앱키 없음")
 
     try:
         tr_id = "FHKST01010900"
@@ -2253,7 +2296,11 @@ def _get_investor_data(ticker, start_date, end_date, exclude_today=True):
         output2 = data.get("output", data.get("output2", []))
         if not isinstance(output2, list) or not output2:
             logger.debug(f"KIS 수급 빈/비정상 응답 ({ticker}): type={type(output2).__name__}")
-            return _FLOW_MISSING
+            if not data:
+                return _flow_missing(ticker, _kis_last_error())
+            if str(data.get("rt_cd", "0")) != "0":
+                return _flow_missing(ticker, f"rt_cd={data.get('rt_cd')} {data.get('msg_cd', '')}".strip())
+            return _flow_missing(ticker, "빈 응답")
 
         _FIELDS = ("orgn_ntby_tr_pbmn", "frgn_ntby_tr_pbmn", "prsn_ntby_tr_pbmn",
                    "orgn_ntby_qty",     "frgn_ntby_qty",     "prsn_ntby_qty")
@@ -2286,7 +2333,7 @@ def _get_investor_data(ticker, start_date, end_date, exclude_today=True):
         rows  = valid[:5]
         if not rows:
             logger.debug(f"KIS 수급 미집계 ({ticker})")
-            return _FLOW_MISSING
+            return _flow_missing(ticker, "미집계(유효 행 없음)")
 
         use_pbmn = any(
             str(r.get("orgn_ntby_tr_pbmn", "")).strip() not in ("", "-") for r in rows
@@ -2302,6 +2349,7 @@ def _get_investor_data(ticker, start_date, end_date, exclude_today=True):
 
         combined = [i + f for i, f in zip(inst_list, foreign_list)]
 
+        _FLOW_FAIL_REASON.pop(ticker, None)
         return (
             sum(1 for v in combined  if v > 0),
             sum(combined),
@@ -2321,7 +2369,7 @@ def _get_investor_data(ticker, start_date, end_date, exclude_today=True):
             _KIS_TB_LOGGED += 1
         else:
             logger.warning(f"_get_investor_data 실패 ({ticker}): {type(e).__name__}: {e}")
-        return _FLOW_MISSING
+        return _flow_missing(ticker, f"예외 {type(e).__name__}")
 
 def _load_dart_sector_map() -> dict:
     """
@@ -2841,7 +2889,7 @@ def run_step1(precomputed,cfg,date=None):
     surge_pct=ea_cfg.get("vol_surge_pct",0.50)
     require_pos=ea_cfg.get("require_positive_total", True)  # Task 2: 수급 부호 가드
     sign_guarded=0
-    flow_missing_n=0
+    flow_missing=[]
     # 1차: 신호 후보 판정 (a=수급/거래량, b=관심상승+부정낮음)
     candidates=[]
     for ticker,p in precomputed.items():
@@ -2852,7 +2900,7 @@ def run_step1(precomputed,cfg,date=None):
         # KIS 조회 실패 하루가 Engine A 를 끈다(2026-10-17 수리). 선택 집합은 수리 전과 같다.
         _nbd=p.get("net_buy_days")
         if _nbd is None:
-            flow_missing_n += 1
+            flow_missing.append(ticker)
         days_ok=(_nbd is not None) and _nbd>=ea_cfg["net_buy_min_days"]
         inst_buy=days_ok and ((not require_pos) or (p.get("net_buy_total") or 0) > 0)
         if require_pos and days_ok and not inst_buy:
@@ -2863,7 +2911,9 @@ def run_step1(precomputed,cfg,date=None):
             candidates.append((ticker, a, b, vol_rising))
     logger.info(f"수급일수충족·합계음수 제외: {sign_guarded}개")
     # 결측 수가 수십 건이면 KIS 쪽 장애다 — 그날 Engine A 판정은 참고로만 읽을 것.
-    logger.info(f"수급 결측(KIS 조회 실패, Engine A 미판정): {flow_missing_n}개")
+    # 사유별 집계를 같은 줄에 붙인다 — 줄 앞부분은 기존 형식 그대로(로그 grep 호환).
+    logger.info(f"수급 결측(KIS 조회 실패, Engine A 미판정): {len(flow_missing)}개"
+                + (f" = {_flow_fail_summary(flow_missing)}" if flow_missing else ""))
 
     # 버그 수정: top_n 밖의 POOL_A 후보는 neg_ratio 미조회 상태 → 부정뉴스 게이트가 무조건 통과됨.
     # 후보 중 미조회 종목만 뉴스 2차 조회해 neg_ratio 채운 뒤 게이트 적용.
@@ -3617,7 +3667,11 @@ def market_open_kis(date):
         logger.warning(f"KIS 휴장일조회 실패 ({type(e).__name__}: {e})")
         return None
     if date not in days:
-        logger.warning(f"KIS 휴장일조회 응답에 {date} 가 없다 (rt_cd={d.get('rt_cd')} msg={d.get('msg1','').strip()})")
+        if not d:   # _kis_get 이 재시도 끝에 {} — 사유는 _kis_get 이 남긴 것
+            logger.warning(f"KIS 휴장일조회 실패 — 응답 없음 ({_kis_last_error()})")
+        else:
+            logger.warning(f"KIS 휴장일조회 응답에 {date} 가 없다 (rt_cd={d.get('rt_cd')} "
+                           f"msg_cd={d.get('msg_cd', '')} msg={d.get('msg1', '').strip()})")
         return None
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
