@@ -191,20 +191,24 @@ class _Resp:
 
 @pytest.mark.parametrize("behavior, label", [
     ("timeout", "timeout"),
-    ("http500", "HTTP 500 EGW00123"),
+    # 일반 서버 오류 — 10/20 아침 런 실측 코드. 토큰 오류(EGW00123)는 재발급 경로라 아래 'token' 으로 따로 본다.
+    ("http500", "HTTP 500 EGW02004"),
+    ("token", "토큰 오류 지속(EGW00123)"),
     ("conn", "연결 실패"),
 ])
 def test_holiday_failure_logs_reason(tmp_db, monkeypatch, caplog, behavior, label):
     import requests
     monkeypatch.setattr(ar, "_KIS_DISABLED", False)
-    monkeypatch.setattr(ar, "_kis_token", lambda: "tok")
+    monkeypatch.setattr(ar, "_kis_token", lambda *a, **k: "tok")
     monkeypatch.setattr(ar.time, "sleep", lambda s: None)
     def fake_get(*a, **k):
         if behavior == "timeout":
             raise requests.Timeout("read timed out")
         if behavior == "conn":
             raise requests.ConnectionError("reset")
-        return _Resp(500, {"rt_cd": "1", "msg_cd": "EGW00123", "msg1": "기간이 만료된 token"})
+        if behavior == "token":
+            return _Resp(500, {"rt_cd": "1", "msg_cd": "EGW00123", "msg1": "기간이 만료된 token"})
+        return _Resp(500, {"rt_cd": "1", "msg_cd": "EGW02004", "msg1": "server error"})
     monkeypatch.setattr(ar.requests, "get", fake_get)
     with caplog.at_level(logging.WARNING, logger=ar.logger.name):
         assert ar.market_open_kis("20261019") is None
