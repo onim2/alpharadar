@@ -127,3 +127,48 @@ def test_reissue_is_capped_once_per_process(kis):
         assert call() == {}
     assert kis["issued"] == 2, "첫 발급 + 재발급 1회뿐"
     assert ar._KIS_STATS["reissue"] == 1
+
+
+# ── 속도 제한(EGW00201)은 HTTP 500 으로 온다 — 2026-10-20 수리 ────────────────────
+# 10/19 저녁 26건·10/20 아침 5건 수급 결측이 전부 'HTTP 500 EGW00201' 이었다.
+# 예전 순서(raise_for_status 먼저)에선 속도 제한 분기에 닿지 못했다.
+
+class _R:
+    def __init__(self, status, body):
+        self.status_code, self._b = status, body
+    def json(self):
+        return self._b
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+            raise requests.HTTPError(str(self.status_code), response=self)
+
+
+def _setup(monkeypatch, seq):
+    import alpharadar as ar
+    monkeypatch.setattr(ar, "_KIS_DISABLED", False)
+    monkeypatch.setattr(ar, "_kis_token", lambda *a, **k: "tok")
+    sleeps = []
+    monkeypatch.setattr(ar.time, "sleep", lambda s: sleeps.append(s))
+    it = iter(seq)
+    monkeypatch.setattr(ar.requests, "get", lambda *a, **k: next(it))
+    return ar, sleeps
+
+
+_RL500 = (500, {"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과하였습니다."})
+_OK200 = (200, {"rt_cd": "0", "msg_cd": "MCA00000", "output": [{"x": 1}]})
+
+
+def test_rate_limit_500_is_retried_then_succeeds(monkeypatch):
+    ar, sleeps = _setup(monkeypatch, [_R(*_RL500), _R(*_OK200)])
+    d = ar._kis_get("/p", {}, "TR")
+    assert d.get("output") == [{"x": 1}]
+    assert 2 in sleeps                       # 속도 제한 백오프(2초)를 탔다 — 일반 예외(1초)가 아니다
+    assert ar._KIS_ERR.reason == "속도 제한(EGW00201)" or ar._KIS_ERR.reason is None
+
+
+def test_rate_limit_persistent_gives_reason_and_no_trailing_sleep(monkeypatch):
+    ar, sleeps = _setup(monkeypatch, [_R(*_RL500), _R(*_RL500), _R(*_RL500)])
+    assert ar._kis_get("/p", {}, "TR") == {}
+    assert ar._KIS_ERR.reason == "속도 제한(EGW00201)"
+    assert 8 not in sleeps                   # 마지막 시도 뒤엔 기다리지 않는다

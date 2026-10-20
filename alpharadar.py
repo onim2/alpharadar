@@ -2206,6 +2206,16 @@ def _kis_token(force: bool = False) -> str:
             _kis_note_token_failure()
             return ""
 
+def _kis_pace():
+    """KIS 호출 간격(_KIS_INTERVAL)을 스레드 전체에 걸쳐 지킨다."""
+    global _KIS_LAST_CALL
+    with _KIS_RATE_LOCK:
+        elapsed = time.time() - _KIS_LAST_CALL
+        if elapsed < _KIS_INTERVAL:
+            time.sleep(_KIS_INTERVAL - elapsed)
+        _KIS_LAST_CALL = time.time()
+
+
 def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3,
              _reauth: bool = True) -> dict:
     global _KIS_LAST_CALL, _KIS_REPORT_ON
@@ -2224,12 +2234,6 @@ def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3,
     app_key    = os.getenv("KIS_APP_KEY", "")
     app_secret = os.getenv("KIS_APP_SECRET", "")
 
-    with _KIS_RATE_LOCK:
-        elapsed = time.time() - _KIS_LAST_CALL
-        if elapsed < _KIS_INTERVAL:
-            time.sleep(_KIS_INTERVAL - elapsed)
-        _KIS_LAST_CALL = time.time()
-
     headers = {
         "authorization": f"Bearer {token}",
         "appkey":        app_key,
@@ -2239,6 +2243,7 @@ def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3,
     }
 
     for attempt in range(retries):
+        _kis_pace()          # 재시도도 간격을 지킨다 — 예전엔 첫 호출만 간격을 두고 재시도는 바로 쐈다
         try:
             r = requests.get(
                 f"{_kis_base_url()}{path}",
@@ -2267,14 +2272,19 @@ def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3,
                     _KIS_ERR.reason = "토큰 재발급 실패"
                     return {}
                 return _kis_get(path, params, tr_id, retries, _reauth=False)
+            # 속도 제한은 raise_for_status 보다 먼저 본다. KIS 는 EGW00201 을 HTTP 500 으로 보내서,
+            # 예전 순서에선 이 분기에 한 번도 닿지 못하고 일반 예외로 1·2초만 쉬고 끝났다.
+            # 실측: 10/19 저녁 26건·10/20 아침 5건 결측이 전부 'HTTP 500 EGW00201'(#25 사유 집계).
+            if code == "EGW00201":
+                wait = 2 ** (attempt + 1)
+                logger.warning(f"KIS 속도 제한 → {wait}초 대기 ({attempt + 1}/{retries})")
+                _KIS_ERR.reason = "속도 제한(EGW00201)"
+                _KIS_STATS["rate_limited"] = _KIS_STATS.get("rate_limited", 0) + 1
+                if attempt < retries - 1:
+                    time.sleep(wait)
+                continue
             r.raise_for_status()
             data = body
-            if data.get("rt_cd") == "1" and "EGW00201" in data.get("msg_cd", ""):
-                wait = 2 ** (attempt + 1)
-                logger.warning(f"KIS 속도 제한 → {wait}초 대기")
-                _KIS_ERR.reason = "속도 제한(EGW00201)"
-                time.sleep(wait)
-                continue
             return data
         except Exception as e:
             _KIS_ERR.reason = _kis_err_label(e)
