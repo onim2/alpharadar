@@ -2082,6 +2082,21 @@ def _kis_last_error() -> str:
     return getattr(_KIS_ERR, "reason", None) or "사유 미상"
 
 
+def _kis_last_msg() -> str:
+    """이 스레드에서 마지막 _kis_get 오류 응답의 msg1 원문. 없으면 ''.
+    사유 라벨(집계용)은 msg_cd 까지만 쓴다 — 10/20 아침 휴장일조회 EGW02004 는 뜻을 몰랐다."""
+    return getattr(_KIS_ERR, "msg", None) or ""
+
+
+# 알림은 Actions 본 런에서만 텔레그램으로 보낸다. 로컬·dry-run 은 콘솔로만 —
+# 10/21 로컬 dry-run 의 KIS 오류 알림이 실제 채널로 나갔다. main() 이 --dry-run 일 때 켠다.
+_DRY_RUN = False
+
+
+def _alert_live() -> bool:
+    return os.getenv("GITHUB_ACTIONS") == "true" and not _DRY_RUN
+
+
 def _kis_err_label(e) -> str:
     """예외를 집계용 짧은 라벨로. HTTP 오류는 상태 코드와 KIS msg_cd(본문에 있으면)."""
     if isinstance(e, requests.Timeout):
@@ -2119,8 +2134,12 @@ def _kis_report():
         print(line)
     bad = {k: v for k, v in st["codes"].items() if k == _KIS_RATE_ERR or k in _KIS_TOKEN_ERR}
     if bad or st["reissue"]:
+        text = f"⚠️ KIS 오류 감지 ({Path(sys.argv[0]).name})\n{line}"
+        if not _alert_live():
+            print(f"[알림 미발송 — 로컬/dry-run] {text}")
+            return
         try:
-            TelegramClient().send(f"⚠️ KIS 오류 감지 ({Path(sys.argv[0]).name})\n{line}")
+            TelegramClient().send(text)
         except Exception:
             pass
 
@@ -2220,6 +2239,7 @@ def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3,
              _reauth: bool = True) -> dict:
     global _KIS_LAST_CALL, _KIS_REPORT_ON
     _KIS_ERR.reason = None
+    _KIS_ERR.msg = None
     if not _KIS_REPORT_ON:
         atexit.register(_kis_report)
         _KIS_REPORT_ON = True
@@ -2259,6 +2279,7 @@ def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3,
             code = str(body.get("msg_cd", "") or "")
             if code and body.get("rt_cd") not in (None, "0"):
                 _KIS_STATS["codes"][code] = _KIS_STATS["codes"].get(code, 0) + 1
+                _KIS_ERR.msg = str(body.get("msg1", "") or "").strip()
             if code in _KIS_TOKEN_ERR or r.status_code in (401, 403):
                 # 재발급은 프로세스 전체에서 1회뿐이다 — 호출마다 허용하면 토큰이 계속 나쁠 때
                 # 종목 수만큼 발급을 시도한다(1분 1회 제한·발급마다 알림톡).
@@ -3756,7 +3777,9 @@ def market_open_kis(date):
         return None
     if date not in days:
         if not d:   # _kis_get 이 재시도 끝에 {} — 사유는 _kis_get 이 남긴 것
-            logger.warning(f"KIS 휴장일조회 실패 — 응답 없음 ({_kis_last_error()})")
+            msg = _kis_last_msg()
+            logger.warning(f"KIS 휴장일조회 실패 — 응답 없음 ({_kis_last_error()})"
+                           + (f" msg1={msg!r}" if msg else ""))
         else:
             logger.warning(f"KIS 휴장일조회 응답에 {date} 가 없다 (rt_cd={d.get('rt_cd')} "
                            f"msg_cd={d.get('msg_cd', '')} msg={d.get('msg1', '').strip()})")
@@ -3885,8 +3908,9 @@ def main():
         logger.warning(f"회차 폴백: 슬롯 미지정 — 실행 시각(KST 정오 기준)으로 run_type={run_type} 판정")
 
     if args.dry_run:
-        global _SCAN_RESULTS_READONLY
+        global _SCAN_RESULTS_READONLY, _DRY_RUN
         _SCAN_RESULTS_READONLY = True
+        _DRY_RUN = True
 
     if args.step is None and not args.mock:
         ok, code = run_guard(date_str, run_type, dry_run=args.dry_run)

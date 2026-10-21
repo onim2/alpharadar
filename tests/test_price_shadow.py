@@ -120,6 +120,7 @@ def test_whole_failure_alerts_and_exits_zero(env, monkeypatch):
 def test_import_failure_still_alerts(monkeypatch):
     """alpharadar 를 못 불러와도 알림은 텔레그램 API 로 직접 간다."""
     monkeypatch.setitem(sys.modules, "alpharadar", None)      # import alpharadar → ImportError
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "c")
     posted = []
@@ -127,6 +128,19 @@ def test_import_failure_still_alerts(monkeypatch):
     monkeypatch.setattr(requests, "post", lambda url, json=None, timeout=None: posted.append(json))
     assert ps.main(["--db", "/nonexistent.db"]) == 0
     assert posted and "price shadow(J) 실패" in posted[0]["text"]
+
+
+def test_notify_is_console_only_outside_actions(monkeypatch, capsys):
+    """10/21 로컬 실행 알림이 실제 채널로 나갔다 — Actions 밖에서는 보내지 않는다."""
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "c")
+    sent = []
+    import requests
+    monkeypatch.setattr(requests, "post", lambda *a, **k: sent.append(k))
+    monkeypatch.setattr(ar.TelegramClient, "send", lambda self, text: sent.append(text))
+    ps.notify("테스트 알림")
+    assert sent == [] and "테스트 알림" in capsys.readouterr().out
 
 
 def test_refuses_live_db_without_flag(env, monkeypatch):

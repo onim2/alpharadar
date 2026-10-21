@@ -61,7 +61,11 @@ def log() -> logging.Logger:
 
 
 def notify(text: str):
-    """텔레그램 알림. alpharadar 를 못 불러와도 가도록 API 를 직접 부르는 길을 둔다."""
+    """텔레그램 알림. alpharadar 를 못 불러와도 가도록 API 를 직접 부르는 길을 둔다.
+    Actions 밖(로컬 사본 실행)에서는 콘솔로만 — 10/21 로컬 실행 알림이 실제 채널로 나갔다."""
+    if os.getenv("GITHUB_ACTIONS") != "true":
+        print(f"[알림 미발송 — 로컬] {text}")
+        return
     try:
         import alpharadar as ar
         ar.TelegramClient().send(text)

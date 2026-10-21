@@ -39,6 +39,8 @@ def kis(monkeypatch, tmp_path):
     monkeypatch.setattr(ar, "_KIS_REPORT_ON", True)          # atexit 등록 막기
     monkeypatch.setattr(ar, "_KIS_INTERVAL", 0.0)
     monkeypatch.setattr(ar.time, "sleep", lambda s: None)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")             # 알림 경로는 Actions 본 런 기준
+    monkeypatch.setattr(ar, "_DRY_RUN", False)
     st = {"issued": 0, "post_ok": True, "gets": [], "get_plan": [], "sent": []}
 
     def post(url, json=None, timeout=None):
@@ -90,6 +92,29 @@ def test_rate_limit_is_counted_and_alerted(kis):
     ar._kis_report()
     assert ar._KIS_STATS["codes"] == {"EGW00201": 1}
     assert kis["sent"] and "EGW00201×1" in kis["sent"][0]
+
+
+@pytest.mark.parametrize("gha,dry", [(None, False), ("true", True)])
+def test_alert_is_console_only_outside_actions_or_dry_run(kis, monkeypatch, capsys, gha, dry):
+    """10/21 로컬 dry-run 의 KIS 오류 알림이 실제 채널로 나갔다 — 로컬·dry-run 은 콘솔로만."""
+    if gha is None:
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.setattr(ar, "_DRY_RUN", dry)
+    kis["get_plan"] = [Resp(200, RATE), Resp(200, OK)]
+    call()
+    ar._kis_report()
+    assert kis["sent"] == []
+    assert "EGW00201×1" in capsys.readouterr().out
+
+
+def test_error_msg1_is_kept_for_http500(kis):
+    """HTTP 500 으로 온 오류도 msg1 원문을 남긴다(10/20 휴장일조회 EGW02004 는 라벨만 남았다)."""
+    body = {"rt_cd": "1", "msg_cd": "EGW02004", "msg1": "원문 메시지"}
+    kis["get_plan"] = [Resp(500, body)] * 3
+    assert call() == {}
+    assert ar._kis_last_msg() == "원문 메시지"
+    kis["get_plan"] = []
+    assert call() == OK and ar._kis_last_msg() == "", "성공하면 지운다"
 
 
 def test_clean_run_logs_but_does_not_alert(kis):
