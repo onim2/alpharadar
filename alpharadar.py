@@ -2063,7 +2063,11 @@ def _precompute_ticker(ticker, start_date, end_date, info, ucfg, cap_fallback=Fa
 # ── KIS API 수급 클라이언트 ───────────────────────────────────────────────────
 _KIS_TOKEN_CACHE: dict = {}
 _KIS_LAST_CALL   = 0.0
-_KIS_INTERVAL    = 0.06
+# 호출 간격은 여기 한 곳에서만 정한다 — price_shadow·stockcard_flow 도 이 _kis_get 을 쓴다.
+# 0.06s(≈16/s)에서 10/21 저녁·10/22 아침 Actions 런이 첫 시도의 15~20% 를 EGW00201 로 받았다
+# (재시도로 대부분 복구, 10/22 최종 결측 5). 로컬 프로브(10/22, 10스레드 200콜):
+# 0.060s 1.5% · 0.0667s(15/s) 0.5% · 0.100s 0% — 공칭 20/s 보다 빡빡하게 걸린다. 10/s 로 둔다.
+_KIS_INTERVAL    = 0.10
 _KIS_WARNED      = False
 _KIS_TB_LOGGED   = 0
 _KIS_TOKEN_LOCK  = threading.Lock()
@@ -2120,20 +2124,38 @@ def _kis_err_label(e) -> str:
 # 텔레그램으로 알린다(atexit — 스캔 본체 흐름을 건드리지 않는다).
 _KIS_TOKEN_ERR   = {"EGW00123", "EGW00121"}
 _KIS_RATE_ERR    = "EGW00201"
-_KIS_STATS       = {"calls": 0, "reissue": 0, "codes": {}}
+_KIS_STATS       = {"calls": 0, "reissue": 0, "codes": {}, "final_fail": {}}
 _KIS_REPORT_ON   = False
+
+
+def _kis_note_final_fail(params: dict, tr_id: str) -> None:
+    """재시도까지 끝내고 {} 를 돌려주는 호출을 종목(없으면 tr_id) 단위로 남긴다.
+    오류코드 집계(codes)는 시도마다 세므로 재시도로 복구된 것까지 들어간다 — 그것만으로는
+    데이터가 실제로 빠졌는지 알 수 없다(10/22 아침 EGW00201×201 중 최종 결측 5)."""
+    key = str((params or {}).get("FID_INPUT_ISCD") or tr_id)
+    _KIS_STATS.setdefault("final_fail", {})[key] = getattr(_KIS_ERR, "reason", None) or "사유 미상"
+
+
+_KIS_FAIL_LIST_MAX = 30
 
 
 def _kis_report():
     st = _KIS_STATS
     codes = ", ".join(f"{k}×{v}" for k, v in sorted(st["codes"].items())) or "없음"
-    line = f"KIS 호출 {st['calls']}회 · 토큰 재발급 {st['reissue']}회 · 오류코드 {codes}"
+    fails = st.get("final_fail", {})
+    line = (f"KIS 호출 {st['calls']}회 · 토큰 재발급 {st['reissue']}회 · 오류코드 {codes}"
+            f" (시도 기준) · 재시도 후 최종 실패 {len(fails)}건")
+    if fails:
+        items = sorted(fails.items())
+        shown = ", ".join(f"{k}({v})" for k, v in items[:_KIS_FAIL_LIST_MAX])
+        more = f" 외 {len(items) - _KIS_FAIL_LIST_MAX}건" if len(items) > _KIS_FAIL_LIST_MAX else ""
+        line += f"\nKIS 데이터 누락(폴백 전): {shown}{more}"
     try:
         logger.info(line)
     except Exception:
         print(line)
     bad = {k: v for k, v in st["codes"].items() if k == _KIS_RATE_ERR or k in _KIS_TOKEN_ERR}
-    if bad or st["reissue"]:
+    if bad or st["reissue"] or fails:
         text = f"⚠️ KIS 오류 감지 ({Path(sys.argv[0]).name})\n{line}"
         if not _alert_live():
             print(f"[알림 미발송 — 로컬/dry-run] {text}")
@@ -2245,10 +2267,12 @@ def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3,
         _KIS_REPORT_ON = True
     if _KIS_DISABLED:
         _KIS_ERR.reason = "KIS 비활성(토큰 연속 실패)"
+        _kis_note_final_fail(params, tr_id)
         return {}
     token = _kis_token()
     if not token:
         _KIS_ERR.reason = "토큰 없음"
+        _kis_note_final_fail(params, tr_id)
         return {}
 
     app_key    = os.getenv("KIS_APP_KEY", "")
@@ -2286,11 +2310,13 @@ def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3,
                 if not _reauth or _KIS_STATS["reissue"] >= 1:
                     logger.warning(f"KIS 토큰 오류 재발급 후에도 지속 ({code or r.status_code}) — 포기")
                     _KIS_ERR.reason = f"토큰 오류 지속({code or r.status_code})"
+                    _kis_note_final_fail(params, tr_id)
                     return {}
                 logger.warning(f"KIS 토큰 오류 ({code or r.status_code}) → 1회 재발급 후 재시도")
                 _KIS_STATS["reissue"] += 1
                 if not _kis_token(force=True):
                     _KIS_ERR.reason = "토큰 재발급 실패"
+                    _kis_note_final_fail(params, tr_id)
                     return {}
                 return _kis_get(path, params, tr_id, retries, _reauth=False)
             # 속도 제한은 raise_for_status 보다 먼저 본다. KIS 는 EGW00201 을 HTTP 500 으로 보내서,
@@ -2313,6 +2339,7 @@ def _kis_get(path: str, params: dict, tr_id: str, retries: int = 3,
                 time.sleep(2 ** attempt)
             else:
                 logger.debug(f"KIS API 최종 실패 ({path}): {e}")
+    _kis_note_final_fail(params, tr_id)
     return {}
 
 def _safe_int(v, default=0):

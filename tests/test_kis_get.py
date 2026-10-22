@@ -197,3 +197,44 @@ def test_rate_limit_persistent_gives_reason_and_no_trailing_sleep(monkeypatch):
     assert ar._kis_get("/p", {}, "TR") == {}
     assert ar._KIS_ERR.reason == "속도 제한(EGW00201)"
     assert 8 not in sleeps                   # 마지막 시도 뒤엔 기다리지 않는다
+
+
+# ── 재시도 후 최종 실패·누락 종목 (2026-10-22) ──────────────────────────────────
+# 오류코드 집계는 시도 기준이라 복구된 재시도까지 센다 — 알림만 보고는 실제 결측을 몰랐다.
+
+def test_recovered_rate_limit_is_not_a_final_failure(kis):
+    kis["get_plan"] = [Resp(500, RATE), Resp(200, OK)]
+    assert ar._kis_get("/x", {"FID_INPUT_ISCD": "005930"}, "TR") == OK
+    ar._kis_report()
+    assert ar._KIS_STATS.get("final_fail", {}) == {}
+    assert "재시도 후 최종 실패 0건" in kis["sent"][0] and "데이터 누락" not in kis["sent"][0]
+
+
+def test_final_failure_lists_ticker_and_reason(kis):
+    kis["get_plan"] = [Resp(500, RATE)] * 3
+    assert ar._kis_get("/x", {"FID_INPUT_ISCD": "000660"}, "TR") == {}
+    kis["get_plan"] = [Resp(500, {"rt_cd": "1", "msg_cd": "EGW02004", "msg1": "m"})] * 3
+    assert ar._kis_get("/hol", {"BASS_DT": "20261022"}, "CTCA0903R") == {}   # 종목 없는 조회는 tr_id
+    ar._kis_report()
+    msg = kis["sent"][0]
+    assert "재시도 후 최종 실패 2건" in msg
+    assert "000660(속도 제한(EGW00201))" in msg and "CTCA0903R(" in msg
+
+
+def test_final_failure_alone_triggers_alert(kis, monkeypatch):
+    """속도 제한·토큰 오류가 아니어도(예: timeout) 데이터가 빠졌으면 알린다."""
+    import requests
+    def boom(*a, **k):
+        raise requests.Timeout("t")
+    monkeypatch.setattr(ar.requests, "get", boom)
+    assert ar._kis_get("/x", {"FID_INPUT_ISCD": "035420"}, "TR") == {}
+    ar._kis_report()
+    assert kis["sent"] and "035420(timeout)" in kis["sent"][0]
+
+
+def test_failure_list_is_truncated(kis):
+    kis["get_plan"] = [Resp(500, RATE)] * (3 * 35)
+    for i in range(35):
+        ar._kis_get("/x", {"FID_INPUT_ISCD": f"{i:06d}"}, "TR")
+    ar._kis_report()
+    assert "재시도 후 최종 실패 35건" in kis["sent"][0] and "외 5건" in kis["sent"][0]
