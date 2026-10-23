@@ -7,7 +7,7 @@
 진짜 아침 런과 같은 키를 썼다(10/2 저녁 → 20261003 am, 10/7 저녁 → 20261008 am).
 
 회차 = 어느 크론이 쐈는가(github.event.schedule) 또는 수동 실행의 slot 입력.
-회차 날짜 = 그 회차의 정시(아침 06:10, 저녁 17:00 KST)가 지금 이전인 가장 최근 평일.
+회차 날짜 = 그 회차의 경계 시각(아침 06:10, 저녁 16:30 KST)이 지금 이전인 가장 최근 평일.
 지연이 24시간 미만이면 이것이 원래 의도한 날짜다. 휴장일은 여기서 거르지 않는다
 (alpharadar.run_guard 가 데이터로 판정한다).
 
@@ -23,13 +23,18 @@ from datetime import datetime, timedelta, timezone
 KST = timezone(timedelta(hours=9))
 
 # daily.yml 의 cron 문자열 → 회차. 크론을 바꾸면 여기도 같이 바꾼다.
-# 옛 저녁 크론(40 9, 18:40 KST)도 남긴다 — 바꾸기 전에 쏜 이벤트가 바꾼 뒤에 시작해도 pm 으로 잡히게.
+# 옛 크론도 남긴다 — 바꾸기 전에 쏜 이벤트가 바꾼 뒤에 시작해도 회차가 맞게.
+# 저녁 본 경로는 cron-job.org 의 16:30 dispatch(slot=pm), '27 8' 은 백업이다.
 CRON_SLOT = {
+    "53 22 * * 0-4": "am",
+    "27 8 * * 1-5": "pm",
     "10 21 * * 0-4": "am",
-    "0 8 * * 1-5": "pm",
     "40 9 * * 1-5": "pm",
 }
-NOMINAL = {"am": (6, 10), "pm": (17, 0)}
+# 날짜 경계 — 크론 시각 그 자체가 아니라 '이 시각(−30분) 이후면 그날 회차'의 기준이다.
+# 아침은 크론을 07:53 으로 늦췄어도 06:10 을 유지한다(06시대 수동 실행이 전날로 가지 않게).
+# 저녁은 16:30 dispatch 가 본 경로라 16:30.
+NOMINAL = {"am": (6, 10), "pm": (16, 30)}
 # 정시보다 조금 일찍 시작한 수동 실행도 그 회차로 본다.
 EARLY_TOLERANCE = timedelta(minutes=30)
 
@@ -59,7 +64,36 @@ def resolve(slot_input="", cron="", date_input="", now=None):
     return "", ""  # 도달 불가 — 평일은 8일 안에 반드시 있다
 
 
+def slot_sent(db_path, date, slot):
+    """그 회차에 발송 기록(sent_history)이 있는가. 테이블이 없으면 0."""
+    import sqlite3
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return con.execute("SELECT COUNT(*) FROM sent_history WHERE send_date=? AND run_type=?",
+                           (date, slot)).fetchone()[0]
+    except sqlite3.OperationalError:
+        return 0
+    finally:
+        con.close()
+
+
+def check_sent(db_path):
+    """daily.yml gate 잡 — SLOT_TYPE·SLOT_DATE(앞 단계가 GITHUB_ENV 로 넘김)의 발송 기록을 보고
+    GITHUB_OUTPUT 에 done=1/0 을 쓴다."""
+    slot, date = os.getenv("SLOT_TYPE", ""), os.getenv("SLOT_DATE", "")
+    n = slot_sent(db_path, date, slot) if slot and date else 0
+    out = os.getenv("GITHUB_OUTPUT")
+    if out:
+        with open(out, "a", encoding="utf-8") as f:
+            f.write(f"done={1 if n else 0}\n")
+    print(f"같은 회차 발송 기록 있음: {date} {slot} {n}행 — 이번 런은 건너뛴다(가드 발동)" if n
+          else f"같은 회차 발송 기록 없음: {date} {slot} — 진행")
+    return 0
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--check-sent":
+        return check_sent(sys.argv[2])
     cron = os.getenv("EVENT_SCHEDULE", "")
     slot, date = resolve(os.getenv("SLOT_INPUT", ""), cron, os.getenv("DATE_INPUT", ""))
     if cron and not slot:

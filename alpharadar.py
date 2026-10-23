@@ -101,8 +101,8 @@ def run_type_kst(now=None) -> str:
     created_at 으로 눈대중할 수는 있어도 질의로 가르기 어려웠다. 런 구분은
     여기 한 곳에서만 정한다.
 
-    경계를 정오에 두는 근거: 아침 크론 21:10 UTC(06:10 KST), 저녁 크론
-    08:00 UTC(17:00 KST, 2026-10-26 전까지 09:40 UTC)에 Actions 큐 지연(아침 중앙 56분, 저녁 중앙 117분)이
+    경계를 정오에 두는 근거: 아침 크론 22:53 UTC(07:53 KST), 저녁 16:30 KST dispatch·
+    백업 크론 08:27 UTC(17:27 KST)(2026-10-26~, 그 전 21:10·09:40 UTC)에 Actions 큐 지연(아침 중앙 56분, 저녁 중앙 117분)이
     붙어도 정오를 넘나들지 않는다.
 
     한계 — 저녁 런이 5시간 넘게 밀려 KST 자정을 넘기면 'am'으로 찍힌다
@@ -1596,6 +1596,13 @@ class TelegramClient:
                     time.sleep(wait)
                     continue
                 r.raise_for_status()
+                # 도착 시각 — 텔레그램 서버가 메시지에 찍은 시각(result.date). 런 시각 측정용 로그.
+                try:
+                    m = r.json().get("result") or {}
+                    logger.info(f"텔레그램 도착 {datetime.fromtimestamp(m['date'], KST):%Y-%m-%d %H:%M:%S} KST "
+                                f"(message_id {m.get('message_id')})")
+                except Exception:
+                    pass
                 return True
             except Exception as e:
                 if i < retries - 1:
@@ -3837,6 +3844,42 @@ def slot_rows(scan_date, run_type):
     return n_scan, n_sent
 
 
+FDR_BAR_WAITS    = 3
+FDR_BAR_WAIT_SEC = 600
+
+
+def wait_fdr_today_bar(date_str, probe="005930", waits=FDR_BAR_WAITS, interval=FDR_BAR_WAIT_SEC,
+                       _sleep=time.sleep):
+    """저녁 회차 — FDR 에 회차 날짜의 봉이 올라왔는지 확인하고, 없으면 interval 초씩 waits 번 기다린다.
+    찾으면 True, 끝내 없으면 False. 봉이 처음 잡힌 시각과 대기 횟수(가드 발동)를 로그로 남긴다.
+
+    저녁 런을 16:30(dispatch)로 당기면서 넣었다(2026-10-26~). Step 0 은 저녁 회차에 시세를
+    자르지 않으므로(run_bar_cutoff), 당일 봉이 아직 없으면 전일 봉으로 점수를 내고 당일 라벨을
+    붙인다. 휴장 판정(latest_trading_day)은 KIS J 를 먼저 보므로 FDR 지연과 무관하다.
+    '처음 잡힌 시각'은 첫 확인에서 이미 있으면 그 시각이 상한일 뿐이다(더 일찍 올라왔을 수 있다).
+    """
+    import FinanceDataReader as fdr
+    start = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=10)).strftime("%Y%m%d")
+    for attempt in range(waits + 1):
+        last = None
+        try:
+            df = fdr.DataReader(probe, start, date_str)
+            if df is not None and len(df):
+                last = df.index[-1].strftime("%Y%m%d")
+        except Exception as e:
+            logger.warning(f"FDR 당일 봉 확인 실패 ({type(e).__name__}: {e})")
+        if last == date_str:
+            logger.info(f"FDR 당일 봉 첫 감지 {datetime.now(KST):%H:%M:%S} KST — 회차 {date_str} · {probe} · "
+                        f"대기 {attempt}회" + (" (가드 발동)" if attempt else " (가드 미발동)"))
+            return True
+        if attempt < waits:
+            logger.warning(f"FDR 당일 봉 없음(최근 봉 {last}) — {interval // 60}분 대기 ({attempt + 1}/{waits})")
+            _sleep(interval)
+    logger.error(f"FDR 당일 봉 {waits}회 대기 후에도 없음(최근 봉 {last}) — 전일 봉으로 당일 점수를 "
+                 f"내지 않도록 스캔을 중단한다(가드 발동). 백업 크론이 다시 시도한다.")
+    return False
+
+
 def run_guard(date_str, run_type, dry_run=False):
     """전체 런을 시작해도 되는지. (계속 여부, 종료 코드)를 돌려준다.
 
@@ -3952,6 +3995,8 @@ def main():
         if not ok:
             if code: sys.exit(code)
             return
+        if run_type == "pm" and not wait_fdr_today_bar(date_str):
+            sys.exit(1)
 
     try: cfg=load_config(); validate_config(cfg); logger.info("config 검증 완료 ✓")
     except AssertionError as e: logger.error(f"설정 오류: {e}"); sys.exit(1)
