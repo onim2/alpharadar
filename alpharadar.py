@@ -246,6 +246,17 @@ def moving_average(series, days):
     if len(series) < days: return float("nan")
     return float(series.iloc[-days:].mean())
 
+def bizday_slope(series, days=7):
+    """엔진 B shadow — 토·일을 뺀 최근 days 개 점의 linear_slope. series=[(YYYY-MM-DD, ratio)].
+
+    DataLab 검색량은 주말에 평일의 10~20% 로 떨어져(2026-10-23 실측), 일별 7점 기울기의 부호가
+    창 속 주말 위치로 정해졌다 — 요일 모형과 엔진 B 수의 Spearman 0.82(99런). 공휴일은 빼지 않는다
+    (평일 휴장의 검색량 하락은 남는다). 점이 2개 미만이면 0.0."""
+    pts = [v for d, v in series
+           if datetime.strptime(d, "%Y-%m-%d").weekday() < 5][-days:]
+    return linear_slope(pts) if len(pts) >= 2 else 0.0
+
+
 def linear_slope(values):
     arr = np.array(values, dtype=float)
     if len(arr) < 2 or np.nanmean(arr) == 0: return 0.0
@@ -490,6 +501,15 @@ def init_db():
                 run_type TEXT DEFAULT 'am',
                 created_at TEXT DEFAULT (datetime('now','localtime'))
             );
+            -- 엔진 B shadow(2026-10-23~): 현행 일별 7점 기울기 vs 영업일 7점 기울기.
+            -- 판정·발송에는 쓰지 않는다. outcomes 일자내 검정 뒤 교체 여부를 정한다.
+            CREATE TABLE IF NOT EXISTS hype_shadow (
+                scan_date TEXT, run_type TEXT, ticker TEXT,
+                hype_slope REAL, hype_slope_bizday REAL, neg_ratio REAL,
+                b_live INTEGER, b_bizday INTEGER, last_period TEXT,
+                created_at TEXT DEFAULT (datetime('now','localtime')),
+                PRIMARY KEY (scan_date, run_type, ticker)
+            );
             CREATE TABLE IF NOT EXISTS engine_b_history (
                 scan_date TEXT, ticker TEXT, hype_slope REAL,
                 PRIMARY KEY (scan_date, ticker)
@@ -727,6 +747,17 @@ def save_engine_b_history(tickers, precomputed, scan_date):
         for t in tickers:
             slope = precomputed.get(t,{}).get("hype_slope",0)
             con.execute("INSERT OR REPLACE INTO engine_b_history VALUES (?,?,?)", (scan_date,t,slope))
+
+def save_hype_shadow(rows, scan_date, run_type):
+    """엔진 B shadow 행 저장. dry-run 은 쓰지 않는다(scan_results 와 같은 규칙)."""
+    if _SCAN_RESULTS_READONLY or not rows:
+        return
+    with _conn() as con:
+        con.executemany("INSERT OR REPLACE INTO hype_shadow (scan_date, run_type, ticker, hype_slope, "
+                        "hype_slope_bizday, neg_ratio, b_live, b_bizday, last_period) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        [(scan_date, run_type, *r) for r in rows])
+
 
 def save_gated_tickers(rows, scan_date):
     """Task 3 반사실 기록 — 과열 필터로 제거된 종목을 결과 추적용으로 영속."""
@@ -1244,6 +1275,15 @@ class NaverClient:
 
     def get_trend(self, keyword, days=7):
         if not self.keys: return self._mock(days)
+        return [r for _, r in self.get_trend_series(keyword, days)[-days:]]
+
+    def get_trend_series(self, keyword, days=7):
+        """DataLab 일별 검색량 [(YYYY-MM-DD, ratio), ...] — 요청 창(days+5일) 전체. 실패면 [].
+        get_trend 는 이 끝 days 점의 ratio 만 쓴다(기존 동작 그대로)."""
+        if not self.keys:
+            today = datetime.now()
+            return [((today - timedelta(days=days - i)).strftime("%Y-%m-%d"), v)
+                    for i, v in enumerate(self._mock(days))]
         body = {"startDate":(datetime.now()-timedelta(days=days+5)).strftime("%Y-%m-%d"),
                 "endDate":datetime.now().strftime("%Y-%m-%d"),
                 "timeUnit":"date",
@@ -1275,7 +1315,7 @@ class NaverClient:
                 r.raise_for_status()
                 results = r.json().get("results",[])
                 if not results: return []
-                return [d["ratio"] for d in results[0].get("data",[])[-days:]]
+                return [(d["period"], d["ratio"]) for d in results[0].get("data",[])]
             except (requests.exceptions.Timeout,
                     requests.exceptions.ConnectionError) as e:
                 net_attempts += 1
@@ -3000,11 +3040,15 @@ def run_step1(precomputed,cfg,date=None):
         ticker, p = item
         name = p.get("name", ticker)
 
-        trend = naver.get_trend(name, eb_cfg["hype_trend_days"])
+        series = naver.get_trend_series(name, eb_cfg["hype_trend_days"])
+        trend = [v for _, v in series[-eb_cfg["hype_trend_days"]:]]
         if len(trend) >= 2:
             p["hype_latest"] = float(trend[-1])
             p["hype_7d_ago"] = float(trend[0])
             p["hype_slope"]  = linear_slope(trend)
+        if series:
+            p["hype_slope_bizday"] = bizday_slope(series, eb_cfg["hype_trend_days"])
+            p["hype_last_period"]  = series[-1][0]
 
         headlines = naver.get_news_headlines(name, target=5, fetch=15, max_age_days=news_max_age)
         if headlines:
@@ -3019,6 +3063,22 @@ def run_step1(precomputed,cfg,date=None):
                 neg_detected += 1
 
     logger.info(f"부정 키워드 감지: {neg_detected}개 종목 (neg_ratio > 0)")
+
+    # 엔진 B shadow — 조회 대상 전부를 기록한다(풀에 못 든 종목도 비교해야 하므로).
+    shadow = []
+    for t, p in targets:
+        if "hype_slope_bizday" not in p:
+            continue
+        ok_neg = p.get("neg_ratio", 0) < max_neg
+        shadow.append((t, p.get("hype_slope", 0.0), p["hype_slope_bizday"], p.get("neg_ratio", 0.0),
+                       int(p.get("hype_slope", 0) > 0 and ok_neg), int(p["hype_slope_bizday"] > 0 and ok_neg),
+                       p.get("hype_last_period")))
+    if shadow:
+        b_live = {r[0] for r in shadow if r[4]}; b_biz = {r[0] for r in shadow if r[5]}
+        lp = Counter(r[6] for r in shadow).most_common(1)[0][0]
+        logger.info(f"엔진B shadow: 조회 {len(shadow)} · 현행 B {len(b_live)} · 영업일 B {len(b_biz)} · "
+                    f"겹침 {len(b_live & b_biz)} · DataLab 마지막 점 {lp}")
+    save_hype_shadow(shadow, scan_date, run_type_kst())
     # 버그 수정: V-Surge 순위는 hype_slope 기준 (hype_latest는 DataLab 자기정규화라 100 동률 다수 → 난수 순위)
     items=sorted(precomputed.items(),key=lambda x:x[1].get("hype_slope",0),reverse=True)
     for rank,(t,_) in enumerate(items,1): precomputed[t]["hype_rank"]=rank
