@@ -7,6 +7,7 @@ gh CLI 로 런 목록과 로그를 읽는다(읽기 전용). 시각은 전부 KS
 - 실제 시작: 런의 run_started_at. dispatch 는 발사(created)와 시작이 같다.
 - 텔레그램 도착: alpharadar.py 의 '텔레그램 도착' 로그(텔레그램 서버 시각) 첫·마지막.
 - 가드: gate 의 '같은 회차 발송 기록 있음'(건너뜀), FDR 당일 봉 대기 횟수·처음 잡힌 시각.
+- 전일 pm FDR 종가 불일치: 아침 런이 직전 저녁 런 스냅숏과 같은 날짜 봉을 대조한 결과(불일치/대조, 차 중앙).
 """
 import json, re, subprocess, sys
 from datetime import date, datetime, timedelta, timezone
@@ -35,6 +36,9 @@ def parse(log):
     tg = re.findall(r"텔레그램 도착 (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)", log)
     g["tg"] = (tg[0][11:16], tg[-1][11:16]) if tg else None
     g["skip"] = "같은 회차 발송 기록 있음" in log
+    if m := re.search(r"FDR 종가 재조회: (\d{8}) pm 저장 \d+ · 대조 (\d+) · 불일치 (\d+)([^\n]*)", log):
+        m2 = re.search(r"차 중앙 ([+-][\d.]+%)", m.group(4))
+        g["recheck"] = f"{m.group(3)}/{m.group(2)}" + (f" 중앙 {m2.group(1)}" if m2 else "")
     if m := re.search(r"FDR 당일 봉 첫 감지 (\d\d:\d\d:\d\d) KST .*? 대기 (\d)회", log):
         g["bar"] = (m.group(1)[:5], int(m.group(2)))
     elif "대기 후에도 없음" in log:
@@ -66,10 +70,10 @@ def main():
             guard.append(f"FDR 봉 {g['bar'][0]} (대기 {g['bar'][1]}회{', 발동' if g['bar'][1] else ''})")
         rows.append((st, f"| {g.get('slot', '?')} | {plan} | {c:%m-%d %H:%M} | {st:%m-%d %H:%M} | "
                          f"{(g['tg'][0] + ('~' + g['tg'][1] if g['tg'][1] != g['tg'][0] else '')) if g['tg'] else '—'} | "
-                         f"{', '.join(guard) or '없음'} | {r['event']}{' dry' if g['dry'] else ''} | "
+                         f"{', '.join(guard) or '없음'} | {g.get('recheck', '—')} | {r['event']}{' dry' if g['dry'] else ''} | "
                          f"{r['conclusion'] or r['status']} | {r['databaseId']} |"))
-    print("| 회차 | 예정 | 발사(created) | 실제 시작 | 텔레그램 도착 | 가드 | 이벤트 | 결과 | 런 |")
-    print("|---|---|---|---|---|---|---|---|---|")
+    print("| 회차 | 예정 | 발사(created) | 실제 시작 | 텔레그램 도착 | 가드 | 전일 pm FDR 종가 불일치 | 이벤트 | 결과 | 런 |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
     for _, line in sorted(rows):
         print(line)
 
