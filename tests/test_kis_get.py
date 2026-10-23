@@ -238,3 +238,19 @@ def test_failure_list_is_truncated(kis):
         ar._kis_get("/x", {"FID_INPUT_ISCD": f"{i:06d}"}, "TR")
     ar._kis_report()
     assert "재시도 후 최종 실패 35건" in kis["sent"][0] and "외 5건" in kis["sent"][0]
+
+
+def test_report_carries_key_fingerprint_not_key(kis, monkeypatch):
+    """요약·알림에 앱키 지문(sha256 앞 8자리)만 싣는다 — 키 값 자체는 나가지 않는다."""
+    import hashlib
+    monkeypatch.setenv("KIS_APP_KEY", "PSabcdefSECRETKEY")
+    kis["get_plan"] = [Resp(500, RATE)] * 3
+    ar._kis_get("/x", {"FID_INPUT_ISCD": "000660"}, "TR")
+    ar._kis_report()
+    fp = hashlib.sha256(b"PSabcdefSECRETKEY").hexdigest()[:8]
+    assert f"키 지문 {fp}" in kis["sent"][0] and "PSabcdefSECRETKEY" not in kis["sent"][0]
+
+
+def test_key_fingerprint_without_key(monkeypatch):
+    monkeypatch.delenv("KIS_APP_KEY", raising=False)
+    assert ar._kis_key_fp() == "없음"

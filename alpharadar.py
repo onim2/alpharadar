@@ -49,7 +49,7 @@ AlphaRadar v3.3.1 — 단일 파일 안정화 버전
 """
 
 # ── 표준 라이브러리 ────────────────────────────────────────────────────────────
-import argparse, atexit, io, json, logging, os, pickle, random, re, sqlite3, sys, time, threading, zipfile
+import argparse, atexit, hashlib, io, json, logging, os, pickle, random, re, sqlite3, sys, time, threading, zipfile
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2139,12 +2139,20 @@ def _kis_note_final_fail(params: dict, tr_id: str) -> None:
 _KIS_FAIL_LIST_MAX = 30
 
 
+def _kis_key_fp() -> str:
+    """앱키 sha256 앞 8자리 — 어느 키로 돌았는지 로그로 대조하려는 것(키 값은 남기지 않는다).
+    10/22 Actions Secrets 에 모의 키(96481ab4)가 들어 있어 휴장일조회 EGW02004·EGW00201 다발이
+    났는데, 키가 다르다는 사실을 프로브를 따로 돌려서야 알았다. 실전 키는 eb9d0251(10/22 교체)."""
+    key = os.getenv("KIS_APP_KEY", "")
+    return hashlib.sha256(key.encode()).hexdigest()[:8] if key else "없음"
+
+
 def _kis_report():
     st = _KIS_STATS
     codes = ", ".join(f"{k}×{v}" for k, v in sorted(st["codes"].items())) or "없음"
     fails = st.get("final_fail", {})
     line = (f"KIS 호출 {st['calls']}회 · 토큰 재발급 {st['reissue']}회 · 오류코드 {codes}"
-            f" (시도 기준) · 재시도 후 최종 실패 {len(fails)}건")
+            f" (시도 기준) · 재시도 후 최종 실패 {len(fails)}건 · 키 지문 {_kis_key_fp()}")
     if fails:
         items = sorted(fails.items())
         shown = ", ".join(f"{k}({v})" for k, v in items[:_KIS_FAIL_LIST_MAX])
