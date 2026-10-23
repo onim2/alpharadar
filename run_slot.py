@@ -7,7 +7,7 @@
 진짜 아침 런과 같은 키를 썼다(10/2 저녁 → 20261003 am, 10/7 저녁 → 20261008 am).
 
 회차 = 어느 크론이 쐈는가(github.event.schedule) 또는 수동 실행의 slot 입력.
-회차 날짜 = 그 회차의 정시(아침 06:10, 저녁 18:40 KST)가 지금 이전인 가장 최근 평일.
+회차 날짜 = 그 회차의 정시(아침 06:10, 저녁 17:00 KST)가 지금 이전인 가장 최근 평일.
 지연이 24시간 미만이면 이것이 원래 의도한 날짜다. 휴장일은 여기서 거르지 않는다
 (alpharadar.run_guard 가 데이터로 판정한다).
 
@@ -23,11 +23,13 @@ from datetime import datetime, timedelta, timezone
 KST = timezone(timedelta(hours=9))
 
 # daily.yml 의 cron 문자열 → 회차. 크론을 바꾸면 여기도 같이 바꾼다.
+# 옛 저녁 크론(40 9, 18:40 KST)도 남긴다 — 바꾸기 전에 쏜 이벤트가 바꾼 뒤에 시작해도 pm 으로 잡히게.
 CRON_SLOT = {
     "10 21 * * 0-4": "am",
+    "0 8 * * 1-5": "pm",
     "40 9 * * 1-5": "pm",
 }
-NOMINAL = {"am": (6, 10), "pm": (18, 40)}
+NOMINAL = {"am": (6, 10), "pm": (17, 0)}
 # 정시보다 조금 일찍 시작한 수동 실행도 그 회차로 본다.
 EARLY_TOLERANCE = timedelta(minutes=30)
 
