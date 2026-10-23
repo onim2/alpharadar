@@ -4,3 +4,6 @@
 2026-10-23 00:21:44,135 [INFO] stockcard — DB: data/scores_history.db
 2026-10-23 00:21:44,146 [INFO] stockcard — 대상 27종목 (스캔 26 + watchlist 전용 1) | 20261023 라벨=am
 2026-10-23 00:22:26,232 [INFO] stockcard — 수급 적재: 27종목 (실패 0) | 신규 9 · 갱신 2340 · 무시 0
+2026-10-23 14:52:58,024 [INFO] stockcard — DB: data/scores_history.db
+2026-10-23 14:52:58,035 [INFO] stockcard — 대상 43종목 (스캔 42 + watchlist 전용 1) | 20261023 라벨=pm
+2026-10-23 14:54:19,808 [INFO] stockcard — 수급 적재: 43종목 (실패 0) | 신규 513 · 갱신 3357 · 무시 0
