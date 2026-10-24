@@ -3,7 +3,7 @@
     python tools/run_timing_report.py 2026-10-26 [2026-10-30]
 
 gh CLI 로 런 목록과 로그를 읽는다(읽기 전용). 시각은 전부 KST.
-- 예정: 스케줄은 어느 크론이 쐈는지(로그의 EVENT_SCHEDULE), dispatch 는 slot=pm 이면 16:30(cron-job.org).
+- 예정: 스케줄은 어느 크론이 쐈는지(로그의 EVENT_SCHEDULE), dispatch 는 수동.
 - 실제 시작: 런의 run_started_at. dispatch 는 발사(created)와 시작이 같다.
 - 텔레그램 도착: alpharadar.py 의 '텔레그램 도착' 로그(텔레그램 서버 시각) 첫·마지막.
 - 가드: gate 의 '같은 회차 발송 기록 있음'(건너뜀), FDR 당일 봉 대기 횟수·처음 잡힌 시각.
@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta, timezone
 
 KST = timezone(timedelta(hours=9))
 REPO = "onim2/alpharadar"
-CRON_KST = {"53 22 * * 0-4": "07:53", "27 8 * * 1-5": "17:27", "10 21 * * 0-4": "06:10",
+CRON_KST = {"43 22 * * 0-4": "07:43", "27 7 * * 1-5": "16:27", "53 22 * * 0-4": "07:53", "27 8 * * 1-5": "17:27", "10 21 * * 0-4": "06:10",
             "40 9 * * 1-5": "18:40", "0 8 * * 1-5": "17:00"}
 
 
@@ -61,7 +61,7 @@ def main():
         if r["event"] == "schedule":
             plan = CRON_KST.get(g.get("cron", ""), g.get("cron", "?")) + " 크론"
         else:
-            plan = "16:30 dispatch" if (g.get("slot", "").endswith("pm")) else "수동"
+            plan = "수동"
         st = kst(r["startedAt"])
         guard = []
         if g["skip"]:
