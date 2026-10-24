@@ -17,15 +17,15 @@ on:
     # 'am' 으로 기록됐다(10/7 저녁 → 20261008 am). 크론 문자열을 바꾸면
     # run_slot.py 의 CRON_SLOT 도 같이 바꾼다.
 
-    # 아침 — KST 월~금 06:10 (장 시작 2시간 50분 전)
-    # 07:40 → 06:40 → 06:10 으로 두 번 당겼다. 06:40일 때 도착 중앙값이
-    # 09:02로 여전히 개장(09:00) 언저리였다. 30분 더 확보해 08:30대를 노린다.
-    # 드물게 3시간 넘는 지연이 나오는데(8/7 204분) 어떤 값으로도 못 막는다.
-    - cron: '10 21 * * 0-4'
+    # 아침 — KST 월~금 07:53 (2026-10-26~, 그 전 06:10)
+    # 07:40 → 06:40 → 06:10 으로 당겼다가, 10월 발사 지연이 아침 +2.6~4.6h 로 커져
+    # 정시 의미가 없어졌다. 한 주간 '예정 vs 실제 시작'을 재고 다시 정한다.
+    - cron: '53 22 * * 0-4'
 
-    # 저녁 — KST 월~금 18:40 (장 마감 3시간 10분 후)
-    # 지연이 커서 실제 도착은 KST 21~22시대.
-    - cron: '40 9 * * 1-5'
+    # 저녁 — 본 경로는 외부 스케줄러(cron-job.org)가 KST 월~금 16:30 에 workflow_dispatch
+    # (inputs.slot=pm)로 부른다. Actions schedule 의 발사 지연(10월 저녁 +4.5~9.6h)을 피하려는 것.
+    # 아래 크론(KST 17:27)은 백업이다 — 같은 회차 발송 기록이 이미 있으면 gate 잡이 즉시 끝낸다.
+    - cron: '27 8 * * 1-5'
 
   workflow_dispatch:        # 수동 실행 버튼 활성화
     inputs:
@@ -66,9 +66,42 @@ permissions:
   contents: write           # DB·캐시 자동 커밋용
 
 jobs:
-  run:
+  # 같은 회차(SLOT_DATE, SLOT_TYPE)에 발송 기록이 이미 있으면 본 잡을 건너뛰고 성공으로 끝낸다.
+  # 16:30 dispatch 가 성공한 날 17:27 백업 크론(과 재시도 dispatch)이 여기서 멈춘다.
+  # DB 는 체크아웃 시점이 아니라 origin/main 최신에서 읽는다 — 큐에서 기다린 런은 이벤트
+  # 당시 커밋을 체크아웃하므로 앞 런이 푸시한 발송 기록이 없다.
+  # dry-run 은 보지 않는다(쓰지도 보내지도 않으므로 run_guard 와 같은 규칙).
+  gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 5
+    outputs:
+      done: ${{ steps.chk.outputs.done }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve run slot
+        env:
+          SLOT_INPUT:     ${{ github.event.inputs.slot }}
+          DATE_INPUT:     ${{ github.event.inputs.slot_date }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+        run: python3 run_slot.py
+      - name: Skip if this slot was already sent
+        id: chk
+        env:
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ] || [ -z "$SLOT_TYPE" ]; then
+            echo "done=0" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          git fetch -q --depth=1 origin main
+          git show origin/main:data/scores_history.db > "$RUNNER_TEMP/live.db"
+          python3 run_slot.py --check-sent "$RUNNER_TEMP/live.db"
+
+  run:
+    needs: gate
+    if: needs.gate.outputs.done != '1'
+    runs-on: ubuntu-latest
+    # 저녁 런의 FDR 당일 봉 가드가 최대 30분(10분×3) 기다린다.
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
