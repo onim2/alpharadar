@@ -1,0 +1,3 @@
+2026-11-02 01:07:30,778 [INFO] stockcard — DB: data/scores_history.db
+2026-11-02 01:07:30,783 [INFO] stockcard — 대상 18종목 (스캔 17 + watchlist 전용 1) | 20261102 라벨=am
+2026-11-02 01:08:01,284 [INFO] stockcard — 수급 적재: 18종목 (실패 0) | 신규 0 · 갱신 1566 · 무시 0
