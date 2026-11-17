@@ -300,6 +300,7 @@ jobs:
       # 아침 런이 전일 봉을 확정(is_final=1)시킨다. 따로 둔 이유: price shadow 가 저녁 런에
       # 이미 6.5~7.6분을 써서 8분 제한 안에 여유가 없다.
       - name: Daily OHLC (KIS J)
+        id: ohlc
         if: success()
         continue-on-error: true
         timeout-minutes: 5
@@ -312,6 +313,21 @@ jobs:
           DAILY_OHLC_ALLOW_LIVE_DB: '1'
         run: python daily_ohlc.py
 
+      # 스크립트는 자기 예외를 텔레그램으로 알리고 0 으로 끝나므로, 여기 걸리는 건 제한시간 강제 종료·
+      # 인터프리터 수준 실패뿐이다. continue-on-error 라 런은 초록으로 끝나니 이 줄이 유일한 알림이다.
+      - name: Alert daily OHLC step failure
+        if: always() && steps.ohlc.outcome == 'failure'
+        continue-on-error: true
+        timeout-minutes: 1
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "::warning::Daily OHLC 단계 실패(제한시간 또는 강제 종료) — 스캔·발송 영향 없음"
+          curl -s -o /dev/null -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=⚠️ daily OHLC(J) 단계 실패(제한시간·강제 종료) — 스캔·발송 영향 없음, 다음 런이 다시 받는다" || true
+
       # shadow 행은 위 커밋 뒤에 생기므로 따로 커밋한다. 방식은 위와 같다(rebase 재시도,
       # DB 충돌이면 조용히 고르지 않고 중단). 실패해도 스캔 결과는 이미 푸시돼 있다.
       - name: Commit price shadow
@@ -319,7 +335,14 @@ jobs:
         continue-on-error: true
         timeout-minutes: 5
         run: |
-          git add data/scores_history.db          2>/dev/null || true
+          # 앞 두 단계가 제한시간에 쓰기 도중 죽었으면 DB 에 hot journal 이 남는다. 열기만 해도 sqlite 가
+          # 롤백하고, 그래도 무결성 검사가 ok 가 아니면 DB 는 메인 커밋 시점으로 되돌리고 로그만 올린다.
+          if python -c "import sqlite3,sys; c=sqlite3.connect('data/scores_history.db'); sys.exit(c.execute('PRAGMA integrity_check').fetchone()[0] != 'ok')"; then
+            git add data/scores_history.db        2>/dev/null || true
+          else
+            echo "::error::DB 무결성 검사 실패 — shadow·OHLC 행은 이번 런에서 버리고 DB 는 메인 커밋 상태로 되돌린다"
+            git checkout -- data/scores_history.db
+          fi
           git add data/logs/price_shadow_*.log    2>/dev/null || true
           git add data/logs/daily_ohlc_*.log      2>/dev/null || true
           if git diff --staged --quiet; then

@@ -51,6 +51,7 @@ INDICES = {"KOSPI": ("0001", "KS11"), "KOSDAQ": ("1001", "KQ11")}   # ticker: (K
 FINAL_HHMM = (8, 0)              # 가설 — 다음 달력일 이 시각 이후에 받은 봉을 확정으로 본다
 MARKET_CLOSE_HHMM = (15, 40)     # 이 전이면 오늘 행은 장중 현재가 — 버린다(KIS 함정 6)
 VALUE_COLS = ["open", "high", "low", "close", "volume", "value"]
+STALE_DAYS = 4                   # 봉 날짜가 이보다 오래됐는데 kis_j 행이 미확정이면 경고(주말 포함 여유)
 COVERED_MIN = 30                 # 이만큼 안에 kis_j 로 저장된 종목은 price_shadow 가 이번 런에 받은 것으로 본다
 
 SCHEMA = f"""
@@ -369,6 +370,9 @@ def run(ar, db, now=None, backfill=None):
             log().info(f"진행 {i}/{len(todo) + len(INDICES)} · {(datetime.now() - t0).seconds}초 · "
                        f"KIS 호출 {ar._KIS_STATS['calls'] - calls0}")
     con.commit()
+    stale_lo = (now - timedelta(days=STALE_DAYS)).strftime("%Y%m%d")
+    stale = con.execute(f"SELECT COUNT(*), COUNT(DISTINCT ticker) FROM {TABLE} WHERE is_final=0 "
+                        f"AND price_src='kis_j' AND date<?", (stale_lo,)).fetchone()
     con.close()
     secs = (datetime.now() - t0).total_seconds()
     calls = ar._KIS_STATS["calls"] - calls0
@@ -379,9 +383,12 @@ def run(ar, db, now=None, backfill=None):
     log().info(line)
     for w in warns:
         log().warning(w)
-    if n_src["fdr"] or failed or stats["changed_final"]:
+    if stale[0]:                                   # 확정이 며칠째 밀렸다 — 아침 런이 계속 못 돌았거나 조회 실패
+        log().warning(f"{STALE_DAYS}일 넘게 미확정인 kis_j 행 {stale[0]}건/{stale[1]}종목")
+    if n_src["fdr"] or failed or stats["changed_final"] or stale[0]:
         detail = f"\n실패: {', '.join(failed[:10])}" if failed else ""
         detail += f"\n확정값 변경 {len(stats['changed_final'])}건(로그 참조)" if stats["changed_final"] else ""
+        detail += f"\n{STALE_DAYS}일 넘게 미확정 {stale[0]}건/{stale[1]}종목" if stale[0] else ""
         notify(f"ℹ️ daily OHLC(J) — 스캔·발송 영향 없음\n{msg}{detail}")
     return {"sets": {k: len(v) for k, v in sets.items()}, "union": len(union), "fetched": len(todo),
             "src": n_src, "failed": failed, "calls": calls, "secs": secs, "stats": stats}

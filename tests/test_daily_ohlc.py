@@ -223,3 +223,10 @@ def test_price_shadow_kis_daily_fills_sink_and_keeps_return(monkeypatch):
     df = ps._kis_daily(ar, "000001", "20261101", "20261113")
     assert list(df.columns) == ["Close", "High", "Volume"]
     assert ps._OHLC_SINK["000001"]["20261113"]["low"] == 990.0
+
+
+def test_run_warns_on_stale_unfinal(db, world):
+    _, sent = world
+    put(db, "000007", {"20261105": bar(1.0)}, "kis_j", datetime(2026, 11, 5, 23, 0, tzinfo=KST))
+    do.run(ar, db, now=MORNING)
+    assert any("4일 넘게 미확정 1건/1종목" in t for t in sent)
