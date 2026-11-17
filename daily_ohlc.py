@@ -4,8 +4,10 @@
 정본은 KIS 일봉(FHKST03010100) 시장구분 J 다(CLAUDE.md KIS 함정 5). 밤에 받은 당일 봉은
 다음 날 다시 받은 값과 다를 수 있어(11/13 루닛 15,250 → 15,020) 확정 여부(is_final)를 같이 적는다.
 
-    확정 규칙: 받은 시각이 봉 날짜의 다음 달력일 08:00 KST 이후면 is_final=1.
-              08:00 은 가설이다 — first_close(처음 받은 종가)와 확정 종가의 차이를 런마다 로그로 남겨 검증한다.
+    확정 규칙: 받은 시각이 봉 날짜의 다음 달력일 09:00 KST 이후면 is_final=1(CLAUDE.md 함정 5 수집 시각 조건과 같은 값).
+              근거: 11/17 실측에서 익일 03:04 수신분까지 통합가(UN), 정규장 값이 확인된 가장 이른 수신은 09:22.
+              09:00~09:22 사이 수신분의 오판은 다음 재조회 때 '확정값 변경' 경고로 드러난다.
+              first_close(처음 받은 종가)와 확정 종가의 차이를 런마다 로그로 남겨 경계를 계속 검증한다.
     is_final=0 행은 다시 받으면 값을 갱신하고 규칙에 따라 1 로 올린다. first_close·first_seen 은 그대로 둔다.
     is_final=1 행은 값이 같으면 as_of 만 갱신, 다르면 갱신하고 경고를 남긴다(수정주가 등).
     장 마감(15:40) 전에 받은 당일 행은 버린다(장중 현재가, KIS 함정 6).
@@ -48,7 +50,7 @@ STOCK_TR = "FHKST03010100"
 INDEX_PATH = "/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice"
 INDEX_TR = "FHKUP03500100"
 INDICES = {"KOSPI": ("0001", "KS11"), "KOSDAQ": ("1001", "KQ11")}   # ticker: (KIS 업종코드, FDR 심볼)
-FINAL_HHMM = (8, 0)              # 가설 — 다음 달력일 이 시각 이후에 받은 봉을 확정으로 본다
+FINAL_HHMM = (9, 0)              # 실측 근거는 위 docstring — 다음 달력일 이 시각 이후에 받은 봉을 확정으로 본다
 MARKET_CLOSE_HHMM = (15, 40)     # 이 전이면 오늘 행은 장중 현재가 — 버린다(KIS 함정 6)
 VALUE_COLS = ["open", "high", "low", "close", "volume", "value"]
 STALE_DAYS = 4                   # 봉 날짜가 이보다 오래됐는데 kis_j 행이 미확정이면 경고(주말 포함 여유)
@@ -267,7 +269,7 @@ def store(con, tk, bars, src, now, stats):
 
 
 def stats_lines(stats, label):
-    """확정 전환 행의 first_close 대 확정 close 차이 — 08:00 경계 가설 검증용 한 줄 + 경고들."""
+    """확정 전환 행의 first_close 대 확정 close 차이 — 09:00 경계 검증용 한 줄 + 경고들."""
     fz = [(t, d, (c / f0 - 1) * 100) for t, d, f0, c in stats["finalized"] if f0 and c]
     bad = [x for x in fz if abs(x[2]) > 1e-9]
     line = (f"{label} 확정 전환 {len(fz)}행 · first_close 불일치 {len(bad)}"

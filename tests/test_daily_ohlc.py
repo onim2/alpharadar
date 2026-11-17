@@ -13,8 +13,8 @@ import price_shadow as ps
 
 KST = do.KST
 NIGHT = datetime(2026, 11, 13, 23, 30, tzinfo=KST)       # 봉 당일 밤 — 미확정
-EARLY = datetime(2026, 11, 14, 7, 59, tzinfo=KST)        # 다음 날 08:00 직전 — 미확정
-MORNING = datetime(2026, 11, 14, 8, 0, tzinfo=KST)       # 다음 날 08:00 — 확정
+EARLY = datetime(2026, 11, 14, 8, 59, tzinfo=KST)        # 다음 날 09:00 직전 — 미확정
+MORNING = datetime(2026, 11, 14, 9, 0, tzinfo=KST)       # 다음 날 09:00 — 확정
 
 
 def bar(c, o=None, h=None, low=None, v=1000.0, val=None):
@@ -62,7 +62,7 @@ def test_night_then_morning_finalizes_and_keeps_first_close(db):
     r = rows(db)[("328130", "20261113")]
     assert r["is_final"] == 0 and r["first_close"] == 15250.0 and r["close"] == 15250.0
     st = put(db, "328130", {"20261113": bar(15020.0, h=15400.0)}, "kis_j", EARLY)
-    assert rows(db)[("328130", "20261113")]["is_final"] == 0, "08:00 전 재조회는 아직 미확정"
+    assert rows(db)[("328130", "20261113")]["is_final"] == 0, "09:00 전 재조회는 아직 미확정"
     st = put(db, "328130", {"20261113": bar(15020.0, h=15400.0)}, "kis_j", MORNING)
     r = rows(db)[("328130", "20261113")]
     assert r["is_final"] == 1 and r["close"] == 15020.0
