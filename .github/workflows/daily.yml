@@ -295,6 +295,23 @@ jobs:
           PRICE_SHADOW_ALLOW_LIVE_DB: '1'
         run: python price_shadow.py
 
+      # 정규장 일봉(daily_ohlc_j). price_shadow 대상은 위 단계가 같은 응답으로 이미 넣었고,
+      # 여기서는 watchlist·브리핑 관심·최근 발송·미확정 종목과 지수만 받는다.
+      # 아침 런이 전일 봉을 확정(is_final=1)시킨다. 따로 둔 이유: price shadow 가 저녁 런에
+      # 이미 6.5~7.6분을 써서 8분 제한 안에 여유가 없다.
+      - name: Daily OHLC (KIS J)
+        if: success()
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          KIS_APP_KEY:    ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KIS_IS_REAL:    '1'
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          DAILY_OHLC_ALLOW_LIVE_DB: '1'
+        run: python daily_ohlc.py
+
       # shadow 행은 위 커밋 뒤에 생기므로 따로 커밋한다. 방식은 위와 같다(rebase 재시도,
       # DB 충돌이면 조용히 고르지 않고 중단). 실패해도 스캔 결과는 이미 푸시돼 있다.
       - name: Commit price shadow
@@ -304,6 +321,7 @@ jobs:
         run: |
           git add data/scores_history.db          2>/dev/null || true
           git add data/logs/price_shadow_*.log    2>/dev/null || true
+          git add data/logs/daily_ohlc_*.log      2>/dev/null || true
           if git diff --staged --quiet; then
             echo "커밋할 shadow 변경 없음"
             exit 0

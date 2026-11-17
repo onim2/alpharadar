@@ -262,3 +262,16 @@ stockcard:
   tags:
     # T7 유형 태그 킬스위치. 태그는 신호이지 주문이 아니다.
     enabled: true
+
+# ─── 정규장 일봉 저장 (daily_ohlc.py → daily_ohlc_j) ──────────────────────
+# 스캔·점수·발송과 무관. 아침 장 전 브리핑이 이 테이블의 확정값(is_final=1)을 읽는다.
+daily_ohlc:
+  # 아침 브리핑 관심 종목. 형식은 stockcard.watchlist_path 와 같다(경로는 여기 한 곳).
+  briefing_watchlist_path: data/briefing_watchlist.txt
+  # 최근 이 달력일 안에 발송된 종목을 매일 받는다(발송 후 약 20거래일 성적 추적).
+  sent_lookback_days: 30
+  # 정기 런의 조회 창(달력일). price_shadow 응답에서 저장하는 봉도 이 창만큼만 넣는다.
+  fetch_days: 14
+  store_days: 14
+  # 이 달력일 안에 미확정(is_final=0) 행이 남은 종목은 다시 받아 확정시킨다.
+  refetch_unfinal_days: 7
