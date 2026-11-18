@@ -4,3 +4,128 @@
 2026-11-17 17:10:11,449 [INFO] track_outcomes —   가격 조회 고유 종목 916개 (기존 258 + 대조군 추가 658)
 2026-11-17 17:10:11,450 [INFO] track_outcomes —   가격 조회 종료일 2026-11-17 (KST 오늘 2026-11-18 02:10 — 당일 바 제외)
 2026-11-17 17:30:06,896 [INFO] track_outcomes — outcomes 적재: 신규 150건 | 갱신(신규+보완) 1802건
+2026-11-18 02:54:13,201 [INFO] __main__ — KIS 토큰 발급 완료
+2026-11-18 02:54:13,741 [INFO] __main__ — config 검증 완료 ✓
+2026-11-18 02:54:13,741 [INFO] __main__ — KIS 조회 도메인: 실전 (https://openapi.koreainvestment.com:9443)
+2026-11-18 02:54:13,741 [INFO] __main__ — ============================================================
+2026-11-18 02:54:13,741 [INFO] __main__ — AlphaRadar v3.3.1  |  기준일: 20261118  |  런: am
+2026-11-18 02:54:13,741 [INFO] __main__ — S = T×0.3 + S_text×0.4 + D×0.3
+2026-11-18 02:54:13,741 [INFO] __main__ — ============================================================
+2026-11-18 02:54:13,741 [INFO] __main__ — ▶ Step 0: 유니버스 필터링
+2026-11-18 02:54:13,844 [INFO] __main__ — FDR 데이터 수집: 20260515 ~ 20261118 (아침 회차 — 시세는 20261118 미만 바만 사용)
+2026-11-18 02:54:14,905 [WARNING] __main__ — 목록 시총 결측 (KOSPI): 유효 0% < 50% — 스냅샷 저장 안 함, 시총은 계산으로 대체
+2026-11-18 02:54:15,484 [WARNING] __main__ — 목록 시총 결측 (KOSDAQ): 유효 0% < 50% — 스냅샷 저장 안 함, 시총은 계산으로 대체
+2026-11-18 02:54:15,497 [INFO] __main__ — master universe 메타: 캐시 사용 2760개 (year=2026)
+2026-11-18 02:54:15,498 [INFO] __main__ — master 보강: 등급 831개 | FnGuide/KSIC 2532개 | 섹터(fg_industry) 2532개
+2026-11-18 02:54:15,498 [INFO] __main__ — KOSPI: 936개 | 섹터정보 828개 (DART +825개 보완)
+2026-11-18 02:54:15,499 [INFO] __main__ — KOSDAQ: 1835개 | 섹터정보 1733개
+2026-11-18 02:54:15,499 [INFO] __main__ — 전체: 2771개
+2026-11-18 02:54:15,500 [WARNING] __main__ — 시총 결측 런: 목록 시총 유효 0/2771 (0%) — 상장주식수 × 최근 바 종가로 계산한다
+2026-11-18 03:00:53,664 [INFO] __main__ — 사전 계산 탈락·대체: 시총 계산 2733 · 계산 불가 탈락 0 · 시총 결측 탈락 0 · 시총 미달 1930 · 예외 0
+2026-11-18 03:00:53,666 [INFO] __main__ — DART corp_code 매핑: 780/803개 (97%)
+2026-11-18 03:00:53,666 [INFO] __main__ — 유효 유니버스: 803개
+2026-11-18 03:00:53,672 [INFO] __main__ — FDR 종가 재조회: 20261117 pm 저장 803 · 대조 801 · 불일치 11 (1.4%) · 차 중앙 -0.10% · 최대 388210 +0.63%
+2026-11-18 03:00:53,672 [INFO] __main__ —   → 803개
+2026-11-18 03:00:53,672 [INFO] __main__ — ▶ Step 1: 신호 탐지
+2026-11-18 03:00:53,672 [INFO] __main__ — NaverClient: 3개 키 로드 (DataLab·검색 독립 회전)
+2026-11-18 03:00:53,672 [INFO] __main__ — 관심 지수 및 부정 뉴스 비율 조회 중...
+2026-11-18 03:00:55,293 [INFO] __main__ — 봇 주가요약 제외 [빛과전자]: 2건
+2026-11-18 03:00:56,686 [INFO] __main__ — 봇 주가요약 제외 [금호건설]: 1건
+2026-11-18 03:00:58,447 [INFO] __main__ — 봇 주가요약 제외 [대한광통신]: 1건
+2026-11-18 03:01:01,350 [INFO] __main__ — 봇 주가요약 제외 [루닛]: 1건
+2026-11-18 03:01:01,483 [INFO] __main__ — 봇 주가요약 제외 [원익홀딩스]: 1건
+2026-11-18 03:01:11,854 [INFO] __main__ — 봇 주가요약 제외 [이수페타시스]: 1건
+2026-11-18 03:01:17,116 [INFO] __main__ — 봇 주가요약 제외 [대한전선]: 1건
+2026-11-18 03:01:18,316 [INFO] __main__ — 봇 주가요약 제외 [코리아써키트]: 1건
+2026-11-18 03:01:21,040 [INFO] __main__ — 봇 주가요약 제외 [제주반도체]: 2건
+2026-11-18 03:01:26,779 [INFO] __main__ — 봇 주가요약 제외 [JYP Ent.]: 1건
+2026-11-18 03:01:28,408 [INFO] __main__ — 봇 주가요약 제외 [서진시스템]: 1건
+2026-11-18 03:01:33,562 [INFO] __main__ — 봇 주가요약 제외 [KB금융]: 1건
+2026-11-18 03:01:37,952 [INFO] __main__ — 봇 주가요약 제외 [에코프로]: 1건
+2026-11-18 03:01:42,368 [INFO] __main__ — 봇 주가요약 제외 [한진칼]: 1건
+2026-11-18 03:01:42,611 [INFO] __main__ — 뉴스 시점 제외 [글로벌텍스프리]: 8건 (>14일/파싱실패)
+2026-11-18 03:01:47,985 [INFO] __main__ — 봇 주가요약 제외 [LS ELECTRIC]: 1건
+2026-11-18 03:02:01,312 [INFO] __main__ — 봇 주가요약 제외 [RFHIC]: 1건
+2026-11-18 03:02:06,719 [INFO] __main__ — 봇 주가요약 제외 [에코프로비엠]: 1건
+2026-11-18 03:02:09,691 [INFO] __main__ — 봇 주가요약 제외 [SK이터닉스]: 1건
+2026-11-18 03:02:12,579 [INFO] __main__ — 뉴스 시점 제외 [미래에셋증권2우B]: 6건 (>14일/파싱실패)
+2026-11-18 03:02:30,782 [INFO] __main__ — 봇 주가요약 제외 [오픈엣지테크놀로지]: 1건
+2026-11-18 03:02:41,702 [INFO] __main__ — 봇 주가요약 제외 [OCI홀딩스]: 1건
+2026-11-18 03:02:55,728 [INFO] __main__ — 봇 주가요약 제외 [HD현대중공업]: 1건
+2026-11-18 03:03:04,002 [INFO] __main__ — 봇 주가요약 제외 [네이처셀]: 1건
+2026-11-18 03:03:08,584 [INFO] __main__ — 봇 주가요약 제외 [포스코퓨처엠]: 1건
+2026-11-18 03:03:16,172 [INFO] __main__ — 뉴스 시점 제외 [ESR켄달스퀘어리츠]: 9건 (>14일/파싱실패)
+2026-11-18 03:03:49,128 [INFO] __main__ — 봇 주가요약 제외 [HD현대]: 1건
+2026-11-18 03:04:16,251 [INFO] __main__ — 뉴스 시점 제외 [현대차2우B]: 11건 (>14일/파싱실패)
+2026-11-18 03:04:20,217 [INFO] __main__ — 봇 주가요약 제외 [LG이노텍]: 1건
+2026-11-18 03:04:24,335 [INFO] __main__ — 뉴스 시점 제외 [이뮨온시아]: 2건 (>14일/파싱실패)
+2026-11-18 03:04:51,783 [INFO] __main__ — 뉴스 시점 제외 [현대차우]: 12건 (>14일/파싱실패)
+2026-11-18 03:04:55,018 [INFO] __main__ — 뉴스 시점 제외 [신한알파리츠]: 8건 (>14일/파싱실패)
+2026-11-18 03:04:59,528 [INFO] __main__ — 부정 키워드 감지: 15개 종목 (neg_ratio > 0)
+2026-11-18 03:04:59,529 [INFO] __main__ — 엔진B shadow: 조회 500 · 현행 B 63 · 영업일 B 154 · 겹침 59 · DataLab 마지막 점 2026-11-17
+2026-11-18 03:04:59,532 [INFO] __main__ — 수급일수충족·합계음수 제외: 66개
+2026-11-18 03:04:59,532 [INFO] __main__ — 수급 결측(KIS 조회 실패, Engine A 미판정): 0개
+2026-11-18 03:05:00,098 [INFO] __main__ — 뉴스 시점 제외 [CJ4우(전환)]: 13건 (>14일/파싱실패)
+2026-11-18 03:05:02,927 [INFO] __main__ — 뉴스 시점 제외 [SK우]: 14건 (>14일/파싱실패)
+2026-11-18 03:05:07,597 [INFO] __main__ — 뉴스 시점 제외 [맵스리얼티]: 7건 (>14일/파싱실패)
+2026-11-18 03:05:08,911 [INFO] __main__ — 뉴스 시점 제외 [미원화학]: 10건 (>14일/파싱실패)
+2026-11-18 03:05:10,234 [INFO] __main__ — 뉴스 시점 제외 [송원산업]: 10건 (>14일/파싱실패)
+2026-11-18 03:05:12,291 [INFO] __main__ — 뉴스 시점 제외 [조광피혁]: 10건 (>14일/파싱실패)
+2026-11-18 03:05:12,307 [INFO] __main__ — 뉴스 시점 제외 [천일고속]: 10건 (>14일/파싱실패)
+2026-11-18 03:05:15,526 [INFO] __main__ — 봇 주가요약 제외 [효성중공업]: 1건
+2026-11-18 03:05:20,831 [INFO] __main__ — 뉴스 시점 제외 [에스엠국일]: 11건 (>14일/파싱실패)
+2026-11-18 03:05:24,479 [INFO] __main__ — POOL_A 후보 부정뉴스 2차 조회: 111개
+2026-11-18 03:05:24,480 [INFO] __main__ — POOL_A: 341개 (A:278 B:22 동시:41) | 부정게이트 제외:1
+  대형:47 중형:154 소형:140
+2026-11-18 03:05:24,485 [INFO] __main__ — 대조군 표본(무신호): 40개 / 모집단 462개 → pool_history
+2026-11-18 03:05:24,486 [INFO] __main__ —   → POOL_A: 341개
+2026-11-18 03:05:24,486 [INFO] __main__ — ▶ Step 2: 하드 필터링
+2026-11-18 03:05:24,487 [INFO] __main__ — 하드 필터 제거: 329개 | 과열배제 34 | 이격도상한 4 | 이격도하한 83 | MA추세 160 | RSI과열 4 | 거래대금 44
+2026-11-18 03:05:24,488 [INFO] __main__ — 과열 gated 기록: 34개 → gated_tickers
+2026-11-18 03:05:24,490 [INFO] __main__ — 대조군 표본(필터탈락): 162개 / 모집단 329개 → pool_history
+2026-11-18 03:05:24,490 [INFO] __main__ — POOL_B: 12개 | 대형:0 중형:8 소형:4
+2026-11-18 03:05:24,490 [INFO] __main__ —   → POOL_B: 12개
+2026-11-18 03:05:24,490 [INFO] __main__ — ▶ Step 3: 스코어링 (FinBERT 감성 분석)
+2026-11-18 03:05:24,490 [INFO] __main__ — NaverClient: 3개 키 로드 (DataLab·검색 독립 회전)
+2026-11-18 03:05:24,490 [INFO] __main__ — 텍스트 신규 수집: 12종목 (캐시 적중 0종목)
+2026-11-18 03:05:33,622 [INFO] __main__ — 봇 주가요약 제외 [루닛]: 1건
+2026-11-18 03:05:37,776 [INFO] __main__ — 뉴스 시점 제외 [타이거일렉]: 4건 (>14일/파싱실패)
+2026-11-18 03:05:41,540 [INFO] __main__ — 기사 보존(수집): 111건 (12종목) → news_articles
+2026-11-18 03:05:41,542 [INFO] __main__ — 공시 보존(수집): 35건 (12종목) → dart_filings
+2026-11-18 03:05:41,542 [INFO] __main__ — 수집 완료: 뉴스 111건 | 공시 35건
+2026-11-18 03:05:41,542 [INFO] __main__ — FinBERT 감성 분석 (finbert 모드)...
+2026-11-18 03:05:41,542 [INFO] __main__ — FinBERT 로딩: snunlp/KR-FinBert-SC (CPU, batch=8)
+2026-11-18 03:05:41,605 [INFO] httpx2 — HTTP Request: GET https://huggingface.co/api/agent-harnesses "HTTP/1.1 200 OK"
+2026-11-18 03:05:41,644 [INFO] httpx2 — HTTP Request: GET https://huggingface.co/api/models/snunlp/KR-FinBert-SC "HTTP/1.1 200 OK"
+2026-11-18 03:05:41,707 [INFO] httpx2 — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/main/model.safetensors "HTTP/1.1 404 Not Found"
+2026-11-18 03:05:41,707 [WARNING] huggingface_hub.utils._http — Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+2026-11-18 03:05:41,924 [INFO] httpx2 — HTTP Request: GET https://huggingface.co/api/models/snunlp/KR-FinBert-SC "HTTP/1.1 200 OK"
+2026-11-18 03:05:41,978 [INFO] httpx2 — HTTP Request: GET https://huggingface.co/api/models/snunlp/KR-FinBert-SC/commits/main "HTTP/1.1 200 OK"
+2026-11-18 03:05:42,014 [INFO] httpx2 — HTTP Request: GET https://huggingface.co/api/models/snunlp/KR-FinBert-SC/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+2026-11-18 03:05:42,024 [INFO] httpx2 — HTTP Request: GET https://huggingface.co/api/models/snunlp/KR-FinBert-SC/discussions?p=0 "HTTP/1.1 200 OK"
+2026-11-18 03:05:42,061 [INFO] httpx2 — HTTP Request: GET https://huggingface.co/api/models/snunlp/KR-FinBert-SC/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-11-18 03:05:42,071 [INFO] httpx2 — HTTP Request: GET https://huggingface.co/api/models/snunlp/KR-FinBert-SC/commits/refs%2Fpr%2F3 "HTTP/1.1 200 OK"
+2026-11-18 03:05:42,111 [INFO] httpx2 — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/f8586286cc3161fb648e9fee09a456069fd846d0/processor_config.json "HTTP/1.1 404 Not Found"
+2026-11-18 03:05:42,112 [INFO] httpx2 — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/refs%2Fpr%2F3/model.safetensors.index.json "HTTP/1.1 404 Not Found"
+2026-11-18 03:05:42,152 [INFO] httpx2 — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/f8586286cc3161fb648e9fee09a456069fd846d0/video_preprocessor_config.json "HTTP/1.1 404 Not Found"
+2026-11-18 03:05:42,154 [INFO] httpx2 — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/refs%2Fpr%2F3/model.safetensors "HTTP/1.1 302 Found"
+2026-11-18 03:05:42,193 [INFO] httpx2 — HTTP Request: HEAD https://huggingface.co/snunlp/KR-FinBert-SC/resolve/f8586286cc3161fb648e9fee09a456069fd846d0/preprocessor_config.json "HTTP/1.1 404 Not Found"
+2026-11-18 03:05:42,194 [INFO] __main__ — FinBERT 로드 완료 (CPU)
+2026-11-18 03:05:44,346 [INFO] __main__ — Phase A.1: 매핑 신뢰도 < 0.5 → 감성 점수 폐기 12건
+2026-11-18 03:05:44,346 [INFO] __main__ — 스코어링: 12개 | 집중:0 | FinBERT:finbert
+2026-11-18 03:05:44,361 [INFO] __main__ —   → 12개
+2026-11-18 03:05:44,361 [INFO] __main__ — 스캔 완료 — 이후 실패해도 DB 는 커밋된다
+2026-11-18 03:05:44,361 [INFO] __main__ — ▶ Step 4: 발송
+2026-11-18 03:05:45,409 [INFO] __main__ — 텔레그램 도착 2026-11-18 12:05:45 KST (message_id 905)
+2026-11-18 03:05:46,479 [INFO] __main__ — 텔레그램 도착 2026-11-18 12:05:46 KST (message_id 906)
+2026-11-18 03:05:47,493 [INFO] __main__ — 텔레그램 도착 2026-11-18 12:05:47 KST (message_id 907)
+2026-11-18 03:05:48,002 [INFO] __main__ — DB 기록: 10개 / 전체 to_send 10개
+2026-11-18 03:05:48,002 [INFO] __main__ — 발송: 10종목 | 신규 0 | 수급 결측 0
+2026-11-18 03:05:48,002 [INFO] __main__ — 완료  |  소요: 694.3초
+2026-11-18 03:05:48,004 [INFO] __main__ — KIS 호출 804회 · 토큰 재발급 0회 · 오류코드 없음 (시도 기준) · 재시도 후 최종 실패 0건 · 키 지문 eb9d0251
+2026-11-18 03:05:48,994 [INFO] track_outcomes — pool_history 대조군 21136건 추적 대상 포함
+2026-11-18 03:05:49,075 [INFO] track_outcomes — 고아 행 219건 복원 (targets에서 탈락한 미완 키)
+2026-11-18 03:05:49,075 [INFO] track_outcomes — 대상 34129건 | 갱신 필요 8309건 | 완료 스킵 26039건
+2026-11-18 03:05:49,076 [INFO] track_outcomes —   가격 조회 고유 종목 911개 (기존 248 + 대조군 추가 663)
+2026-11-18 03:05:49,077 [INFO] track_outcomes —   가격 조회 종료일 2026-11-17 (KST 오늘 2026-11-18 12:05 — 당일 바 제외)
+2026-11-18 03:22:29,485 [INFO] track_outcomes — outcomes 적재: 신규 248건 | 갱신(신규+보완) 248건
