@@ -33,6 +33,7 @@ MARKET_CLOSE_HHMM = (15, 40)     # 이 전이면 오늘 행은 장중 현재가 
 FALLBACK_ALERT_RATE = 0.05
 
 _LOG = None
+_OHLC_SINK = None    # run() 중에만 dict — _kis_daily 가 받은 봉 전체(시·고·저·종·량·대금)를 모은다(daily_ohlc)
 
 
 def log() -> logging.Logger:
@@ -116,6 +117,13 @@ def _kis_daily(ar, tk, d1, d2):
         if not d or d.get("rt_cd") != "0":
             return None
         out = [r for r in (d.get("output2") or []) if r.get("stck_bsop_date")]
+        if _OHLC_SINK is not None:
+            import daily_ohlc
+            sink = _OHLC_SINK.setdefault(tk, {})
+            for r in out:
+                p = daily_ohlc.parse_stock_row(r)
+                if p:
+                    sink[p[0]] = p[1]
         for r in out:
             if r.get("stck_clpr") in (None, "", "0"):
                 continue
@@ -213,6 +221,33 @@ def shadow_row(ar, df, tier, srow, fcfg, ocfg, w_tech, w_cross):
 
 
 def run(ar, db, now=None):
+    global _OHLC_SINK
+    _OHLC_SINK = {}
+    try:
+        return _run(ar, db, now)
+    finally:
+        sink, _OHLC_SINK = _OHLC_SINK, None
+        _store_ohlc(ar, db, sink, now)
+
+
+def _store_ohlc(ar, db, sink, now):
+    """받아 둔 KIS J 봉을 daily_ohlc_j 에 넣는다(추가 호출 없음). 실패해도 shadow 결과와 무관 —
+    빠진 종목은 다음 단계 daily_ohlc.py 가 다시 받는다."""
+    if not sink:
+        return
+    try:
+        import daily_ohlc
+        days = (ar.load_config().get("daily_ohlc", {}) or {}).get("store_days", 14)
+        st = daily_ohlc.store_sink(db, sink, now or datetime.now(ar.KST), int(days))
+        line, warns = daily_ohlc.stats_lines(st, f"OHLC 저장 {len(sink)}종목 ·")
+        log().info(line)
+        for w in warns:
+            log().warning(w)
+    except Exception as e:
+        log().warning(f"OHLC 저장 실패 ({type(e).__name__}: {e}) — daily_ohlc 단계가 다시 받는다")
+
+
+def _run(ar, db, now=None):
     import pandas as pd
     cfg = ar.load_config()
     fcfg = cfg["filter"]

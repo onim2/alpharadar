@@ -51,6 +51,7 @@
    - KIS 는 자기 `prdy_vrss` 와 닫혀 있다(전일 `stck_clpr` 차분 = `prdy_vrss`) — J 가 일관된 계열이라는 뜻이다.
    - `investor_flow_daily`: `close_krx` 는 FDR 에서 와서 9/14 이후 UN 계열이고, `base_price`(KIS `stck_clpr`)가 J 다.
      칼럼 이름·주석이 실제와 반대다 — 정정 전까지 정본은 `base_price` 로 읽을 것.
+   - **수집 시각 조건: 봉 날짜 다음 달력일 09:00 이후 수집분만 정규장 종가** — 밤에 받은 KIS J 당일 봉은 통합가(UN)다(11/17 실측: `price_shadow_j` pm 행 83~95% 불일치·FDR 밤 값과 일치, 밤 수집 `base_price` 도 같은 조건).
 6. 당일 행은 장중에도 응답에 들어오고 값이 계속 움직인다(종가가 아니라 현재가).
    as_of 와 upsert 가 그 갱신을 받아내는 구조다 — 당일 값을 확정치로 읽지 말 것.
 
