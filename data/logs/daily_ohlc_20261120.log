@@ -1,0 +1,3 @@
+2026-11-19 17:15:02,443 [INFO] daily_ohlc — 시작 20261106~20261120 · shadow 348 · watchlist 1 · briefing 8 · sent 82 · unfinal 348 · 합집합 388 · 조회 40
+2026-11-19 17:15:24,064 [INFO] daily_ohlc — 조회 42 · kis_j 42 · fdr폴백 0 · 실패 0 · KIS 호출 42 · 22초
+2026-11-19 17:15:24,064 [INFO] daily_ohlc — OHLC 확정 전환 0행 · first_close 불일치 0 · 신규 42 · 확정값 변경 0
