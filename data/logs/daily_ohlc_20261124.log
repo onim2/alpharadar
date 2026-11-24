@@ -1,3 +1,10 @@
 2026-11-23 19:55:08,936 [INFO] daily_ohlc — 시작 20261110~20261124 · shadow 311 · watchlist 1 · briefing 8 · sent 72 · unfinal 311 · 합집합 353 · 조회 42
 2026-11-23 19:55:30,939 [INFO] daily_ohlc — 조회 44 · kis_j 44 · fdr폴백 0 · 실패 0 · KIS 호출 44 · 22초
 2026-11-23 19:55:30,939 [INFO] daily_ohlc — OHLC 확정 전환 0행 · first_close 불일치 0 · 신규 44 · 확정값 변경 0
+2026-11-24 05:46:27,742 [INFO] daily_ohlc — 시작 20261110~20261124 · shadow 203 · watchlist 1 · briefing 8 · sent 72 · unfinal 218 · 합집합 421 · 조회 218
+2026-11-24 05:46:51,760 [INFO] daily_ohlc — 진행 50/220 · 24초 · KIS 호출 50
+2026-11-24 05:47:13,221 [INFO] daily_ohlc — 진행 100/220 · 45초 · KIS 호출 100
+2026-11-24 05:47:35,151 [INFO] daily_ohlc — 진행 150/220 · 67초 · KIS 호출 150
+2026-11-24 05:47:58,704 [INFO] daily_ohlc — 진행 200/220 · 90초 · KIS 호출 200
+2026-11-24 05:48:07,402 [INFO] daily_ohlc — 조회 220 · kis_j 220 · fdr폴백 0 · 실패 0 · KIS 호출 220 · 100초
+2026-11-24 05:48:07,402 [INFO] daily_ohlc — OHLC 확정 전환 220행 · first_close 불일치 210 (95.5%) · 차 중앙 -0.77% · 최대 170920 20261123 -4.17% · 신규 0 · 확정값 변경 0
