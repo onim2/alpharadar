@@ -1,0 +1,18 @@
+2026-11-25 18:34:08,671 [INFO] price_shadow — 시작 20261125 pm · 대상 389행/329종목
+2026-11-25 18:35:24,831 [INFO] price_shadow — 진행 50/329종목 · 76초 · KIS 호출 99 · fdr폴백 0 · 실패 0
+2026-11-25 18:36:41,890 [INFO] price_shadow — 진행 100/329종목 · 153초 · KIS 호출 199 · fdr폴백 0 · 실패 0
+2026-11-25 18:37:55,940 [INFO] price_shadow — 진행 150/329종목 · 227초 · KIS 호출 297 · fdr폴백 0 · 실패 0
+2026-11-25 18:39:12,357 [INFO] price_shadow — 진행 200/329종목 · 303초 · KIS 호출 397 · fdr폴백 0 · 실패 0
+2026-11-25 18:40:28,423 [INFO] price_shadow — 진행 250/329종목 · 379초 · KIS 호출 497 · fdr폴백 0 · 실패 0
+2026-11-25 18:41:44,622 [INFO] price_shadow — 진행 300/329종목 · 455초 · KIS 호출 597 · fdr폴백 0 · 실패 0
+2026-11-25 18:42:38,434 [WARNING] price_shadow — OHLC 저장 실패 (OperationalError: database is locked) — daily_ohlc 단계가 다시 받는다
+2026-11-25 18:42:38,434 [ERROR] price_shadow — shadow 실패: database is locked
+Traceback (most recent call last):
+  File "/home/runner/work/alpharadar/alpharadar/price_shadow.py", line 320, in main
+    run(ar, db)
+  File "/home/runner/work/alpharadar/alpharadar/price_shadow.py", line 227, in run
+    return _run(ar, db, now)
+           ^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/alpharadar/alpharadar/price_shadow.py", line 289, in _run
+    con.execute("DELETE FROM price_shadow_j WHERE scan_date=? AND run_type=?", (sd, rt))
+sqlite3.OperationalError: database is locked
